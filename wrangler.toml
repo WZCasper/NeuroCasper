@@ -1,0 +1,11 @@
+name = "neurocasper"
+main = "src/index.ts"
+compatibility_date = "2026-08-18"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "neurocasper"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[vars]
+ENVIRONMENT = "production"
