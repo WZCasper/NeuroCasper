@@ -1,0 +1,66 @@
+# Runs automatically on every push to main that touches the Worker, and any
+# time you trigger it manually. Applies the D1 schema, syncs Worker secrets
+# from this repo's secrets, and deploys. Requires "1) Bootstrap D1 database"
+# to have been run first and wrangler.toml's database_id to be a real id
+# (not the REPLACE_WITH_... placeholder) -- deploy fails loudly otherwise.
+#
+# Uses Cloudflare's own cloudflare/wrangler-action rather than shelling out
+# to `wrangler secret put` directly: piping a value into that command's
+# stdin is documented CI usage, but wrangler has had a real bug where it
+# doesn't trim the trailing newline `echo` adds (cloudflare/workers-sdk#993)
+# -- the action's dedicated `secrets:` input avoids that entirely.
+name: "2) Deploy Worker"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "wrangler.toml"
+      - "schema.sql"
+      - "package.json"
+      - "package-lock.json"
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+
+      - name: Guard against an un-configured database_id
+        run: |
+          if grep -q "REPLACE_WITH_D1_DATABASE_ID" wrangler.toml; then
+            echo "::error::wrangler.toml still has the placeholder database_id -- run '1) Bootstrap D1 database' first, paste the real id in, commit, and push again."
+            exit 1
+          fi
+
+      - name: Apply D1 schema
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --file=./schema.sql
+
+      - name: Sync secrets and deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          secrets: |
+            BOT_TOKEN
+            WEBHOOK_SECRET
+            TWITCH_CLIENT_ID
+            TWITCH_CLIENT_SECRET
+            TWITCH_EVENTSUB_SECRET
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+          TWITCH_EVENTSUB_SECRET: ${{ secrets.TWITCH_EVENTSUB_SECRET }}

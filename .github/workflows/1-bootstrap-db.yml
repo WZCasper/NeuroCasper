@@ -1,0 +1,29 @@
+# Run this ONCE, manually, before the first deploy (Actions tab -> this
+# workflow -> "Run workflow"). It only needs CLOUDFLARE_API_TOKEN and
+# CLOUDFLARE_ACCOUNT_ID to already be set as repo secrets.
+#
+# It creates the D1 database and prints its id in the run log. Copy that id
+# into wrangler.toml's database_id (replacing REPLACE_WITH_D1_DATABASE_ID),
+# commit and push -- that push triggers "2) Deploy Worker" automatically.
+name: "1) Bootstrap D1 database"
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create D1 database
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4"
+          command: d1 create neurocasper-db
+
+      - name: If the step above failed with "already exists"
+        if: failure()
+        run: echo "Database already created earlier -- find its id with 'npx wrangler d1 list' locally, or in the Cloudflare dashboard under Workers & Pages > D1."

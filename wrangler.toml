@@ -1,0 +1,22 @@
+name = "neurocasper"
+main = "src/index.ts"
+compatibility_date = "2026-08-18"
+
+[observability]
+enabled = true
+
+# Created by: npx wrangler d1 create neurocasper-db
+# Paste the returned database_id below before deploying.
+[[d1_databases]]
+binding = "DB"
+database_name = "neurocasper-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+# Non-secret configuration. Secrets (BOT_TOKEN, WEBHOOK_SECRET,
+# TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_EVENTSUB_SECRET) are set as
+# GitHub repo secrets and synced by .github/workflows/2-deploy.yml on every
+# deploy — or manually with `npx wrangler secret put <NAME>`. Never put an
+# actual secret value in this file.
+[vars]
+# Public base URL of this deployed Worker, e.g. https://neurocasper.<subdomain>.workers.dev
+WORKER_URL = "https://REPLACE_WITH_YOUR_WORKER_URL"

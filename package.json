@@ -1,0 +1,31 @@
+{
+  "name": "neurocasper",
+  "version": "1.0.0",
+  "description": "Telegram bot that posts live/new-video alerts for Twitch, YouTube and TikTok streamers, with one button per platform.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p scripts/tsconfig.json",
+    "build": "npm run typecheck",
+    "check": "npx tsx scripts/checker.ts",
+    "db:migrate:local": "wrangler d1 execute neurocasper-db --local --file=./schema.sql",
+    "db:migrate:remote": "wrangler d1 execute neurocasper-db --remote --file=./schema.sql"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@resvg/resvg-wasm": "^2.6.2",
+    "fast-xml-parser": "^5.11.0",
+    "grammy": "^1.45.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260818.1",
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.123.0"
+  }
+}

@@ -1,0 +1,27 @@
+# Run this ONCE, manually, after the first successful deploy AND after
+# wrangler.toml's WORKER_URL has been set to your real Worker URL (not the
+# REPLACE_WITH_... placeholder), committed and pushed. Points Telegram at
+# the deployed webhook. Re-run any time you rotate WEBHOOK_SECRET.
+name: "3) Set Telegram webhook"
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  set-webhook:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Call Telegram setWebhook
+        run: |
+          WORKER_URL=$(grep -m1 '^WORKER_URL' wrangler.toml | sed -E 's/^WORKER_URL[[:space:]]*=[[:space:]]*"(.*)"$/\1/')
+          if [ -z "$WORKER_URL" ] || echo "$WORKER_URL" | grep -q "REPLACE_WITH"; then
+            echo "::error::WORKER_URL in wrangler.toml is still a placeholder — set it to your real Worker URL, commit and push, then re-run this workflow."
+            exit 1
+          fi
+          RESPONSE=$(curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook" \
+            --data-urlencode "url=${WORKER_URL}/webhook/telegram" \
+            --data-urlencode "secret_token=${{ secrets.WEBHOOK_SECRET }}")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"ok":true' || (echo "::error::setWebhook call failed, see response above" && exit 1)

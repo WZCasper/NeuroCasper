@@ -1,0 +1,37 @@
+name: NeuroCasper YouTube/TikTok checker
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub Actions cron is best-effort and can lag under
+    # load — treat "every 5 min" as "at least every 5–15 min".
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab
+
+concurrency:
+  group: neurocasper-checker
+  cancel-in-progress: false # let an in-flight run finish rather than overlap with the next
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4 # stay comfortably inside the 5-minute schedule
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm ci
+
+      - run: npx tsx scripts/checker.ts
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          # Optional — leave unset to fall back to the best-effort watch-page
+          # heuristic (see scripts/lib/youtube.ts). Set it for reliable live
+          # detection via the official YouTube Data API v3.
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
