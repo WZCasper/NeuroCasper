@@ -10,7 +10,7 @@ enabled = true
 [[d1_databases]]
 binding = "DB"
 database_name = "neurocasper-db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "0c84ead8-43bd-4626-a834-87b930642c25"
 
 # Non-secret configuration. Secrets (BOT_TOKEN, WEBHOOK_SECRET,
 # TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_EVENTSUB_SECRET) are set as

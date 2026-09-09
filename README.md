@@ -12,13 +12,15 @@ on more than one platform at once.
   goes live.
 - **Cloudflare D1** (`schema.sql`) — users, channels, streamers, platform
   accounts, and the posted-message state.
-- **GitHub Actions** — both the recurring YouTube/TikTok checker *and* all
-  deployment (schema migration, secrets, `wrangler deploy`) run here, not on
-  your machine and not from wherever this was built. See "Deploy" below —
-  this is the direct answer to "why files and not a running bot": deploying
-  requires authenticating as *you* on Cloudflare/Telegram/Twitch/GitHub,
-  which isn't something to hand to an assistant mid-chat. Once those
-  credentials are repo secrets, GitHub Actions does the rest on every push.
+- **GitHub Actions** — runs the recurring YouTube/TikTok checker on a cron,
+  since that needs somewhere to live independent of the Worker. The Worker
+  itself is deployed by Cloudflare's own Git integration (connect the repo
+  in the dashboard, it builds and deploys on every push) rather than a
+  custom Actions workflow — simpler, and Cloudflare's own build system
+  already has the credentials it needs. See "Deploy" below for exactly
+  which parts are automatic and which one-time steps only you can do
+  (creating accounts/apps requires authenticating as *you* on
+  Cloudflare/Telegram/Twitch/GitHub — not something to hand an assistant).
 
 `src/lib/publish.ts` and `scripts/lib/publish.ts` implement the same
 "post or merge" rule in both places: if a streamer's platform goes live (or
@@ -27,19 +29,29 @@ already has an open post, the new platform's button is added to that post
 instead of sending a second message. A platform's button is removed when it
 ends; the post is unpinned and closed once every platform under it has ended.
 
-## Deploy (GitHub Actions does the actual deploying)
+## Deploy
+
+Two independent things get deployed here, on two different schedules: **the
+Worker** (deployed by Cloudflare's own Git integration, triggered by pushes
+to `main`) and **the checker** (runs on a cron, so it needs somewhere to
+live regardless of how the Worker gets deployed — that's GitHub Actions).
 
 ### 0. One-time accounts/credentials
 
 - Telegram bot token: message [@BotFather](https://t.me/BotFather) → `/newbot`
 - Cloudflare account (Workers + D1 are free tier) — note your **Account ID**
   (dashboard right sidebar) and your **workers.dev subdomain** (Workers &
-  Pages → Overview; set one if you haven't)
-- Cloudflare API token: dashboard → My Profile → API Tokens → Create
-  Token → permissions **Account.D1: Edit** and **Account.Workers Scripts: Edit**
+  Pages → Overview)
+- Cloudflare API token (only needed for the checker's GitHub Actions
+  secrets below, not for the Worker itself): dashboard → My Profile → API
+  Tokens → Create Token → permissions **Account.D1: Edit**
 - Twitch app: [dev.twitch.tv/console/apps](https://dev.twitch.tv/console/apps)
   → Register → any name, redirect URL `https://localhost`, category
-  "Application Integration" → copy Client ID, generate Client Secret
+  "Application Integration" → copy Client ID, generate Client Secret.
+  **Registering requires 2FA on your Twitch account**, which needs a phone
+  number for the initial SMS step — if that doesn't work for your number,
+  see the note in Limitations below. Skippable: the bot works fine with
+  only YouTube/TikTok if Twitch isn't available to you.
 - (Optional) YouTube Data API v3 key: [console.cloud.google.com](https://console.cloud.google.com)
   → enable the API → Credentials → API key — without this, YouTube live
   detection falls back to a best-effort page check (see Limitations)
@@ -47,58 +59,72 @@ ends; the post is unpinned and closed once every platform under it has ended.
 None of these can be created by an assistant on your behalf — each one is
 tied to proving it's *you* on that platform.
 
-### 1. Get the code into a repo you control
+### 1. Repo
 
-Either push it yourself:
+Push the code to a GitHub repo you control (see git log for how this one
+got there). Cloudflare's Git integration and GitHub Actions both read from
+this repo directly, on every push to `main`.
+
+### 2. The Worker — Cloudflare's Git integration
+
+Workers & Pages → your Worker → connected to this repo, with:
+
+- Build command: `npm run build`
+- Deploy command: `npx wrangler deploy`
+
+Cloudflare builds and deploys on every push using its own internal auth —
+no GitHub secrets needed for this part. What's still needed, one time:
+
+- **D1 database**: Storage & databases → D1 → Create database → paste the
+  id into `wrangler.toml`'s `database_id` (replacing the placeholder),
+  commit, push. (`.github/workflows/1-bootstrap-db.yml` does the same
+  creation step from the Actions tab instead, if you'd rather not use the
+  dashboard for this one part — either way produces the same kind of
+  database, use whichever's convenient.)
+- **`WORKER_URL`** in `wrangler.toml`'s `[vars]` — your actual
+  `https://<worker-name>.<subdomain>.workers.dev`.
+- **Secrets**: this Worker's own **Settings → Variables and Secrets** tab
+  → Add → type **Secret** → one each for `BOT_TOKEN`, `WEBHOOK_SECRET`,
+  `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET`, `TWITCH_EVENTSUB_SECRET`
+  (skip the three Twitch ones if you're not using Twitch). These attach to
+  the Worker immediately — no redeploy needed, and they're separate from
+  GitHub Secrets entirely.
+
+Each push after that just redeploys; the schema migration
+(`npx wrangler d1 execute ... --remote --file=./schema.sql`) only needs
+running once after the database is created — from your machine, or via
+`workflow_dispatch` on `1-bootstrap-db.yml` adapted to run it, or by hand
+in the dashboard's D1 console.
+
+### 3. Point Telegram at the Worker
+
+Once deployed and `BOT_TOKEN`/`WEBHOOK_SECRET` are set on the Worker,
+either run `.github/workflows/2-set-webhook.yml` manually from the Actions
+tab (this one needs `BOT_TOKEN` and `WEBHOOK_SECRET` added as *repo*
+secrets too, since it runs on GitHub, not Cloudflare — Settings → Secrets
+and variables → Actions), or just run this once, from anywhere:
 
 ```bash
-cd neurocasper
-git init && git add -A && git commit -m "Initial import"
-gh repo create neurocasper --private --source=. --push   # needs GitHub CLI + login
-# no gh CLI? create an empty repo on github.com, then:
-#   git remote add origin https://github.com/<you>/neurocasper.git
-#   git push -u origin main
+curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+  --data-urlencode "url=<WORKER_URL>/webhook/telegram" \
+  --data-urlencode "secret_token=<WEBHOOK_SECRET>"
 ```
 
-or, if you'd rather I push it: create an empty repo, generate a
-**fine-grained personal access token** scoped to just that one repo with
-**Contents: Read and write**, and share it here — I'll push and then you
-can revoke it. (I have no way to create the repo myself — that also
-requires authenticating as you on GitHub.)
+### 4. The checker (YouTube/TikTok) — GitHub Actions, always
 
-### 2. Add repo secrets
-
-Repo → Settings → Secrets and variables → Actions → New repository secret:
+This part runs on a schedule regardless of how the Worker is deployed, so
+it needs its own repo secrets (Settings → Secrets and variables → Actions):
 
 | Secret | Value |
 |---|---|
-| `CLOUDFLARE_ACCOUNT_ID` | from step 0 |
-| `CLOUDFLARE_API_TOKEN` | from step 0 |
-| `BOT_TOKEN` | from BotFather |
-| `WEBHOOK_SECRET` | make up a long random string |
-| `TWITCH_CLIENT_ID` | from step 0 |
-| `TWITCH_CLIENT_SECRET` | from step 0 |
-| `TWITCH_EVENTSUB_SECRET` | make up a second long random string |
-| `YOUTUBE_API_KEY` | optional, from step 0 |
-| `CLOUDFLARE_D1_DATABASE_ID` | comes from step 3 below — add it after |
+| `CLOUDFLARE_ACCOUNT_ID` | step 0 |
+| `CLOUDFLARE_API_TOKEN` | step 0 |
+| `CLOUDFLARE_D1_DATABASE_ID` | same id as step 2 |
+| `BOT_TOKEN` | same token as step 2 |
+| `YOUTUBE_API_KEY` | optional, step 0 |
 
-### 3. Run the workflows, in order, from the repo's **Actions** tab
-
-1. **"1) Bootstrap D1 database"** — Run workflow (button, top right). Open
-   the run, copy the `database_id` it prints.
-2. Edit `wrangler.toml` in the GitHub web UI: paste that id over
-   `REPLACE_WITH_D1_DATABASE_ID`, and set `WORKER_URL` to
-   `https://neurocasper.<your-workers.dev-subdomain>.workers.dev` (replacing
-   `REPLACE_WITH_YOUR_WORKER_URL`). Commit directly to `main`.
-3. Add the `CLOUDFLARE_D1_DATABASE_ID` repo secret (same id as step 1).
-4. That commit auto-triggers **"2) Deploy Worker"** — applies the schema,
-   syncs secrets, deploys. Watch it go green.
-5. Run **"3) Set Telegram webhook"** once, manually — points Telegram at
-   the now-deployed Worker.
-
-From here on, every push to `main` that touches the Worker redeploys
-automatically, and **"4) NeuroCasper YouTube/TikTok checker"** runs on its
-own every 5 minutes — no local commands needed for normal operation.
+`.github/workflows/3-checker.yml` then runs every 5 minutes on its own —
+no further action needed.
 
 ## Known limitations (read before relying on this)
 
@@ -108,6 +134,17 @@ own every 5 minutes — no local commands needed for normal operation.
   🟣 Twitch / ⚫ TikTok). Full color control *is* available for the
   generated fallback preview image, since that's pixels the bot draws
   itself — see `src/lib/preview-image.ts`.
+- **Twitch requires 2FA on your account to register a developer app**,
+  and enabling 2FA requires an initial SMS to a phone number — if that SMS
+  doesn't reliably reach your number, Twitch's own docs describe an
+  account-signup path that defers the phone step in favor of email +
+  authenticator-app (TOTP) enrollment; whether that's still open to an
+  *existing* account trying to add 2FA (rather than at signup) isn't
+  something this README can promise — Twitch support is the reliable next
+  step if the app-based path doesn't come up. None of this blocks the rest
+  of the bot: Twitch is entirely optional per streamer, and skipping it
+  needs zero code changes — just never set the three `TWITCH_*` secrets
+  and never pick Twitch in `/add_social`.
 - **YouTube live detection without `YOUTUBE_API_KEY`** is a best-effort regex
   check on the watch page's embedded state, not an official signal. Set
   `YOUTUBE_API_KEY` for a reliable `liveBroadcastContent` check instead.
@@ -119,24 +156,20 @@ own every 5 minutes — no local commands needed for normal operation.
   the three platforms. TikTok posts also won't have a title (no reliable
   way to extract one without an API), so they show just the streamer-name
   header.
-- **Deploy/secrets CI (`2) Deploy Worker`) uses Cloudflare's own
-  `cloudflare/wrangler-action`**, not raw `wrangler secret put` piped by hand
-  — that raw pattern has a real, documented bug where it doesn't trim the
-  trailing newline `echo` adds (cloudflare/workers-sdk#993), which would
-  have silently corrupted every secret. The action's `secrets:` input
-  avoids that. This still wasn't runnable end-to-end from the sandbox this
-  was built in (no Cloudflare API access there), so its first real run with
-  real credentials is still the first full proof — if it fails, the error
-  will name which step; most likely fix is a mis-scoped `CLOUDFLARE_API_TOKEN`.
+- **The checker's GitHub Actions secrets are separate from the Worker's
+  Cloudflare-dashboard secrets** — the same underlying value (e.g.
+  `BOT_TOKEN`) has to be entered in both places, since the two run in
+  different systems that don't share a secret store.
 - **Not network-tested against the real Telegram/Twitch/YouTube/TikTok
-  APIs** for the same reason. What *was* verified: the Worker's own logic
+  APIs** during the build of this project — that sandbox only had access
+  to package registries. What *was* verified: the Worker's own logic
   (routing, Twitch webhook HMAC verification, the challenge/response flow,
   background-processing pattern) against a real local Cloudflare Workers
   runtime (`wrangler dev`), and the fallback preview-image renderer against
   real rendered PNG output (visually inspected, including catching and
   fixing a font-glyph bug). Do a real test after step 3 above (send
-  `/start`, add a real streamer, trigger "4)" manually) before trusting it
-  unattended.
+  `/start`, add a real streamer, trigger "3) checker" manually) before
+  trusting it unattended.
 
 ## Using the bot
 
