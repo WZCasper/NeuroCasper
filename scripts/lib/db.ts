@@ -1,8 +1,14 @@
 import { d1Query, d1QueryOne, d1Run } from "./d1-client.js";
 import type { D1Config } from "./d1-client.js";
-import type { ChannelRow, PostKind, PostPlatformRow, PostRow, SocialAccountWithStreamer } from "./types.js";
+import type { ChannelRow, ExtraLinkRow, PostKind, PostPlatformRow, PostRow, SocialAccountWithStreamer } from "./types.js";
 
 export const VIDEO_POST_MERGE_WINDOW_MINUTES = 15;
+
+export async function listExtraLinksByStreamer(config: D1Config, streamerId: number): Promise<ExtraLinkRow[]> {
+  return d1Query<ExtraLinkRow>(config, "SELECT * FROM extra_links WHERE streamer_id = ? ORDER BY created_at ASC", [
+    streamerId,
+  ]);
+}
 
 export async function listSocialAccountsByPlatform(
   config: D1Config,

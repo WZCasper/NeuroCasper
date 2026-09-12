@@ -4,7 +4,7 @@
 // src/types.ts's Env interface references Workers-only ambient types. Keeping
 // the two projects' type-checking fully decoupled avoids one side's tsconfig
 // leaking into the other's.
-export type Platform = "twitch" | "youtube" | "tiktok";
+export type Platform = "youtube" | "tiktok";
 export type PostKind = "live" | "video";
 
 export interface ChannelRow {
@@ -32,11 +32,21 @@ export interface SocialAccountWithStreamer {
   platform: Platform;
   platform_user_id: string | null;
   platform_username: string;
-  eventsub_subscription_id: string | null;
   last_video_id: string | null;
   last_checked_at: string | null;
   streamer_display_name: string;
   streamer_channel_id: number;
+}
+
+// A static, unmonitored link (Twitch, Discord, etc.) always shown as an
+// extra button on every alert for its streamer — see schema.sql's
+// extra_links comment for why this exists instead of monitoring Twitch.
+export interface ExtraLinkRow {
+  id: number;
+  streamer_id: number;
+  label: string;
+  url: string;
+  created_at: string;
 }
 
 export interface PostRow {

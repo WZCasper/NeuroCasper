@@ -1,9 +1,11 @@
-// Entry point run by .github/workflows/checker.yml every 5 minutes. Polls
+// Entry point run by .github/workflows/3-checker.yml every 5 minutes. Polls
 // YouTube (RSS + optional Data API) and TikTok (best-effort page check) for
-// every tracked account, publishing or merging alerts exactly like the
-// Worker's Twitch EventSub handler does (scripts/lib/publish.ts mirrors
-// src/lib/publish.ts). Twitch itself is NOT checked here — it's handled in
-// real time by the Worker via EventSub.
+// every tracked account, publishing or merging alerts exactly like
+// scripts/lib/publish.ts describes (mirrors src/lib/publish.ts). Twitch is
+// not monitored at all — registering a Twitch app needs 2FA that isn't
+// available to every streamer, so it's handled as a static extra_links
+// entry instead (see schema.sql), shown alongside whatever YouTube/TikTok
+// activity actually triggers a post.
 import { loadD1ConfigFromEnv } from "./lib/d1-client.js";
 import {
   findOpenPostPlatformForAccount,

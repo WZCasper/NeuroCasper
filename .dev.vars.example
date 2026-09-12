@@ -1,7 +1,5 @@
 # Copy to .dev.vars for local `wrangler dev` testing (already gitignored).
-# In production these are set with `wrangler secret put <NAME>`, not here.
+# In production these are set on the Worker in the Cloudflare dashboard ->
+# Settings -> Variables and Secrets, not here.
 BOT_TOKEN=123456:your-telegram-bot-token
 WEBHOOK_SECRET=some-long-random-string
-TWITCH_CLIENT_ID=your-twitch-client-id
-TWITCH_CLIENT_SECRET=your-twitch-client-secret
-TWITCH_EVENTSUB_SECRET=another-long-random-string

@@ -1,11 +1,13 @@
-# Run this ONCE, manually, before the first deploy (Actions tab -> this
-# workflow -> "Run workflow"). It only needs CLOUDFLARE_API_TOKEN and
-# CLOUDFLARE_ACCOUNT_ID to already be set as repo secrets.
+# Run this manually (Actions tab -> this workflow -> "Run workflow"):
+#   - the first time, to create the D1 database and apply schema.sql
+#   - any time schema.sql changes, to re-apply it (it's a full drop+recreate,
+#     safe to re-run -- see the comment at the top of schema.sql)
 #
-# It creates the D1 database and prints its id in the run log. Copy that id
-# into wrangler.toml's database_id (replacing REPLACE_WITH_D1_DATABASE_ID),
-# commit and push -- that push triggers "2) Deploy Worker" automatically.
-name: "1) Bootstrap D1 database"
+# Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repo secrets.
+# First run only: copy the printed database_id into wrangler.toml's
+# database_id (replacing the placeholder), commit and push -- Cloudflare's
+# Git integration redeploys the Worker automatically from there.
+name: "1) Bootstrap/migrate D1 database"
 
 on:
   workflow_dispatch: {}
@@ -16,7 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create D1 database
+      - name: Create D1 database (no-op if it already exists)
+        id: create
+        continue-on-error: true
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -24,6 +28,13 @@ jobs:
           wranglerVersion: "4"
           command: d1 create neurocasper-db
 
-      - name: If the step above failed with "already exists"
-        if: failure()
-        run: echo "Database already created earlier -- find its id with 'npx wrangler d1 list' locally, or in the Cloudflare dashboard under Workers & Pages > D1."
+      - name: Note if it already existed
+        if: steps.create.outcome == 'failure'
+        run: echo "Database probably already exists -- that's fine, continuing to apply schema.sql against it."
+
+      - name: Apply schema.sql
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --file=./schema.sql

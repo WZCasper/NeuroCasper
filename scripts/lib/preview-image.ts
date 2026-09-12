@@ -19,13 +19,11 @@ const CARD_HEIGHT = 720;
 
 const GRADIENTS: Record<Platform, [string, string]> = {
   youtube: ["#FF0000", "#8B0000"],
-  twitch: ["#9146FF", "#4B2380"],
   tiktok: ["#1A1A1A", "#000000"],
 };
 
 const PLATFORM_NAMES: Record<Platform, string> = {
   youtube: "YOUTUBE",
-  twitch: "TWITCH",
   tiktok: "TIKTOK",
 };
 

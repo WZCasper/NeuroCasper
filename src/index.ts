@@ -1,10 +1,9 @@
 import { webhookCallback } from "grammy";
 import { createBot } from "./bot.js";
-import { handleTwitchWebhook } from "./handlers/twitch.js";
 import type { Env } from "./types.js";
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
@@ -22,10 +21,6 @@ export default {
         // already failed once; the error is still logged above.
         return new Response("OK", { status: 200 });
       }
-    }
-
-    if (request.method === "POST" && url.pathname === "/webhook/twitch") {
-      return handleTwitchWebhook(request, env, ctx);
     }
 
     return new Response("Not found", { status: 404 });

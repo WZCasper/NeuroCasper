@@ -1,11 +1,13 @@
 import { Bot, Context, InlineKeyboard } from "grammy";
 import {
   createChannel,
+  createExtraLink,
   createSocialAccount,
   createStreamer,
   getChannelById,
   getChannelByOwnerAndChatId,
   listChannelsByOwner,
+  listExtraLinksByStreamer,
   listSocialAccountsByStreamer,
   listStreamersByChannel,
   setSession,
@@ -13,7 +15,6 @@ import {
   updateChannelTemplate,
 } from "../db.js";
 import { DEFAULT_TEMPLATE } from "../lib/message-templates.js";
-import { getTwitchUserByLogin, subscribeEventSub } from "../lib/twitch-api.js";
 import { IDLE_SESSION } from "../types.js";
 import type { ChannelRow, Env, Platform, SessionState, UserRow } from "../types.js";
 
@@ -22,14 +23,16 @@ export interface BotContext extends Context {
   session: SessionState;
 }
 
-const ALL_PLATFORMS: Platform[] = ["twitch", "youtube", "tiktok"];
-const PLATFORM_DISPLAY: Record<Platform, string> = { twitch: "Twitch", youtube: "YouTube", tiktok: "TikTok" };
+const ALL_PLATFORMS: Platform[] = ["youtube", "tiktok"];
+const PLATFORM_DISPLAY: Record<Platform, string> = { youtube: "YouTube", tiktok: "TikTok" };
 
 export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
   bot.command("start", async (ctx) => {
     await ctx.reply(
-      "NeuroCasper watches Twitch/YouTube/TikTok streamers and posts a “live” or “new video” alert " +
-        "to your Telegram channel or group, with a button per platform.\n\n" +
+      "NeuroCasper watches YouTube/TikTok streamers and posts a “live” or “new video” alert " +
+        "to your Telegram channel or group, with a button per platform — plus any extra links " +
+        "you attach (Twitch, Discord, etc.), shown on every alert regardless of which platform " +
+        "triggered it.\n\n" +
         "Setup:\n" +
         "1) Add me as admin (with the “pin messages” permission) to your channel or group.\n" +
         "2) Register it:\n" +
@@ -37,8 +40,8 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
         "   • Channel: forward any post from the channel to me here in DM.\n" +
         "3) Back in this DM, send /add_social to attach a streamer.\n" +
         "4) Use /settings any time to edit the alert template or pin behaviour.\n\n" +
-        "If the same streamer is live on more than one platform at once, I merge it into a single message " +
-        "with one button per platform instead of posting twice.",
+        "If the same streamer is live on more than one monitored platform at once, I merge it " +
+        "into a single message with one button per platform instead of posting twice.",
     );
   });
 
@@ -77,7 +80,7 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
     }
 
     await createChannel(env, ctx.dbUser.id, chat.id, chat.title);
-    await ctx.reply("✅ Registered! DM me /add_social to attach a Twitch, YouTube or TikTok streamer.");
+    await ctx.reply("✅ Registered! DM me /add_social to attach a YouTube/TikTok streamer.");
   });
 
   bot.command("add_social", async (ctx) => {
@@ -135,6 +138,10 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
       await handleStreamerNameInput(ctx, env, session.data);
     } else if (session.step === "awaiting_social_username") {
       await handleSocialUsernameInput(ctx, env, session.data);
+    } else if (session.step === "awaiting_link_label") {
+      await handleLinkLabelInput(ctx, env, session.data);
+    } else if (session.step === "awaiting_link_url") {
+      await handleLinkUrlInput(ctx, env, session.data);
     } else if (session.step === "awaiting_template") {
       await handleTemplateInput(ctx, env, session.data);
     }
@@ -172,12 +179,12 @@ async function registerChannelFromForward(ctx: BotContext, env: Env): Promise<vo
 
   await createChannel(env, ctx.dbUser.id, channelChat.id, channelChat.title);
   await ctx.reply(
-    `✅ "${channelChat.title}" registered! Send /add_social to attach a Twitch, YouTube or TikTok streamer.`,
+    `✅ "${channelChat.title}" registered! Send /add_social to attach a YouTube/TikTok streamer.`,
   );
 }
 
 // ---------------------------------------------------------------------------
-// /add_social flow: channel -> streamer (existing or new) -> platform -> username
+// /add_social flow: channel -> streamer (existing or new) -> platform/link -> value
 // ---------------------------------------------------------------------------
 
 async function promptChannelChoice(ctx: BotContext, channels: ChannelRow[], prefix: "soc" | "set"): Promise<void> {
@@ -203,6 +210,11 @@ async function promptStreamerChoice(
   else await ctx.reply(text, { reply_markup: kb });
 }
 
+/** Shows monitored-platform choices (YouTube/TikTok, minus ones already
+ * attached) plus an always-available "add a link" option for anything not
+ * independently monitored (Twitch, Discord, ...) — see schema.sql's
+ * extra_links comment for why Twitch lives there instead of being checked
+ * for real. */
 async function promptPlatformChoice(
   ctx: BotContext,
   env: Env,
@@ -213,16 +225,11 @@ async function promptPlatformChoice(
   const taken = new Set(existing.map((a) => a.platform));
   const remaining = ALL_PLATFORMS.filter((p) => !taken.has(p));
 
-  if (remaining.length === 0) {
-    const text = "All three platforms are already attached to this streamer.";
-    if (edit) await ctx.editMessageText(text);
-    else await ctx.reply(text);
-    return;
-  }
-
   const kb = new InlineKeyboard();
   for (const p of remaining) kb.text(PLATFORM_DISPLAY[p], `soc:pl:${streamerId}:${p}`).row();
-  const text = "Which platform?";
+  kb.text("🔗 Add a link (Twitch, Discord, ...)", `soc:link:${streamerId}`).row();
+
+  const text = remaining.length > 0 ? "Which platform, or add a link?" : "Add a link (both monitored platforms are already attached):";
   if (edit) await ctx.editMessageText(text, { reply_markup: kb });
   else await ctx.reply(text, { reply_markup: kb });
 }
@@ -256,12 +263,17 @@ async function handleAddSocialCallback(ctx: BotContext, env: Env, rest: string[]
       data: { streamer_id: streamerId, platform },
     });
     const hint =
-      platform === "twitch"
-        ? "Send their Twitch username (e.g. shroud)."
-        : platform === "youtube"
-          ? "Send their YouTube channel ID (starts with UC…) or @handle."
-          : "Send their TikTok username (without @).";
+      platform === "youtube"
+        ? "Send their YouTube channel ID (starts with UC…) or @handle."
+        : "Send their TikTok username (without @).";
     await ctx.editMessageText(hint);
+    return;
+  }
+
+  if (action === "link" && rest[1]) {
+    const streamerId = Number(rest[1]);
+    await setSession(env, ctx.dbUser.id, { step: "awaiting_link_label", data: { streamer_id: streamerId } });
+    await ctx.editMessageText('What should the button say? (e.g. "Twitch", "Discord")');
   }
 }
 
@@ -284,43 +296,8 @@ async function handleSocialUsernameInput(
 
   await setSession(env, ctx.dbUser.id, IDLE_SESSION);
 
-  if (data.platform === "twitch") await addTwitchSocial(ctx, env, data.streamer_id, username);
-  else if (data.platform === "youtube") await addYoutubeSocial(ctx, env, data.streamer_id, username);
+  if (data.platform === "youtube") await addYoutubeSocial(ctx, env, data.streamer_id, username);
   else await addTiktokSocial(ctx, env, data.streamer_id, username);
-}
-
-async function addTwitchSocial(ctx: BotContext, env: Env, streamerId: number, username: string): Promise<void> {
-  await ctx.reply("Looking that up on Twitch…");
-
-  let user;
-  try {
-    user = await getTwitchUserByLogin(env, username);
-  } catch (err) {
-    console.error("Twitch user lookup failed", err);
-    await ctx.reply(
-      "Twitch lookup failed — check TWITCH_CLIENT_ID/TWITCH_CLIENT_SECRET are set correctly and try again.",
-    );
-    return;
-  }
-  if (!user) {
-    await ctx.reply(`No Twitch user "${username}" found. Try again with /add_social.`);
-    return;
-  }
-
-  let subId: string | null = null;
-  try {
-    subId = await subscribeEventSub(env, "stream.online", user.id);
-    await subscribeEventSub(env, "stream.offline", user.id);
-  } catch (err) {
-    console.error("Twitch EventSub subscribe failed", err);
-    await ctx.reply(
-      "Found the user, but subscribing to Twitch EventSub failed. Verify TWITCH_EVENTSUB_SECRET and WORKER_URL are set and that the Worker is deployed and publicly reachable, then try again.",
-    );
-    return;
-  }
-
-  await createSocialAccount(env, streamerId, "twitch", user.login, user.id, subId);
-  await ctx.reply(`✅ Twitch/${user.display_name} attached — you'll get an alert the moment they go live.`);
 }
 
 async function addYoutubeSocial(ctx: BotContext, env: Env, streamerId: number, input: string): Promise<void> {
@@ -339,7 +316,7 @@ async function addYoutubeSocial(ctx: BotContext, env: Env, streamerId: number, i
     }
   }
 
-  await createSocialAccount(env, streamerId, "youtube", input, channelYtId, null);
+  await createSocialAccount(env, streamerId, "youtube", input, channelYtId);
   await ctx.reply(
     `✅ YouTube channel attached (ID: ${channelYtId}). The GitHub Actions checker polls it roughly every 5 minutes.`,
   );
@@ -360,9 +337,32 @@ async function resolveYoutubeChannelId(handle: string): Promise<string> {
 }
 
 async function addTiktokSocial(ctx: BotContext, env: Env, streamerId: number, username: string): Promise<void> {
-  await createSocialAccount(env, streamerId, "tiktok", username, null, null);
+  await createSocialAccount(env, streamerId, "tiktok", username, null);
   await ctx.reply(
-    `✅ TikTok/@${username} attached. Heads up: TikTok has no public live-status API, so this relies on a best-effort page check in the checker script that can break if TikTok changes their site — treat it as less reliable than Twitch/YouTube.`,
+    `✅ TikTok/@${username} attached. Heads up: TikTok has no public live-status API, so this relies on a best-effort page check in the checker script that can break if TikTok changes their site — treat it as less reliable than YouTube.`,
+  );
+}
+
+async function handleLinkLabelInput(ctx: BotContext, env: Env, data: { streamer_id: number }): Promise<void> {
+  const label = ctx.message?.text?.trim();
+  if (!label) return;
+  await setSession(env, ctx.dbUser.id, { step: "awaiting_link_url", data: { streamer_id: data.streamer_id, label } });
+  await ctx.reply(`And the URL for "${label}"?`);
+}
+
+async function handleLinkUrlInput(
+  ctx: BotContext,
+  env: Env,
+  data: { streamer_id: number; label: string },
+): Promise<void> {
+  const raw = ctx.message?.text?.trim();
+  if (!raw) return;
+  const url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+  await createExtraLink(env, data.streamer_id, data.label, url);
+  await ctx.reply(
+    `✅ "${data.label}" link attached — it'll show up as a button on every alert for this streamer, alongside whichever monitored platform actually triggered it.`,
   );
 }
 
@@ -395,7 +395,7 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
     const channelId = Number(rest[1]);
     await setSession(env, ctx.dbUser.id, { step: "awaiting_template", data: { channel_id: channelId } });
     await ctx.editMessageText(
-      `Send the new alert text (shown under the "\u{1F534} {streamer} is live!" header).\nPlaceholders: {title} {game}\n\nDefault:\n${DEFAULT_TEMPLATE}`,
+      `Send the new alert text (shown under the "🔴 {streamer} is live!" header).\nPlaceholders: {title} {game}\n\nDefault:\n${DEFAULT_TEMPLATE}`,
     );
     return;
   }
@@ -412,9 +412,15 @@ async function renderChannelSettings(ctx: BotContext, env: Env, channel: Channel
   const streamers = await listStreamersByChannel(env, channel.id);
   const lines: string[] = [];
   for (const s of streamers) {
-    const accounts = await listSocialAccountsByStreamer(env, s.id);
-    const platforms = accounts.length ? accounts.map((a) => PLATFORM_DISPLAY[a.platform]).join(", ") : "no platforms yet";
-    lines.push(`• ${s.display_name}: ${platforms}`);
+    const [accounts, links] = await Promise.all([
+      listSocialAccountsByStreamer(env, s.id),
+      listExtraLinksByStreamer(env, s.id),
+    ]);
+    const parts = [
+      ...accounts.map((a) => PLATFORM_DISPLAY[a.platform]),
+      ...links.map((l) => l.label),
+    ];
+    lines.push(`• ${s.display_name}: ${parts.length ? parts.join(", ") : "nothing attached yet"}`);
   }
   const list = lines.length ? lines.join("\n") : "(none yet — DM /add_social to add one)";
 
