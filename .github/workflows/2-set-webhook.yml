@@ -6,6 +6,9 @@ name: "2) Set Telegram webhook"
 on:
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 env:
   # Update this if the Worker's URL ever changes (custom domain, renamed
   # Worker, different workers.dev subdomain, etc). Not read from
@@ -19,6 +22,8 @@ jobs:
   set-webhook:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Call Telegram setWebhook
         run: |
           RESPONSE=$(curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook" \
@@ -29,4 +34,12 @@ jobs:
 
       - name: Show current webhook status (delivery errors show up here)
         run: |
-          curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/getWebhookInfo" | python3 -m json.tool
+          curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/getWebhookInfo" | python3 -m json.tool | tee webhook-status.json
+
+      - name: Commit status file (temporary debugging aid)
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          git add webhook-status.json
+          git diff --cached --quiet || git commit -m "Update webhook-status.json [skip ci]"
+          git push
