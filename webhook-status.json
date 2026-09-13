@@ -3,10 +3,10 @@
     "result": {
         "url": "https://neurocasper.webtkachdenis.workers.dev/webhook/telegram",
         "has_custom_certificate": false,
-        "pending_update_count": 4,
-        "last_error_date": 1789291494,
+        "pending_update_count": 0,
+        "last_error_date": 1789331658,
         "last_error_message": "Wrong response from the webhook: 500 Internal Server Error",
         "max_connections": 40,
-        "ip_address": "188.114.96.0"
+        "ip_address": "188.114.97.0"
     }
 }
