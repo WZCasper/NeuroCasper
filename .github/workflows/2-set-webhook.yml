@@ -26,3 +26,7 @@ jobs:
             --data-urlencode "secret_token=${{ secrets.WEBHOOK_SECRET }}")
           echo "$RESPONSE"
           echo "$RESPONSE" | grep -q '"ok":true' || (echo "::error::setWebhook call failed, see response above" && exit 1)
+
+      - name: Show current webhook status (delivery errors show up here)
+        run: |
+          curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/getWebhookInfo" | python3 -m json.tool
