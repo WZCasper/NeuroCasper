@@ -11,12 +11,16 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/webhook/telegram") {
-      const bot = createBot(env);
-      const handleUpdate = webhookCallback(bot, "cloudflare-mod", { secretToken: env.WEBHOOK_SECRET });
       try {
+        const bot = createBot(env);
+        const handleUpdate = webhookCallback(bot, "cloudflare-mod", { secretToken: env.WEBHOOK_SECRET });
         return await handleUpdate(request);
       } catch (err) {
-        console.error("Telegram webhook error", err);
+        // Log with enough detail to diagnose from the dashboard's
+        // Observability -> Logs tab (a bad/missing BOT_TOKEN is the most
+        // likely cause of a throw here, since grammY validates the token
+        // format when constructing Bot).
+        console.error("Telegram webhook error:", err instanceof Error ? err.stack ?? err.message : err);
         // Ack with 200 anyway so Telegram doesn't retry-storm a request that
         // already failed once; the error is still logged above.
         return new Response("OK", { status: 200 });
