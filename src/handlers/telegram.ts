@@ -29,19 +29,19 @@ const PLATFORM_DISPLAY: Record<Platform, string> = { youtube: "YouTube", tiktok:
 export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
   bot.command("start", async (ctx) => {
     await ctx.reply(
-      "NeuroCasper watches YouTube/TikTok streamers and posts a “live” or “new video” alert " +
-        "to your Telegram channel or group, with a button per platform — plus any extra links " +
-        "you attach (Twitch, Discord, etc.), shown on every alert regardless of which platform " +
-        "triggered it.\n\n" +
-        "Setup:\n" +
-        "1) Add me as admin (with the “pin messages” permission) to your channel or group.\n" +
-        "2) Register it:\n" +
-        "   • Group: send /add_channel inside the group.\n" +
-        "   • Channel: forward any post from the channel to me here in DM.\n" +
-        "3) Back in this DM, send /add_social to attach a streamer.\n" +
-        "4) Use /settings any time to edit the alert template or pin behaviour.\n\n" +
-        "If the same streamer is live on more than one monitored platform at once, I merge it " +
-        "into a single message with one button per platform instead of posting twice.",
+      "NeuroCasper следит за стримерами на YouTube/TikTok и присылает уведомление «в эфире» или «новое видео» " +
+        "в ваш Telegram-канал или группу — с кнопкой на каждую платформу, плюс любые дополнительные ссылки " +
+        "(Twitch, Discord и т.д.), которые показываются в каждом уведомлении независимо от того, какая " +
+        "платформа его вызвала.\n\n" +
+        "Настройка:\n" +
+        "1) Добавьте меня админом (с правом «закреплять сообщения») в канал или группу.\n" +
+        "2) Зарегистрируйте её:\n" +
+        "   • Группа: отправьте /add_channel прямо в группе.\n" +
+        "   • Канал: перешлите мне сюда, в личку, любой пост из канала.\n" +
+        "3) Вернитесь в эту личку и отправьте /add_social, чтобы привязать стримера.\n" +
+        "4) Команда /settings в любой момент — изменить текст уведомления или поведение закрепления.\n\n" +
+        "Если один и тот же стример одновременно в эфире на нескольких отслеживаемых платформах, я объединяю " +
+        "это в одно сообщение с кнопкой на каждую платформу вместо дублей.",
     );
   });
 
@@ -49,12 +49,12 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
     const chat = ctx.chat;
     if (chat.type === "private") {
       await ctx.reply(
-        "Run /add_channel inside the group you want alerts posted to — or, for a broadcast channel, forward any post from that channel to me here.",
+        "Отправьте /add_channel прямо в группе, куда должны приходить уведомления — а для канала перешлите мне сюда любой пост из него.",
       );
       return;
     }
     if (chat.type !== "group" && chat.type !== "supergroup") {
-      await ctx.reply("This only works in groups/supergroups. For channels, forward a post to me in DM.");
+      await ctx.reply("Это работает только в группах/супергруппах. Для каналов перешлите мне пост в личку.");
       return;
     }
     if (!ctx.from) return;
@@ -62,36 +62,36 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
     const botMember = await ctx.getChatMember(ctx.me.id).catch(() => null);
     if (!botMember || botMember.status !== "administrator") {
       await ctx.reply(
-        "Please make me an admin here first (post + pin messages permission), then run /add_channel again.",
+        "Сначала сделайте меня админом здесь (права на публикацию и закрепление сообщений), потом снова отправьте /add_channel.",
       );
       return;
     }
 
     const userMember = await ctx.getChatMember(ctx.from.id).catch(() => null);
     if (!userMember || (userMember.status !== "creator" && userMember.status !== "administrator")) {
-      await ctx.reply("Only an admin of this group can register it.");
+      await ctx.reply("Зарегистрировать эту группу может только её админ.");
       return;
     }
 
     const existing = await getChannelByOwnerAndChatId(env, ctx.dbUser.id, chat.id);
     if (existing) {
-      await ctx.reply("This group is already registered. DM me /add_social to attach a streamer.");
+      await ctx.reply("Эта группа уже зарегистрирована. Напишите мне в личку /add_social, чтобы привязать стримера.");
       return;
     }
 
     await createChannel(env, ctx.dbUser.id, chat.id, chat.title);
-    await ctx.reply("✅ Registered! DM me /add_social to attach a YouTube/TikTok streamer.");
+    await ctx.reply("✅ Зарегистрировано! Напишите мне в личку /add_social, чтобы привязать стримера YouTube/TikTok.");
   });
 
   bot.command("add_social", async (ctx) => {
     if (ctx.chat.type !== "private") {
-      await ctx.reply("Please DM me to add a streamer — groups/channels stay alert-only.");
+      await ctx.reply("Напишите мне в личные сообщения, чтобы добавить стримера — группы/каналы только для уведомлений.");
       return;
     }
     await setSession(env, ctx.dbUser.id, IDLE_SESSION);
     const channels = await listChannelsByOwner(env, ctx.dbUser.id);
     if (channels.length === 0) {
-      await ctx.reply("You haven't registered a channel or group yet — see /start for how.");
+      await ctx.reply("Вы ещё не зарегистрировали канал или группу — см. /start.");
       return;
     }
     const only = channels.length === 1 ? channels[0] : undefined;
@@ -101,13 +101,13 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
 
   bot.command("settings", async (ctx) => {
     if (ctx.chat.type !== "private") {
-      await ctx.reply("Please DM me to change settings.");
+      await ctx.reply("Напишите мне в личные сообщения, чтобы изменить настройки.");
       return;
     }
     await setSession(env, ctx.dbUser.id, IDLE_SESSION);
     const channels = await listChannelsByOwner(env, ctx.dbUser.id);
     if (channels.length === 0) {
-      await ctx.reply("You haven't registered a channel or group yet — see /start for how.");
+      await ctx.reply("Вы ещё не зарегистрировали канал или группу — см. /start.");
       return;
     }
     await promptChannelChoice(ctx, channels, "set");
@@ -149,7 +149,7 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
 }
 
 // ---------------------------------------------------------------------------
-// Channel registration via forwarded post (for broadcast channels)
+// Регистрация канала через пересланный пост (для broadcast-каналов)
 // ---------------------------------------------------------------------------
 
 async function registerChannelFromForward(ctx: BotContext, env: Env): Promise<void> {
@@ -160,31 +160,31 @@ async function registerChannelFromForward(ctx: BotContext, env: Env): Promise<vo
   const botMember = await ctx.api.getChatMember(channelChat.id, ctx.me.id).catch(() => null);
   if (!botMember || botMember.status !== "administrator") {
     await ctx.reply(
-      "I'm not an admin of that channel yet. Add me as admin (post + pin messages permission), then forward the post again.",
+      "Я ещё не админ этого канала. Добавьте меня админом (права на публикацию и закрепление), потом перешлите пост ещё раз.",
     );
     return;
   }
 
   const userMember = await ctx.api.getChatMember(channelChat.id, ctx.from.id).catch(() => null);
   if (!userMember || (userMember.status !== "creator" && userMember.status !== "administrator")) {
-    await ctx.reply("Only an admin of that channel can register it.");
+    await ctx.reply("Зарегистрировать этот канал может только его админ.");
     return;
   }
 
   const existing = await getChannelByOwnerAndChatId(env, ctx.dbUser.id, channelChat.id);
   if (existing) {
-    await ctx.reply("That channel is already registered. Send /add_social to attach a streamer.");
+    await ctx.reply("Этот канал уже зарегистрирован. Отправьте /add_social, чтобы привязать стримера.");
     return;
   }
 
   await createChannel(env, ctx.dbUser.id, channelChat.id, channelChat.title);
   await ctx.reply(
-    `✅ "${channelChat.title}" registered! Send /add_social to attach a YouTube/TikTok streamer.`,
+    `✅ «${channelChat.title}» зарегистрирован! Отправьте /add_social, чтобы привязать стримера YouTube/TikTok.`,
   );
 }
 
 // ---------------------------------------------------------------------------
-// /add_social flow: channel -> streamer (existing or new) -> platform/link -> value
+// /add_social: канал -> стример (новый или существующий) -> платформа/ссылка -> значение
 // ---------------------------------------------------------------------------
 
 async function promptChannelChoice(ctx: BotContext, channels: ChannelRow[], prefix: "soc" | "set"): Promise<void> {
@@ -192,7 +192,7 @@ async function promptChannelChoice(ctx: BotContext, channels: ChannelRow[], pref
   for (const ch of channels) {
     kb.text(ch.title ?? String(ch.telegram_chat_id), `${prefix}:ch:${ch.id}`).row();
   }
-  await ctx.reply("Which channel/group?", { reply_markup: kb });
+  await ctx.reply("Какой канал/группа?", { reply_markup: kb });
 }
 
 async function promptStreamerChoice(
@@ -204,17 +204,17 @@ async function promptStreamerChoice(
   const streamers = await listStreamersByChannel(env, channel.id);
   const kb = new InlineKeyboard();
   for (const s of streamers) kb.text(s.display_name, `soc:str:${s.id}`).row();
-  kb.text("➕ New streamer", `soc:newstr:${channel.id}`).row();
-  const text = `Streamer for "${channel.title ?? channel.telegram_chat_id}":`;
+  kb.text("➕ Новый стример", `soc:newstr:${channel.id}`).row();
+  const text = `Стример для «${channel.title ?? channel.telegram_chat_id}»:`;
   if (edit) await ctx.editMessageText(text, { reply_markup: kb });
   else await ctx.reply(text, { reply_markup: kb });
 }
 
-/** Shows monitored-platform choices (YouTube/TikTok, minus ones already
- * attached) plus an always-available "add a link" option for anything not
- * independently monitored (Twitch, Discord, ...) — see schema.sql's
- * extra_links comment for why Twitch lives there instead of being checked
- * for real. */
+/** Показывает выбор отслеживаемых платформ (YouTube/TikTok, кроме уже
+ * привязанных) плюс всегда доступный вариант «добавить ссылку» для всего,
+ * что не отслеживается по-настоящему (Twitch, Discord, ...) — см. комментарий
+ * к таблице extra_links в schema.sql про то, почему Twitch там, а не в
+ * настоящем мониторинге. */
 async function promptPlatformChoice(
   ctx: BotContext,
   env: Env,
@@ -227,9 +227,12 @@ async function promptPlatformChoice(
 
   const kb = new InlineKeyboard();
   for (const p of remaining) kb.text(PLATFORM_DISPLAY[p], `soc:pl:${streamerId}:${p}`).row();
-  kb.text("🔗 Add a link (Twitch, Discord, ...)", `soc:link:${streamerId}`).row();
+  kb.text("\u{1F517} Добавить ссылку (Twitch, Discord, ...)", `soc:link:${streamerId}`).row();
 
-  const text = remaining.length > 0 ? "Which platform, or add a link?" : "Add a link (both monitored platforms are already attached):";
+  const text =
+    remaining.length > 0
+      ? "Какая платформа, или добавить ссылку?"
+      : "Добавить ссылку (обе отслеживаемые платформы уже привязаны):";
   if (edit) await ctx.editMessageText(text, { reply_markup: kb });
   else await ctx.reply(text, { reply_markup: kb });
 }
@@ -246,7 +249,7 @@ async function handleAddSocialCallback(ctx: BotContext, env: Env, rest: string[]
   if (action === "newstr" && rest[1]) {
     const channelId = Number(rest[1]);
     await setSession(env, ctx.dbUser.id, { step: "awaiting_streamer_name", data: { channel_id: channelId } });
-    await ctx.editMessageText('What’s this streamer’s name? (shown in alerts, e.g. "Alex")');
+    await ctx.editMessageText('Как зовут этого стримера? (будет показано в уведомлениях, например «Алекс»)');
     return;
   }
 
@@ -264,8 +267,8 @@ async function handleAddSocialCallback(ctx: BotContext, env: Env, rest: string[]
     });
     const hint =
       platform === "youtube"
-        ? "Send their YouTube channel ID (starts with UC…) or @handle."
-        : "Send their TikTok username (without @).";
+        ? "Отправьте ID YouTube-канала (начинается с UC…) или @хэндл."
+        : "Отправьте юзернейм TikTok (без @).";
     await ctx.editMessageText(hint);
     return;
   }
@@ -273,7 +276,7 @@ async function handleAddSocialCallback(ctx: BotContext, env: Env, rest: string[]
   if (action === "link" && rest[1]) {
     const streamerId = Number(rest[1]);
     await setSession(env, ctx.dbUser.id, { step: "awaiting_link_label", data: { streamer_id: streamerId } });
-    await ctx.editMessageText('What should the button say? (e.g. "Twitch", "Discord")');
+    await ctx.editMessageText('Какая надпись будет на кнопке? (например «Twitch», «Discord»)');
   }
 }
 
@@ -304,13 +307,13 @@ async function addYoutubeSocial(ctx: BotContext, env: Env, streamerId: number, i
   let channelYtId = input;
 
   if (!/^UC[\w-]{22}$/.test(input)) {
-    await ctx.reply("Resolving that handle…");
+    await ctx.reply("Определяю канал по хэндлу…");
     try {
       channelYtId = await resolveYoutubeChannelId(input);
     } catch (err) {
       console.error("YouTube handle resolution failed", err);
       await ctx.reply(
-        "Couldn't resolve that handle automatically. Open the channel on youtube.com, copy the ID from the URL (starts with UC…) and send that instead.",
+        "Не удалось автоматически определить канал по хэндлу. Откройте канал на youtube.com, скопируйте ID из адреса (начинается с UC…) и отправьте его.",
       );
       return;
     }
@@ -318,14 +321,14 @@ async function addYoutubeSocial(ctx: BotContext, env: Env, streamerId: number, i
 
   await createSocialAccount(env, streamerId, "youtube", input, channelYtId);
   await ctx.reply(
-    `✅ YouTube channel attached (ID: ${channelYtId}). The GitHub Actions checker polls it roughly every 5 minutes.`,
+    `✅ YouTube-канал привязан (ID: ${channelYtId}). Проверяется примерно раз в 5 минут.`,
   );
 }
 
-/** Best-effort: YouTube has no free public handle→channelId lookup, so this
- * scrapes the channel page HTML for the canonical channel ID. It can break if
- * YouTube changes their page markup — the reliable path is the user pasting
- * the UC… channel ID directly. */
+/** Best-effort: у YouTube нет бесплатного публичного способа получить
+ * channelId по хэндлу, поэтому здесь парсится HTML страницы канала. Может
+ * сломаться, если YouTube изменит вёрстку страницы — надёжный вариант —
+ * пользователь сам вставляет ID канала (начинается с UC…). */
 async function resolveYoutubeChannelId(handle: string): Promise<string> {
   const cleanHandle = handle.replace(/^@/, "");
   const res = await fetch(`https://www.youtube.com/@${encodeURIComponent(cleanHandle)}`);
@@ -339,7 +342,7 @@ async function resolveYoutubeChannelId(handle: string): Promise<string> {
 async function addTiktokSocial(ctx: BotContext, env: Env, streamerId: number, username: string): Promise<void> {
   await createSocialAccount(env, streamerId, "tiktok", username, null);
   await ctx.reply(
-    `✅ TikTok/@${username} attached. Heads up: TikTok has no public live-status API, so this relies on a best-effort page check in the checker script that can break if TikTok changes their site — treat it as less reliable than YouTube.`,
+    `✅ TikTok/@${username} привязан. Учтите: у TikTok нет публичного API статуса эфира, поэтому проверка идёт через best-effort разбор страницы, который может сломаться при изменении сайта TikTok — считайте это менее надёжным, чем YouTube.`,
   );
 }
 
@@ -347,7 +350,7 @@ async function handleLinkLabelInput(ctx: BotContext, env: Env, data: { streamer_
   const label = ctx.message?.text?.trim();
   if (!label) return;
   await setSession(env, ctx.dbUser.id, { step: "awaiting_link_url", data: { streamer_id: data.streamer_id, label } });
-  await ctx.reply(`And the URL for "${label}"?`);
+  await ctx.reply(`А теперь ссылку для «${label}»?`);
 }
 
 async function handleLinkUrlInput(
@@ -362,12 +365,12 @@ async function handleLinkUrlInput(
   await setSession(env, ctx.dbUser.id, IDLE_SESSION);
   await createExtraLink(env, data.streamer_id, data.label, url);
   await ctx.reply(
-    `✅ "${data.label}" link attached — it'll show up as a button on every alert for this streamer, alongside whichever monitored platform actually triggered it.`,
+    `✅ Ссылка «${data.label}» привязана — будет показываться кнопкой в каждом уведомлении этого стримера, независимо от того, какая платформа его вызвала.`,
   );
 }
 
 // ---------------------------------------------------------------------------
-// /settings flow
+// /settings
 // ---------------------------------------------------------------------------
 
 async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[]): Promise<void> {
@@ -395,7 +398,7 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
     const channelId = Number(rest[1]);
     await setSession(env, ctx.dbUser.id, { step: "awaiting_template", data: { channel_id: channelId } });
     await ctx.editMessageText(
-      `Send the new alert text (shown under the "🔴 {streamer} is live!" header).\nPlaceholders: {title} {game}\n\nDefault:\n${DEFAULT_TEMPLATE}`,
+      `Отправьте новый текст уведомления (показывается под заголовком «\u{1F534} {streamer} в эфире!»).\nПлейсхолдеры: {title} {game}\n\nПо умолчанию:\n${DEFAULT_TEMPLATE}`,
     );
     return;
   }
@@ -404,7 +407,7 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
     const channels = await listChannelsByOwner(env, ctx.dbUser.id);
     const kb = new InlineKeyboard();
     for (const ch of channels) kb.text(ch.title ?? String(ch.telegram_chat_id), `set:ch:${ch.id}`).row();
-    await ctx.editMessageText("Which channel/group?", { reply_markup: kb });
+    await ctx.editMessageText("Какой канал/группа?", { reply_markup: kb });
   }
 }
 
@@ -420,25 +423,25 @@ async function renderChannelSettings(ctx: BotContext, env: Env, channel: Channel
       ...accounts.map((a) => PLATFORM_DISPLAY[a.platform]),
       ...links.map((l) => l.label),
     ];
-    lines.push(`• ${s.display_name}: ${parts.length ? parts.join(", ") : "nothing attached yet"}`);
+    lines.push(`• ${s.display_name}: ${parts.length ? parts.join(", ") : "ничего не привязано"}`);
   }
-  const list = lines.length ? lines.join("\n") : "(none yet — DM /add_social to add one)";
+  const list = lines.length ? lines.join("\n") : "(пока никого нет — добавьте через /add_social)";
 
   const text =
     `⚙️ ${channel.title ?? channel.telegram_chat_id}\n\n` +
-    `Auto-pin: ${channel.auto_pin ? "on" : "off"}\n` +
-    `Auto-unpin: ${channel.auto_unpin ? "on" : "off"}\n\n` +
-    `Streamers:\n${list}\n\n` +
-    `Alert text:\n${channel.message_template}`;
+    `Автозакрепление: ${channel.auto_pin ? "вкл" : "выкл"}\n` +
+    `Автооткрепление: ${channel.auto_unpin ? "вкл" : "выкл"}\n\n` +
+    `Стримеры:\n${list}\n\n` +
+    `Текст уведомления:\n${channel.message_template}`;
 
   const kb = new InlineKeyboard()
-    .text(channel.auto_pin ? "Turn auto-pin off" : "Turn auto-pin on", `set:pin:${channel.id}`)
+    .text(channel.auto_pin ? "Выключить автозакрепление" : "Включить автозакрепление", `set:pin:${channel.id}`)
     .row()
-    .text(channel.auto_unpin ? "Turn auto-unpin off" : "Turn auto-unpin on", `set:unpin:${channel.id}`)
+    .text(channel.auto_unpin ? "Выключить автооткрепление" : "Включить автооткрепление", `set:unpin:${channel.id}`)
     .row()
-    .text("Edit alert text", `set:tpl:${channel.id}`)
+    .text("Изменить текст уведомления", `set:tpl:${channel.id}`)
     .row()
-    .text("⬅ Back", "set:back");
+    .text("⬅ Назад", "set:back");
 
   await ctx.editMessageText(text, { reply_markup: kb });
 }
@@ -448,5 +451,5 @@ async function handleTemplateInput(ctx: BotContext, env: Env, data: { channel_id
   if (!text) return;
   await setSession(env, ctx.dbUser.id, IDLE_SESSION);
   await updateChannelTemplate(env, data.channel_id, text);
-  await ctx.reply("✅ Alert text updated.");
+  await ctx.reply("✅ Текст уведомления обновлён.");
 }

@@ -3,7 +3,7 @@
 // option without one. It fails closed (returns "not live, no new video")
 // rather than throwing when the page doesn't match, since TikTok's markup is
 // undocumented and can change without notice. Treat this module as the
-// weakest link of the three platforms and expect it may need updating.
+// weakest link of the two platforms and expect it may need updating.
 export interface TiktokStatus {
   isLive: boolean;
   roomId: string | null;

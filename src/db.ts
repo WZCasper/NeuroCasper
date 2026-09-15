@@ -1,16 +1,19 @@
-// D1 query helpers for the Worker's bot. The Worker only manages
-// configuration (users, channels, streamers, monitored accounts, extra
-// links) — it never touches posts/post_platforms, since all live/video
-// detection and posting now happens in the checker script (scripts/,
-// via GitHub Actions) rather than a Worker-side Twitch webhook. See
-// scripts/lib/db.ts for the posts/post_platforms equivalents.
+// D1 query helpers for the Worker. Covers both the bot's configuration
+// tables (users, channels, streamers, social_accounts, extra_links) and,
+// since the YouTube/TikTok checker moved here from a separate GitHub
+// Actions script (see src/scheduled.ts), the posts/post_platforms tables
+// too.
 import type {
   ChannelRow,
   Env,
   ExtraLinkRow,
   Platform,
+  PostKind,
+  PostPlatformRow,
+  PostRow,
   SessionState,
   SocialAccountRow,
+  SocialAccountWithStreamer,
   StreamerRow,
   UserRow,
 } from "./types.js";
@@ -166,6 +169,23 @@ export async function listSocialAccountsByStreamer(
   return results ?? [];
 }
 
+/** All monitored accounts for a platform, joined with their streamer —
+ * what the scheduled checker iterates over. */
+export async function listSocialAccountsByPlatform(
+  env: Env,
+  platform: Platform,
+): Promise<SocialAccountWithStreamer[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT sa.*, s.display_name AS streamer_display_name, s.channel_id AS streamer_channel_id
+     FROM social_accounts sa
+     JOIN streamers s ON s.id = sa.streamer_id
+     WHERE sa.platform = ?`,
+  )
+    .bind(platform)
+    .all<SocialAccountWithStreamer>();
+  return results ?? [];
+}
+
 export async function createSocialAccount(
   env: Env,
   streamerId: number,
@@ -182,6 +202,20 @@ export async function createSocialAccount(
     .first<SocialAccountRow>();
   if (!row) throw new Error("Failed to create social account");
   return row;
+}
+
+export async function updateLastVideoId(env: Env, socialAccountId: number, videoId: string): Promise<void> {
+  await env.DB.prepare(
+    "UPDATE social_accounts SET last_video_id = ?, last_checked_at = datetime('now') WHERE id = ?",
+  )
+    .bind(videoId, socialAccountId)
+    .run();
+}
+
+export async function touchLastCheckedAt(env: Env, socialAccountId: number): Promise<void> {
+  await env.DB.prepare("UPDATE social_accounts SET last_checked_at = datetime('now') WHERE id = ?")
+    .bind(socialAccountId)
+    .run();
 }
 
 // ---------------------------------------------------------------------------
@@ -210,4 +244,129 @@ export async function createExtraLink(
     .first<ExtraLinkRow>();
   if (!row) throw new Error("Failed to create extra link");
   return row;
+}
+
+// ---------------------------------------------------------------------------
+// posts / post_platforms
+// ---------------------------------------------------------------------------
+
+/** Minutes a 'video' post stays eligible for another platform to merge into
+ * (see schema.sql comment on `posts.kind`). 'live' posts don't need a
+ * window: they stay open for as long as is_open=1. */
+export const VIDEO_POST_MERGE_WINDOW_MINUTES = 15;
+
+export async function findOpenPost(env: Env, streamerId: number, kind: PostKind): Promise<PostRow | null> {
+  if (kind === "live") {
+    const row = await env.DB.prepare(
+      "SELECT * FROM posts WHERE streamer_id = ? AND kind = 'live' AND is_open = 1 ORDER BY created_at DESC LIMIT 1",
+    )
+      .bind(streamerId)
+      .first<PostRow>();
+    return row ?? null;
+  }
+  const row = await env.DB.prepare(
+    `SELECT * FROM posts
+     WHERE streamer_id = ? AND kind = 'video' AND is_open = 1
+       AND created_at >= datetime('now', ?)
+     ORDER BY created_at DESC LIMIT 1`,
+  )
+    .bind(streamerId, `-${VIDEO_POST_MERGE_WINDOW_MINUTES} minutes`)
+    .first<PostRow>();
+  return row ?? null;
+}
+
+export async function getPostById(env: Env, id: number): Promise<PostRow | null> {
+  const row = await env.DB.prepare("SELECT * FROM posts WHERE id = ?").bind(id).first<PostRow>();
+  return row ?? null;
+}
+
+export async function createPost(
+  env: Env,
+  streamerId: number,
+  channelId: number,
+  kind: PostKind,
+  telegramChatId: number,
+  telegramMessageId: number,
+): Promise<PostRow> {
+  const row = await env.DB.prepare(
+    `INSERT INTO posts (streamer_id, channel_id, kind, telegram_chat_id, telegram_message_id)
+     VALUES (?, ?, ?, ?, ?)
+     RETURNING *`,
+  )
+    .bind(streamerId, channelId, kind, telegramChatId, telegramMessageId)
+    .first<PostRow>();
+  if (!row) throw new Error("Failed to create post");
+  return row;
+}
+
+export async function addPostPlatform(
+  env: Env,
+  postId: number,
+  socialAccountId: number,
+  platform: Platform,
+  contentId: string | null,
+  url: string,
+): Promise<PostPlatformRow> {
+  const row = await env.DB.prepare(
+    `INSERT INTO post_platforms (post_id, social_account_id, platform, content_id, url)
+     VALUES (?, ?, ?, ?, ?)
+     RETURNING *`,
+  )
+    .bind(postId, socialAccountId, platform, contentId, url)
+    .first<PostPlatformRow>();
+  if (!row) throw new Error("Failed to add post platform");
+  return row;
+}
+
+export async function listPostPlatforms(env: Env, postId: number): Promise<PostPlatformRow[]> {
+  const { results } = await env.DB.prepare(
+    "SELECT * FROM post_platforms WHERE post_id = ? ORDER BY created_at ASC",
+  )
+    .bind(postId)
+    .all<PostPlatformRow>();
+  return results ?? [];
+}
+
+export async function listOpenPostPlatforms(env: Env, postId: number): Promise<PostPlatformRow[]> {
+  const { results } = await env.DB.prepare(
+    "SELECT * FROM post_platforms WHERE post_id = ? AND ended = 0 ORDER BY created_at ASC",
+  )
+    .bind(postId)
+    .all<PostPlatformRow>();
+  return results ?? [];
+}
+
+export async function findOpenPostPlatformForAccount(
+  env: Env,
+  socialAccountId: number,
+): Promise<PostPlatformRow | null> {
+  const row = await env.DB.prepare(
+    "SELECT * FROM post_platforms WHERE social_account_id = ? AND ended = 0 ORDER BY created_at DESC LIMIT 1",
+  )
+    .bind(socialAccountId)
+    .first<PostPlatformRow>();
+  return row ?? null;
+}
+
+export async function contentAlreadyPosted(
+  env: Env,
+  socialAccountId: number,
+  contentId: string,
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    "SELECT id FROM post_platforms WHERE social_account_id = ? AND content_id = ? LIMIT 1",
+  )
+    .bind(socialAccountId, contentId)
+    .first<{ id: number }>();
+  return row !== null;
+}
+
+export async function closePostPlatform(env: Env, id: number): Promise<void> {
+  await env.DB.prepare("UPDATE post_platforms SET ended = 1 WHERE id = ?").bind(id).run();
+}
+
+export async function closePost(env: Env, id: number): Promise<void> {
+  await env.DB.prepare("UPDATE posts SET is_open = 0, closed_at = datetime('now') WHERE id = ?")
+    .bind(id)
+    .run();
 }

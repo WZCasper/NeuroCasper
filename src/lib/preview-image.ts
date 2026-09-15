@@ -1,18 +1,16 @@
-// Node counterpart of src/lib/preview-image.ts — same hand-written SVG +
-// @resvg/resvg-wasm rendering, verified working in an earlier smoke test
-// (see project notes), but loading the wasm module and font from disk via
-// `fs` instead of a bundler import, since this runs as a plain Node script
-// rather than inside the Worker's bundle. Keep the visual design in sync
-// with the Worker version if you change one.
+// Fallback preview card, generated when a platform doesn't hand us a usable
+// thumbnail (this is the normal case for TikTok, which has no public API to
+// fetch one from; it's also a safety net if a YouTube thumbnail fetch ever
+// fails). Renders a hand-written SVG to PNG with @resvg/resvg-wasm — pure
+// WASM, no native bindings, verified to bundle and run under Cloudflare
+// Workers. No layout engine (Satori) is used since the card is simple enough
+// to position by hand; text is a single-line, character-count truncation
+// rather than measured, which is the one real limitation of that choice.
 import { Resvg, initWasm } from "@resvg/resvg-wasm";
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-import type { Platform, PostKind } from "./types.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const WASM_PATH = path.join(__dirname, "..", "..", "node_modules", "@resvg", "resvg-wasm", "index_bg.wasm");
-const FONT_PATH = path.join(__dirname, "..", "assets", "Inter-Bold.ttf");
+// Typed via src/wasm.d.ts; wrangler's bundler resolves this to a WebAssembly.Module.
+import RESVG_WASM_MODULE from "@resvg/resvg-wasm/index_bg.wasm";
+import { INTER_BOLD_TTF_BASE64 } from "../assets/fonts.js";
+import type { Platform, PostKind } from "../types.js";
 
 const CARD_WIDTH = 1280;
 const CARD_HEIGHT = 720;
@@ -29,16 +27,21 @@ const PLATFORM_NAMES: Record<Platform, string> = {
 
 let wasmReady: Promise<void> | null = null;
 function ensureWasm(): Promise<void> {
-  if (!wasmReady) {
-    wasmReady = readFile(WASM_PATH).then((bytes) => initWasm(bytes));
-  }
+  if (!wasmReady) wasmReady = initWasm(RESVG_WASM_MODULE);
   return wasmReady;
 }
 
 let cachedFontBytes: Uint8Array | null = null;
-async function getFontBytes(): Promise<Uint8Array> {
-  if (!cachedFontBytes) cachedFontBytes = await readFile(FONT_PATH);
+function getFontBytes(): Uint8Array {
+  if (!cachedFontBytes) cachedFontBytes = base64ToBytes(INTER_BOLD_TTF_BASE64);
   return cachedFontBytes;
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 function escapeXml(text: string): string {
@@ -57,8 +60,10 @@ function truncate(text: string, max: number): string {
 function buildFallbackSvg(platform: Platform, displayName: string, kind: PostKind): string {
   const [c1, c2] = GRADIENTS[platform];
   const name = escapeXml(truncate(displayName, 22));
-  // The "● live dot" is drawn as an SVG shape, not a Unicode glyph — see
-  // the matching comment in src/lib/preview-image.ts for why.
+  // The live dot is an SVG shape, not a Unicode glyph — the embedded Inter
+  // subset is Latin-only and doesn't include geometric-shape characters
+  // like U+25CF (confirmed by rendering and inspecting the PNG earlier: it
+  // came out as a tofu box). Shapes have no font-coverage risk at all.
   const status = escapeXml(
     kind === "live" ? `LIVE · ${PLATFORM_NAMES[platform]}` : `NEW VIDEO · ${PLATFORM_NAMES[platform]}`,
   );
@@ -86,18 +91,19 @@ function buildFallbackSvg(platform: Platform, displayName: string, kind: PostKin
 </svg>`;
 }
 
+/** Renders the branded fallback card and returns raw PNG bytes, ready to
+ * hand to `new InputFile(bytes, "preview.png")`. */
 export async function generateFallbackPreview(
   platform: Platform,
   displayName: string,
   kind: PostKind,
 ): Promise<Uint8Array> {
   await ensureWasm();
-  const fontBytes = await getFontBytes();
   const svg = buildFallbackSvg(platform, displayName, kind);
   const resvg = new Resvg(svg, {
     font: {
       loadSystemFonts: false,
-      fontBuffers: [fontBytes],
+      fontBuffers: [getFontBytes()],
       defaultFontFamily: "Inter",
     },
   });

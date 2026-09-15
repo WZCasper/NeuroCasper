@@ -1,15 +1,15 @@
-// Mirrors src/lib/buttons.ts, returning plain Telegram API JSON instead of a
-// grammY InlineKeyboard (this script doesn't depend on grammY — see
-// scripts/lib/telegram.ts). Keep the two files' labels/colors in sync if you
-// change one.
-import type { InlineButton } from "./telegram.js";
-import type { Platform } from "./types.js";
+import { InlineKeyboard } from "grammy";
+import type { Platform } from "../types.js";
 
+// Telegram's Bot API gives inline buttons NO color/style control — a
+// coloured emoji in the label is the closest honest approximation the
+// platform actually allows.
 export const PLATFORM_LABELS: Record<Platform, string> = {
   youtube: "\u{1F534} YouTube",
   tiktok: "⚫ TikTok",
 };
 
+// Used only by the generated fallback preview image (src/lib/preview-image.ts).
 export const PLATFORM_BRAND_COLORS: Record<Platform, string> = {
   youtube: "#FF0000",
   tiktok: "#000000",
@@ -44,9 +44,13 @@ function formatLinkLabel(label: string): string {
 export function buildKeyboard(
   platformLinks: PlatformLink[],
   extraLinks: Array<{ label: string; url: string }> = [],
-): InlineButton[][] {
-  return [
-    ...platformLinks.map((link) => [{ text: PLATFORM_LABELS[link.platform], url: link.url }]),
-    ...extraLinks.map((link) => [{ text: formatLinkLabel(link.label), url: link.url }]),
-  ];
+): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  for (const link of platformLinks) {
+    kb.url(PLATFORM_LABELS[link.platform], link.url).row();
+  }
+  for (const link of extraLinks) {
+    kb.url(formatLinkLabel(link.label), link.url).row();
+  }
+  return kb;
 }
