@@ -92,11 +92,13 @@ Workers & Pages → воркер → подключён к репозитори�
   `database_id` в `wrangler.toml`, закоммитить, запушить. (Тот же результат
   даёт `1-bootstrap-db.yml` из вкладки Actions — он ещё и сразу применяет
   `schema.sql`.)
-- **Секреты**: `BOT_TOKEN`, `WEBHOOK_SECRET`, опционально `YOUTUBE_API_KEY` —
-  через `0-sync-secrets.yml` (Actions → Run workflow, нужны те же секреты
-  и в GitHub тоже — Settings → Secrets and variables → Actions) или вручную
-  через Settings → Variables and Secrets у воркера (но см. ограничение ниже
-  про то, почему это может не пережить следующий деплой).
+- **Секреты**: `BOT_TOKEN`, `WEBHOOK_SECRET` — через `0-sync-secrets.yml`
+  (Actions → Run workflow, нужны те же секреты и в GitHub тоже — Settings →
+  Secrets and variables → Actions) или вручную через Settings → Variables
+  and Secrets у воркера (но см. ограничение ниже про то, почему это может
+  не пережить следующий деплой). `YOUTUBE_API_KEY` туда не входит по
+  умолчанию (см. комментарий в файле workflow, почему) — если понадобится,
+  добавляется отдельно.
 
 ### 3. Направить Telegram на воркер
 
