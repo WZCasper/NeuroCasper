@@ -7,15 +7,14 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   # Update this if the Worker's URL ever changes (custom domain, renamed
-  # Worker, different workers.dev subdomain, etc). Not read from
-  # wrangler.toml on purpose: nothing in the Worker's own code needs this
-  # value anymore (Twitch removal took the only user of it with it), so
-  # keeping it here avoids carrying an otherwise-unused variable in
-  # wrangler.toml just for this one workflow's sake.
+  # Worker, different workers.dev subdomain, etc) -- and keep it in sync
+  # with wrangler.toml's [vars] WORKER_URL, which the Worker's own code now
+  # reads at runtime too (Kick OAuth redirect_uri, src/lib/kick.ts). Two
+  # copies because GitHub Actions env: doesn't read wrangler.toml.
   WORKER_URL: "https://neurocasper.webtkachdenis.workers.dev"
 
 jobs:
@@ -34,12 +33,9 @@ jobs:
 
       - name: Show current webhook status (delivery errors show up here)
         run: |
-          curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/getWebhookInfo" | python3 -m json.tool | tee webhook-status.json
-
-      - name: Commit status file (temporary debugging aid)
-        run: |
-          git config user.email "actions@github.com"
-          git config user.name "github-actions"
-          git add webhook-status.json
-          git diff --cached --quiet || git commit -m "Update webhook-status.json [skip ci]"
-          git push
+          {
+            echo "### Telegram webhook status"
+            echo '```json'
+            curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/getWebhookInfo" | python3 -m json.tool
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
