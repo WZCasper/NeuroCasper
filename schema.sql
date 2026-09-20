@@ -12,6 +12,8 @@ PRAGMA foreign_keys = ON;
 DROP TABLE IF EXISTS post_platforms;
 DROP TABLE IF EXISTS posts;
 DROP TABLE IF EXISTS extra_links;
+DROP TABLE IF EXISTS kick_oauth_states;
+DROP TABLE IF EXISTS kick_tokens;
 DROP TABLE IF EXISTS social_accounts;
 DROP TABLE IF EXISTS streamers;
 DROP TABLE IF EXISTS channels;
@@ -66,13 +68,50 @@ CREATE TABLE streamers (
 CREATE TABLE social_accounts (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   streamer_id         INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
-  platform            TEXT NOT NULL CHECK (platform IN ('youtube','tiktok')),
-  platform_user_id    TEXT,   -- YouTube channel ID (UC...); unused for tiktok
+  platform            TEXT NOT NULL CHECK (platform IN ('youtube','tiktok','kick')),
+  platform_user_id    TEXT,   -- YouTube channel ID (UC...) / Kick broadcaster_user_id; unused for tiktok
   platform_username   TEXT NOT NULL,
   last_video_id       TEXT,   -- last seen video/room id, for de-duping
   last_checked_at     TEXT,
   created_at          TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(streamer_id, platform)
+);
+
+-- One row per Kick channel the bot has been authorized for. Unlike YouTube
+-- (public RSS feed) and TikTok (public profile page), Kick's events:subscribe
+-- webhook is per-authorized-user: the broadcaster (the streamer themself,
+-- not whoever runs this bot) must complete Kick's OAuth flow once so the
+-- bot can subscribe to their livestream.status.updated event. See
+-- src/lib/kick.ts for the OAuth + webhook-subscribe flow that fills this.
+CREATE TABLE kick_tokens (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  social_account_id     INTEGER NOT NULL UNIQUE REFERENCES social_accounts(id) ON DELETE CASCADE,
+  broadcaster_user_id   INTEGER NOT NULL,
+  access_token          TEXT NOT NULL,
+  refresh_token         TEXT NOT NULL,
+  expires_at            TEXT NOT NULL,  -- ISO datetime; refresh before this
+  event_subscription_id TEXT,           -- Kick's id for the livestream.status.updated subscription, for cleanup
+  created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Short-lived CSRF-protection row for Kick's OAuth flow: created right
+-- before redirecting the streamer to Kick's authorization page, read back
+-- (and deleted) when Kick redirects back to /kick/oauth/callback with this
+-- same `state` value. Ties the callback to the streamer_id and the
+-- Telegram user who started the flow, since the OAuth round trip happens
+-- in the streamer's own browser, outside any Telegram session. Also carries
+-- the PKCE code_verifier generated alongside `state`, since the token
+-- exchange at the callback step needs the exact same value used to derive
+-- the code_challenge in the authorization URL. Rows older than a few
+-- minutes are treated as expired regardless of whether they're deleted
+-- (see src/lib/kick.ts).
+CREATE TABLE kick_oauth_states (
+  state         TEXT PRIMARY KEY,
+  code_verifier TEXT NOT NULL,
+  streamer_id   INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+  requested_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- A static link attached to a streamer that ISN'T independently monitored
@@ -132,6 +171,7 @@ CREATE INDEX idx_channels_owner       ON channels(owner_user_id);
 CREATE INDEX idx_streamers_channel    ON streamers(channel_id);
 CREATE INDEX idx_social_streamer      ON social_accounts(streamer_id);
 CREATE INDEX idx_social_platform      ON social_accounts(platform);
+CREATE INDEX idx_kick_tokens_broadcaster ON kick_tokens(broadcaster_user_id);
 CREATE INDEX idx_extra_links_streamer ON extra_links(streamer_id);
 CREATE INDEX idx_posts_streamer_open  ON posts(streamer_id, kind, is_open);
 CREATE INDEX idx_post_platforms_post  ON post_platforms(post_id, ended);
