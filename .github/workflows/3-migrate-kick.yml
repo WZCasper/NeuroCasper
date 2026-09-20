@@ -1,0 +1,41 @@
+# Run once, manually (Actions tab -> this workflow -> "Run workflow"), to
+# apply migrations/001_add_kick.sql to the live D1 database -- adds Kick as
+# a third monitored platform. Unlike 1-bootstrap-db.yml (which re-applies
+# schema.sql, a full drop+recreate), this is additive and safe to run
+# against a database that already has real streamers/posts/etc in it -- see
+# the comment at the top of migrations/001_add_kick.sql for why.
+#
+# Safe to re-run accidentally: if it's already been applied, this fails
+# with a "table social_accounts_old already exists" (or similar) error
+# instead of doing anything harmful -- that failure just means the
+# migration already ran, nothing to do.
+#
+# Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repo secrets
+# (same ones 1-bootstrap-db.yml and 0-sync-secrets.yml already use).
+name: "3) Apply Kick migration to D1"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply migrations/001_add_kick.sql
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --file=./migrations/001_add_kick.sql
+
+      - name: List all tables (check kick_tokens and kick_oauth_states are there)
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --command "SELECT name FROM sqlite_master"
