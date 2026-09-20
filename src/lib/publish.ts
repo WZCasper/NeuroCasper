@@ -155,6 +155,23 @@ export async function closeLivePlatform(env: Env, api: Api, socialAccountId: num
     return;
   }
 
+  // No monitored platform is still live under this post. Its buttons would
+  // otherwise keep pointing at a stream that's already over, so trim them
+  // down to just the extra_links (Twitch etc. are never checked for
+  // "still live" -- see schema.sql's comment on extra_links -- so those
+  // stay valid and worth keeping clickable).
+  const extraLinks = await listExtraLinksByStreamer(env, post.streamer_id);
+  try {
+    if (extraLinks.length > 0) {
+      const kb = buildKeyboard([], extraLinks);
+      await api.editMessageReplyMarkup(post.telegram_chat_id, post.telegram_message_id, { reply_markup: kb });
+    } else {
+      await api.editMessageReplyMarkup(post.telegram_chat_id, post.telegram_message_id);
+    }
+  } catch (err) {
+    console.error(`Failed to clear buttons on post ${post.id}`, err);
+  }
+
   const channel = await getChannelById(env, post.channel_id);
   if (channel?.auto_unpin) {
     try {

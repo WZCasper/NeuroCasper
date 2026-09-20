@@ -7,11 +7,12 @@
 // not a bug in the checker logic itself. Cloudflare Cron Triggers run on
 // the same platform as the Worker and keep much tighter to schedule.
 //
-// Polls YouTube (RSS + optional Data API) and TikTok (best-effort page
-// check) for every tracked account, publishing or merging alerts via
-// src/lib/publish.ts.
+// Polls YouTube (fast /live redirect check + RSS + optional Data API) and
+// TikTok (best-effort page check) for every tracked account, publishing or
+// merging alerts via src/lib/publish.ts.
 import { Api } from "grammy";
 import {
+  contentAlreadyPosted,
   findOpenPostPlatformForAccount,
   getChannelById,
   listSocialAccountsByPlatform,
@@ -20,7 +21,7 @@ import {
 } from "./db.js";
 import { closeLivePlatform, publishOrMerge } from "./lib/publish.js";
 import { checkTiktokStatus } from "./lib/tiktok.js";
-import { checkIsCurrentlyLive, fetchLatestVideo } from "./lib/youtube.js";
+import { checkChannelLiveNow, checkIsCurrentlyLive, fetchLatestVideo } from "./lib/youtube.js";
 import type { Env, SocialAccountWithStreamer } from "./types.js";
 
 async function checkYoutubeAccount(
@@ -39,9 +40,58 @@ async function checkYoutubeAccount(
     if (!stillLive) await closeLivePlatform(env, api, account.id);
   }
 
+  // Fast path: the channel's permanent /live redirect reflects live status
+  // immediately, unlike the RSS feed below, which can take a long time
+  // (minutes, sometimes tens of minutes) to list a just-started broadcast.
+  // Only worth checking if nothing is already tracked as live for this
+  // account -- otherwise the openPlatformRow re-check above already covers
+  // it (findOpenPostPlatformForAccount is scoped to this social_account_id,
+  // so a row found here is always this same YouTube account's own live
+  // post, never some other platform's).
+  if (!openPlatformRow) {
+    const liveNow = await checkChannelLiveNow(account.platform_user_id);
+    if (liveNow && !(await contentAlreadyPosted(env, account.id, liveNow.videoId))) {
+      const channel = await getChannelById(env, account.streamer_channel_id);
+      if (channel) {
+        await publishOrMerge({
+          env,
+          api,
+          channel,
+          streamerId: account.streamer_id,
+          streamerName: account.streamer_display_name,
+          socialAccountId: account.id,
+          platform: "youtube",
+          kind: "live",
+          url: `https://www.youtube.com/watch?v=${liveNow.videoId}`,
+          contentId: liveNow.videoId,
+          title: liveNow.title,
+          thumbnailUrl: null,
+        });
+        await updateLastVideoId(env, account.id, liveNow.videoId);
+        // Already posted this run via the fast path -- skip the RSS check
+        // below so a still-lagging feed entry for the same video doesn't
+        // get processed a second time in this same pass.
+        return;
+      }
+    }
+  }
+
   const latest = await fetchLatestVideo(account.platform_user_id);
   await touchLastCheckedAt(env, account.id);
   if (!latest || latest.videoId === account.last_video_id) return;
+
+  // Belt-and-suspenders guard on top of the last_video_id check above:
+  // YouTube's RSS feed can briefly stop listing a just-ended stream as the
+  // latest entry while it's being converted to a VOD (see
+  // contentAlreadyPosted's comment in src/db.ts), which can make
+  // last_video_id drift to an older id for one poll. If that happens, the
+  // feed later "reintroduces" the same video and the check above alone
+  // would treat it as new. Skip (but still resync last_video_id) if this
+  // exact video was already posted for this account, under either kind.
+  if (await contentAlreadyPosted(env, account.id, latest.videoId)) {
+    await updateLastVideoId(env, account.id, latest.videoId);
+    return;
+  }
 
   const channel = await getChannelById(env, account.streamer_channel_id);
   if (!channel) return;

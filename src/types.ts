@@ -7,9 +7,18 @@ export interface Env {
   // Optional: without it, YouTube live detection falls back to a
   // best-effort page-scrape heuristic (see src/lib/youtube.ts).
   YOUTUBE_API_KEY?: string;
+  // Required only if Kick is used as a monitored platform (see
+  // src/lib/kick.ts). From the app registered at
+  // https://kick.com/settings/developer.
+  KICK_CLIENT_ID?: string;
+  KICK_CLIENT_SECRET?: string;
+  // The Worker's own public HTTPS URL, no trailing slash. Not a secret --
+  // set as a plain [vars] entry in wrangler.toml. Needed to build the Kick
+  // OAuth redirect_uri at runtime.
+  WORKER_URL?: string;
 }
 
-export type Platform = "youtube" | "tiktok";
+export type Platform = "youtube" | "tiktok" | "kick";
 export type PostKind = "live" | "video";
 
 export interface UserRow {
@@ -90,6 +99,21 @@ export interface PostPlatformRow {
   url: string;
   ended: number;
   created_at: string;
+}
+
+// One row per Kick channel the bot has been authorized for via OAuth --
+// see schema.sql's comment on this table for why Kick needs this and
+// YouTube/TikTok don't.
+export interface KickTokenRow {
+  id: number;
+  social_account_id: number;
+  broadcaster_user_id: number;
+  access_token: string;
+  refresh_token: string;
+  expires_at: string;
+  event_subscription_id: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 // Persisted in users.session_state as JSON. Drives the multi-step

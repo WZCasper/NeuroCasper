@@ -7,6 +7,7 @@ import type {
   ChannelRow,
   Env,
   ExtraLinkRow,
+  KickTokenRow,
   Platform,
   PostKind,
   PostPlatformRow,
@@ -52,6 +53,11 @@ export async function getOrCreateUser(
 
   if (!inserted) throw new Error("Failed to create user");
   return inserted;
+}
+
+export async function getUserById(env: Env, id: number): Promise<UserRow | null> {
+  const row = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first<UserRow>();
+  return row ?? null;
 }
 
 export async function getSession(env: Env, userId: number): Promise<SessionState> {
@@ -126,7 +132,15 @@ export async function toggleChannelFlag(
   channelId: number,
   flag: "auto_pin" | "auto_unpin",
 ): Promise<ChannelRow | null> {
-  await env.DB.prepare(`UPDATE channels SET ${flag} = 1 - ${flag} WHERE id = ?`).bind(channelId).run();
+  // Literal SQL per flag rather than interpolating the column name into the
+  // query string — `flag` is always a hardcoded literal from the call sites
+  // in src/handlers/telegram.ts today, but this keeps the query text fixed
+  // regardless, rather than relying on that staying true.
+  const sql =
+    flag === "auto_pin"
+      ? "UPDATE channels SET auto_pin = 1 - auto_pin WHERE id = ?"
+      : "UPDATE channels SET auto_unpin = 1 - auto_unpin WHERE id = ?";
+  await env.DB.prepare(sql).bind(channelId).run();
   return getChannelById(env, channelId);
 }
 
@@ -151,6 +165,11 @@ export async function createStreamer(env: Env, channelId: number, displayName: s
     .first<StreamerRow>();
   if (!row) throw new Error("Failed to create streamer");
   return row;
+}
+
+export async function getStreamerById(env: Env, id: number): Promise<StreamerRow | null> {
+  const row = await env.DB.prepare("SELECT * FROM streamers WHERE id = ?").bind(id).first<StreamerRow>();
+  return row ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +235,106 @@ export async function touchLastCheckedAt(env: Env, socialAccountId: number): Pro
   await env.DB.prepare("UPDATE social_accounts SET last_checked_at = datetime('now') WHERE id = ?")
     .bind(socialAccountId)
     .run();
+}
+
+// ---------------------------------------------------------------------------
+// Kick OAuth (streamer-authorized webhook subscription) — see schema.sql's
+// comments on kick_oauth_states / kick_tokens and src/lib/kick.ts.
+// ---------------------------------------------------------------------------
+
+const KICK_OAUTH_STATE_TTL_MINUTES = 10;
+
+export async function createKickOAuthState(
+  env: Env,
+  state: string,
+  codeVerifier: string,
+  streamerId: number,
+  requestedByUserId: number,
+): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO kick_oauth_states (state, code_verifier, streamer_id, requested_by) VALUES (?, ?, ?, ?)",
+  )
+    .bind(state, codeVerifier, streamerId, requestedByUserId)
+    .run();
+}
+
+/** Consumes (deletes) a Kick OAuth state row if it exists and hasn't
+ * expired. Returns null for an unknown or expired state -- the caller
+ * must treat that as "reject this callback", since an expired or reused
+ * state is exactly the CSRF case this table exists to catch. */
+export async function consumeKickOAuthState(
+  env: Env,
+  state: string,
+): Promise<{ streamerId: number; requestedByUserId: number; codeVerifier: string } | null> {
+  const row = await env.DB.prepare(
+    `SELECT streamer_id, requested_by, code_verifier FROM kick_oauth_states
+     WHERE state = ? AND created_at >= datetime('now', ?)`,
+  )
+    .bind(state, `-${KICK_OAUTH_STATE_TTL_MINUTES} minutes`)
+    .first<{ streamer_id: number; requested_by: number; code_verifier: string }>();
+  await env.DB.prepare("DELETE FROM kick_oauth_states WHERE state = ?").bind(state).run();
+  if (!row) return null;
+  return { streamerId: row.streamer_id, requestedByUserId: row.requested_by, codeVerifier: row.code_verifier };
+}
+
+export async function upsertKickToken(
+  env: Env,
+  socialAccountId: number,
+  data: {
+    broadcasterUserId: number;
+    accessToken: string;
+    refreshToken: string;
+    expiresAt: string;
+    eventSubscriptionId: string | null;
+  },
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO kick_tokens
+       (social_account_id, broadcaster_user_id, access_token, refresh_token, expires_at, event_subscription_id)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(social_account_id) DO UPDATE SET
+       broadcaster_user_id = excluded.broadcaster_user_id,
+       access_token = excluded.access_token,
+       refresh_token = excluded.refresh_token,
+       expires_at = excluded.expires_at,
+       event_subscription_id = excluded.event_subscription_id,
+       updated_at = datetime('now')`,
+  )
+    .bind(
+      socialAccountId,
+      data.broadcasterUserId,
+      data.accessToken,
+      data.refreshToken,
+      data.expiresAt,
+      data.eventSubscriptionId,
+    )
+    .run();
+}
+
+export async function getKickTokenBySocialAccount(
+  env: Env,
+  socialAccountId: number,
+): Promise<KickTokenRow | null> {
+  const row = await env.DB.prepare("SELECT * FROM kick_tokens WHERE social_account_id = ?")
+    .bind(socialAccountId)
+    .first<KickTokenRow>();
+  return row ?? null;
+}
+
+/** Looked up by Kick's broadcaster_user_id, the only identifier a webhook
+ * payload carries — see src/lib/kick.ts's handleWebhook. */
+export async function getSocialAccountByKickBroadcasterId(
+  env: Env,
+  broadcasterUserId: number,
+): Promise<SocialAccountRow | null> {
+  const row = await env.DB.prepare(
+    `SELECT sa.* FROM social_accounts sa
+     JOIN kick_tokens kt ON kt.social_account_id = sa.id
+     WHERE kt.broadcaster_user_id = ?`,
+  )
+    .bind(broadcasterUserId)
+    .first<SocialAccountRow>();
+  return row ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +467,16 @@ export async function findOpenPostPlatformForAccount(
   return row ?? null;
 }
 
+/** True if this exact piece of content (by platform content_id, e.g. a
+ * YouTube video id) was already posted for this social account, in ANY
+ * post -- live or video, open or closed. Was defined but unused; now used
+ * by src/scheduled.ts as a guard against re-announcing the same stream
+ * once it turns into a VOD: YouTube's RSS feed can briefly stop listing a
+ * video as the latest entry while it's mid-transition from "live" to
+ * "video", which can make last_video_id drift to an older id for one poll
+ * and then "see" the same content_id again as if it were new when the feed
+ * catches up. Checking post_platforms directly catches that regardless of
+ * what last_video_id currently holds. */
 export async function contentAlreadyPosted(
   env: Env,
   socialAccountId: number,

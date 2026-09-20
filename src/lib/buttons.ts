@@ -7,12 +7,14 @@ import type { Platform } from "../types.js";
 export const PLATFORM_LABELS: Record<Platform, string> = {
   youtube: "\u{1F534} YouTube",
   tiktok: "⚫ TikTok",
+  kick: "\u{1F7E2} Kick",
 };
 
 // Used only by the generated fallback preview image (src/lib/preview-image.ts).
 export const PLATFORM_BRAND_COLORS: Record<Platform, string> = {
   youtube: "#FF0000",
   tiktok: "#000000",
+  kick: "#3DB414",
 };
 
 export interface PlatformLink {

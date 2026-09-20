@@ -18,11 +18,13 @@ const CARD_HEIGHT = 720;
 const GRADIENTS: Record<Platform, [string, string]> = {
   youtube: ["#FF0000", "#8B0000"],
   tiktok: ["#1A1A1A", "#000000"],
+  kick: ["#3DB414", "#1B5E0A"],
 };
 
 const PLATFORM_NAMES: Record<Platform, string> = {
   youtube: "YOUTUBE",
   tiktok: "TIKTOK",
+  kick: "KICK",
 };
 
 let wasmReady: Promise<void> | null = null;

@@ -2,6 +2,7 @@ import { Bot, Context, InlineKeyboard } from "grammy";
 import {
   createChannel,
   createExtraLink,
+  createKickOAuthState,
   createSocialAccount,
   createStreamer,
   getChannelById,
@@ -14,6 +15,7 @@ import {
   toggleChannelFlag,
   updateChannelTemplate,
 } from "../db.js";
+import { buildAuthorizationUrl, generatePkcePair } from "../lib/kick.js";
 import { DEFAULT_TEMPLATE } from "../lib/message-templates.js";
 import { IDLE_SESSION } from "../types.js";
 import type { ChannelRow, Env, Platform, SessionState, UserRow } from "../types.js";
@@ -23,11 +25,12 @@ export interface BotContext extends Context {
   session: SessionState;
 }
 
-const ALL_PLATFORMS: Platform[] = ["youtube", "tiktok"];
-const PLATFORM_DISPLAY: Record<Platform, string> = { youtube: "YouTube", tiktok: "TikTok" };
+const ALL_PLATFORMS: Platform[] = ["youtube", "tiktok", "kick"];
+const PLATFORM_DISPLAY: Record<Platform, string> = { youtube: "YouTube", tiktok: "TikTok", kick: "Kick" };
 
 export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
   bot.command("start", async (ctx) => {
+    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
     await ctx.reply(
       "NeuroCasper следит за стримерами на YouTube/TikTok и присылает уведомление «в эфире» или «новое видео» " +
         "в ваш Telegram-канал или группу — с кнопкой на каждую платформу, плюс любые дополнительные ссылки " +
@@ -232,9 +235,44 @@ async function promptPlatformChoice(
   const text =
     remaining.length > 0
       ? "Какая платформа, или добавить ссылку?"
-      : "Добавить ссылку (обе отслеживаемые платформы уже привязаны):";
+      : "Добавить ссылку (все отслеживаемые платформы уже привязаны):";
   if (edit) await ctx.editMessageText(text, { reply_markup: kb });
   else await ctx.reply(text, { reply_markup: kb });
+}
+
+/** Starts Kick's OAuth flow: unlike YouTube/TikTok (a public username is
+ * enough), Kick requires the streamer themself to approve this bot via
+ * Kick's own login, since events:subscribe is authorized per-channel. This
+ * sends an authorization link the streamer opens in their own browser --
+ * createSocialAccount for their Kick account only happens once they finish
+ * that and Kick redirects back to /kick/oauth/callback (src/index.ts). */
+async function promptKickAuthorization(ctx: BotContext, env: Env, streamerId: number): Promise<void> {
+  if (!env.KICK_CLIENT_ID || !env.WORKER_URL) {
+    await ctx.editMessageText(
+      "Интеграция с Kick не настроена на сервере (нет KICK_CLIENT_ID или WORKER_URL). " +
+        "Обратитесь к администратору бота.",
+    );
+    return;
+  }
+
+  const { codeVerifier, codeChallenge } = await generatePkcePair();
+  const state = crypto.randomUUID();
+  await createKickOAuthState(env, state, codeVerifier, streamerId, ctx.dbUser.id);
+
+  const url = buildAuthorizationUrl({
+    clientId: env.KICK_CLIENT_ID,
+    redirectUri: `${env.WORKER_URL}/kick/oauth/callback`,
+    state,
+    codeChallenge,
+  });
+
+  const kb = new InlineKeyboard().url("\u{1F7E2} Авторизовать на Kick", url).row();
+  kb.text("\u{2B05} Назад", `soc:str:${streamerId}`).row();
+  await ctx.editMessageText(
+    "Откройте ссылку и разрешите доступ своим аккаунтом Kick — стример должен сделать это сам, " +
+      "это подтверждает его канал. Ссылка действительна 10 минут.",
+    { reply_markup: kb },
+  );
 }
 
 async function handleAddSocialCallback(ctx: BotContext, env: Env, rest: string[]): Promise<void> {
@@ -261,6 +299,12 @@ async function handleAddSocialCallback(ctx: BotContext, env: Env, rest: string[]
   if (action === "pl" && rest[1] && rest[2]) {
     const streamerId = Number(rest[1]);
     const platform = rest[2] as Platform;
+
+    if (platform === "kick") {
+      await promptKickAuthorization(ctx, env, streamerId);
+      return;
+    }
+
     await setSession(env, ctx.dbUser.id, {
       step: "awaiting_social_username",
       data: { streamer_id: streamerId, platform },

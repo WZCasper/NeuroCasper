@@ -1,5 +1,6 @@
 import { webhookCallback } from "grammy";
 import { createBot } from "./bot.js";
+import { handleKickOAuthCallback, handleKickWebhook } from "./handlers/kick.js";
 import { runScheduledCheck } from "./scheduled.js";
 import type { Env } from "./types.js";
 
@@ -20,6 +21,14 @@ export default {
         console.error("Telegram webhook error:", err instanceof Error ? err.stack ?? err.message : err);
         return new Response("OK", { status: 200 });
       }
+    }
+
+    if (request.method === "GET" && url.pathname === "/kick/oauth/callback") {
+      return handleKickOAuthCallback(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/kick/webhook") {
+      return handleKickWebhook(request, env);
     }
 
     return new Response("Not found", { status: 404 });
