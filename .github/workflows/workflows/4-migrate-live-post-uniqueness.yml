@@ -1,0 +1,39 @@
+# Run once, manually (Actions tab -> this workflow -> "Run workflow"), to
+# apply migrations/002_add_live_post_unique_constraint.sql to the live D1
+# database -- adds a safety-net constraint against a rare duplicate-post
+# race (see the comment at the top of that migration file for details).
+#
+# Safe to re-run accidentally: the migration uses CREATE UNIQUE INDEX IF
+# NOT EXISTS, so running it again when it's already applied is a no-op,
+# not an error.
+#
+# Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repo secrets
+# (same ones 1-bootstrap-db.yml, 0-sync-secrets.yml and 3-migrate-kick.yml
+# already use).
+name: "4) Add live-post uniqueness constraint to D1"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply migrations/002_add_live_post_unique_constraint.sql
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --file=./migrations/002_add_live_post_unique_constraint.sql
+
+      - name: List indexes on posts (confirm the new one is there)
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --command "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'posts'"

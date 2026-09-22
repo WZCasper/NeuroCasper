@@ -1,0 +1,31 @@
+# Runs on every push and every pull request: type-checks the Worker and
+# runs the test suite (src/**/*.test.ts, see package.json's "test" script).
+#
+# This is separate from Cloudflare's own Git-integration build (which runs
+# `npm run build` = typecheck, but only at deploy time, on pushes to
+# main) -- this workflow catches a broken build or a failing test on pull
+# requests too, before anything merges to main, and on every branch push,
+# not just deploys.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
