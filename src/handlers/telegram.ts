@@ -32,7 +32,7 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
   bot.command("start", async (ctx) => {
     await setSession(env, ctx.dbUser.id, IDLE_SESSION);
     await ctx.reply(
-      "NeuroCasper следит за стримерами на YouTube/TikTok и присылает уведомление «в эфире» или «новое видео» " +
+      "NeuroCasper следит за стримерами на YouTube/TikTok/Kick и присылает уведомление «в эфире» или «новое видео» " +
         "в ваш Telegram-канал или группу — с кнопкой на каждую платформу, плюс любые дополнительные ссылки " +
         "(Twitch, Discord и т.д.), которые показываются в каждом уведомлении независимо от того, какая " +
         "платформа его вызвала.\n\n" +
@@ -343,8 +343,16 @@ async function handleSocialUsernameInput(
 
   await setSession(env, ctx.dbUser.id, IDLE_SESSION);
 
+  // Kick never reaches this function -- selecting it in promptPlatformChoice
+  // goes straight to promptKickAuthorization's OAuth flow instead of this
+  // username-based session step (see handleAddSocialCallback's "pl" case).
+  // Written as an exhaustive check rather than an `if/else` that silently
+  // treated "not youtube" as "must be tiktok", so a future platform added
+  // here without updating this function fails loudly instead of being
+  // misrouted to the wrong add-account logic.
   if (data.platform === "youtube") await addYoutubeSocial(ctx, env, data.streamer_id, username);
-  else await addTiktokSocial(ctx, env, data.streamer_id, username);
+  else if (data.platform === "tiktok") await addTiktokSocial(ctx, env, data.streamer_id, username);
+  else console.error(`handleSocialUsernameInput: unexpected platform "${data.platform}"`);
 }
 
 async function addYoutubeSocial(ctx: BotContext, env: Env, streamerId: number, input: string): Promise<void> {

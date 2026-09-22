@@ -1,0 +1,35 @@
+{
+  // Test files run under real Node.js (via `tsx --test`, see package.json's
+  // "test" script), not the Cloudflare Workers runtime -- so unlike
+  // tsconfig.json (which types the actual deployed Worker code strictly
+  // against @cloudflare/workers-types, and nothing else, so a Node-only
+  // API used by mistake in src/**/*.ts is a type error), this config adds
+  // Node's own types (node:test, node:assert, Buffer, ...) on top. Kept as
+  // a separate file, rather than adding "node" to tsconfig.json's `types`
+  // directly, so production code (tsconfig.json) still can't accidentally
+  // typecheck against a Node-only API that doesn't exist in Workers.
+  // @cloudflare/workers-types stays in this config's `types` too (not
+  // swapped out) because a test file importing from production source
+  // (e.g. kick.test.ts importing kick.ts) makes TypeScript check that
+  // source file's whole module graph under THIS config -- dropping
+  // workers-types here made TypeScript re-check already-correct Workers
+  // code (e.g. crypto.subtle calls in kick.ts) against DOM lib's stricter,
+  // differently-generic TypedArray types instead of the Workers ones it
+  // was actually written and verified against, producing false positives.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "types": ["node", "@cloudflare/workers-types"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.test.ts"]
+}

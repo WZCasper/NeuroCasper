@@ -61,6 +61,23 @@ function buildCaption(channel: ChannelRow, kind: PostKind, streamerName: string,
 export async function publishOrMerge(input: PublishInput): Promise<void> {
   const { env, api, channel, streamerId, streamerName, socialAccountId, platform, kind, url, contentId } = input;
 
+  // Known race, deliberately not fully closed: this read-then-decide is not
+  // atomic with the INSERT further down, so two "went live" events for the
+  // same streamer arriving close enough together (realistic case: a Kick
+  // webhook lands while this same function is mid-call for that streamer's
+  // YouTube/TikTok check on the 5-minute cron -- see src/scheduled.ts) can
+  // both read "no open post" here before either has inserted one, each then
+  // sending its own Telegram message. schema.sql's
+  // idx_posts_one_open_live_per_streamer makes the second createPost() call
+  // below fail loudly (caught and logged, not silent) instead of both
+  // succeeding as two independently-tracked posts -- but by then the
+  // losing request's Telegram message has typically already been sent, so
+  // it stops the worse outcome (two posts silently drifting apart, e.g.
+  // only one ever getting unpinned) without preventing a rare duplicate
+  // message. Closing that fully would need claiming the post row (e.g. an
+  // INSERT ... ON CONFLICT DO NOTHING) before calling the Telegram API,
+  // which is a bigger restructure than this fix -- worth doing if
+  // duplicate posts turn out to happen in practice.
   const openPost = await findOpenPost(env, streamerId, kind);
 
   if (openPost) {

@@ -174,5 +174,28 @@ CREATE INDEX idx_social_platform      ON social_accounts(platform);
 CREATE INDEX idx_kick_tokens_broadcaster ON kick_tokens(broadcaster_user_id);
 CREATE INDEX idx_extra_links_streamer ON extra_links(streamer_id);
 CREATE INDEX idx_posts_streamer_open  ON posts(streamer_id, kind, is_open);
+
+-- At most one OPEN 'live' post per streamer -- a safety net against the
+-- rare race where two "went live" events for the same streamer (e.g. a
+-- Kick webhook arriving while the same cron run is mid-check for that
+-- streamer's YouTube/TikTok account -- realistic, since a simulcasting
+-- streamer often starts every platform within moments of the others) get
+-- processed closely enough together that both read "no open post yet"
+-- (src/lib/publish.ts's publishOrMerge) before either has inserted one.
+-- Without this, both inserts would succeed and the streamer would get two
+-- separate Telegram posts instead of one merged post, with only one of
+-- them ever receiving further button updates or auto-unpin -- silent and
+-- easy to miss. With it, the second INSERT fails outright (already caught
+-- and logged in publishOrMerge) instead of silently succeeding, turning a
+-- silent data-integrity bug into a loud, logged one. This does not fully
+-- close the race -- the Telegram message for the losing request has
+-- typically already been sent by the time its INSERT is attempted, see
+-- publish.ts's comment -- but it stops the worse outcome of two
+-- independently-tracked open posts drifting apart. Partial index, so
+-- closed posts and 'video' posts (which use a time-window check instead
+-- of is_open, see VIDEO_POST_MERGE_WINDOW_MINUTES) are unaffected.
+CREATE UNIQUE INDEX idx_posts_one_open_live_per_streamer
+  ON posts(streamer_id) WHERE kind = 'live' AND is_open = 1;
+
 CREATE INDEX idx_post_platforms_post  ON post_platforms(post_id, ended);
 CREATE INDEX idx_post_platforms_acct  ON post_platforms(social_account_id, ended);

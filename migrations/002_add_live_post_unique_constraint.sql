@@ -1,0 +1,35 @@
+-- Migration: enforce at most one OPEN 'live' post per streamer at the
+-- database level.
+--
+-- Run once, manually, against a live database with:
+--   npx wrangler d1 execute neurocasper-db --remote --file=./migrations/002_add_live_post_unique_constraint.sql
+-- (drop --remote to test against the local dev database first, which is
+-- strongly recommended before running this against --remote).
+--
+-- Additive and safe to run against a database that already has real
+-- streamers/posts/etc in it -- it only adds one index, nothing is
+-- dropped or rebuilt (unlike 001_add_kick.sql, which had to rebuild
+-- social_accounts because SQLite can't widen a CHECK constraint in
+-- place; no such limitation applies to adding an index).
+--
+-- Why this index: see its comment in schema.sql and the comment on
+-- publishOrMerge in src/lib/publish.ts. In short: two "went live" events
+-- for the same streamer processed close enough together (e.g. a Kick
+-- webhook landing while the same cron run is mid-check for that
+-- streamer's YouTube/TikTok account) could previously both read "no open
+-- post yet" and both insert one, leaving two independently-tracked
+-- Telegram posts instead of one merged post. This index makes the second
+-- insert fail loudly (already caught and logged) instead of silently
+-- succeeding.
+--
+-- IMPORTANT -- if this fails with a UNIQUE constraint error, that means a
+-- duplicate already exists in your data (i.e. this exact race already
+-- happened at least once before this fix shipped). Find it with:
+--   SELECT streamer_id, COUNT(*) AS open_live_posts FROM posts
+--   WHERE kind = 'live' AND is_open = 1
+--   GROUP BY streamer_id HAVING COUNT(*) > 1;
+-- then close the stale duplicate (keep the one still receiving updates,
+-- usually the more recent id) before re-running this migration:
+--   UPDATE posts SET is_open = 0, closed_at = datetime('now') WHERE id = <stale id>;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_posts_one_open_live_per_streamer
+  ON posts(streamer_id) WHERE kind = 'live' AND is_open = 1;

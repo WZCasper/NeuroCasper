@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "wrangler dev --test-scheduled",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "tsx --test src/**/*.test.ts",
     "build": "npm run typecheck",
     "db:migrate:local": "wrangler d1 execute neurocasper-db --local --file=./schema.sql",
     "db:migrate:remote": "wrangler d1 execute neurocasper-db --remote --file=./schema.sql"
