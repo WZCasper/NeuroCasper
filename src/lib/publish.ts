@@ -10,6 +10,7 @@ import { InputFile } from "grammy";
 import type { Api } from "grammy";
 import {
   addPostPlatform,
+  claimPostSlot,
   closePost,
   closePostPlatform,
   createPost,
@@ -20,11 +21,12 @@ import {
   listExtraLinksByStreamer,
   listOpenPostPlatforms,
   listPostPlatforms,
+  releasePostSlot,
 } from "../db.js";
 import { buildKeyboard } from "./buttons.js";
 import { renderTemplate } from "./message-templates.js";
 import { generateFallbackPreview } from "./preview-image.js";
-import type { ChannelRow, Env, Platform, PostKind } from "../types.js";
+import type { ChannelRow, Env, Platform, PostKind, PostRow } from "../types.js";
 
 export interface PublishInput {
   env: Env;
@@ -55,55 +57,47 @@ function buildCaption(channel: ChannelRow, kind: PostKind, streamerName: string,
   return body ? `${header}\n\n${body}` : header;
 }
 
-/** Call when a monitored platform goes live / publishes new content for a
- * streamer. Merges into an already-open post for the same streamer+kind if
- * one exists, otherwise creates a new Telegram message. */
-export async function publishOrMerge(input: PublishInput): Promise<void> {
-  const { env, api, channel, streamerId, streamerName, socialAccountId, platform, kind, url, contentId } = input;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  // Known race, deliberately not fully closed: this read-then-decide is not
-  // atomic with the INSERT further down, so two "went live" events for the
-  // same streamer arriving close enough together (realistic case: a Kick
-  // webhook lands while this same function is mid-call for that streamer's
-  // YouTube/TikTok check on the 5-minute cron -- see src/scheduled.ts) can
-  // both read "no open post" here before either has inserted one, each then
-  // sending its own Telegram message. schema.sql's
-  // idx_posts_one_open_live_per_streamer makes the second createPost() call
-  // below fail loudly (caught and logged, not silent) instead of both
-  // succeeding as two independently-tracked posts -- but by then the
-  // losing request's Telegram message has typically already been sent, so
-  // it stops the worse outcome (two posts silently drifting apart, e.g.
-  // only one ever getting unpinned) without preventing a rare duplicate
-  // message. Closing that fully would need claiming the post row (e.g. an
-  // INSERT ... ON CONFLICT DO NOTHING) before calling the Telegram API,
-  // which is a bigger restructure than this fix -- worth doing if
-  // duplicate posts turn out to happen in practice.
-  const openPost = await findOpenPost(env, streamerId, kind);
+/** How many times to back off and retry when another request already holds
+ * the post_claims slot for this streamer+kind, and how long to wait between
+ * retries -- see the comment on the retry loop in publishOrMerge. Five
+ * retries at 400ms is up to ~2s of extra latency in the rare contended
+ * case; a normal claim -> send Telegram message -> createPost -> release
+ * cycle finishes in well under a second, so this is generous headroom, not
+ * a tight budget. */
+const MAX_CLAIM_RETRIES = 5;
+const CLAIM_RETRY_DELAY_MS = 400;
 
-  if (openPost) {
-    try {
-      await addPostPlatform(env, openPost.id, socialAccountId, platform, contentId, url);
-    } catch (err) {
-      console.error(`addPostPlatform failed for post ${openPost.id}`, err);
-      return;
-    }
-    const [platforms, extraLinks] = await Promise.all([
-      listPostPlatforms(env, openPost.id),
-      listExtraLinksByStreamer(env, streamerId),
-    ]);
-    const kb = buildKeyboard(
-      platforms.filter((p) => !p.ended).map((p) => ({ platform: p.platform, url: p.url })),
-      extraLinks,
-    );
-    try {
-      await api.editMessageReplyMarkup(openPost.telegram_chat_id, openPost.telegram_message_id, {
-        reply_markup: kb,
-      });
-    } catch (err) {
-      console.error(`Failed to update buttons on post ${openPost.id}`, err);
-    }
+async function mergeIntoOpenPost(input: PublishInput, openPost: PostRow): Promise<void> {
+  const { env, api, streamerId, socialAccountId, platform, contentId, url } = input;
+  try {
+    await addPostPlatform(env, openPost.id, socialAccountId, platform, contentId, url);
+  } catch (err) {
+    console.error(`addPostPlatform failed for post ${openPost.id}`, err);
     return;
   }
+  const [platforms, extraLinks] = await Promise.all([
+    listPostPlatforms(env, openPost.id),
+    listExtraLinksByStreamer(env, streamerId),
+  ]);
+  const kb = buildKeyboard(
+    platforms.filter((p) => !p.ended).map((p) => ({ platform: p.platform, url: p.url })),
+    extraLinks,
+  );
+  try {
+    await api.editMessageReplyMarkup(openPost.telegram_chat_id, openPost.telegram_message_id, {
+      reply_markup: kb,
+    });
+  } catch (err) {
+    console.error(`Failed to update buttons on post ${openPost.id}`, err);
+  }
+}
+
+async function createNewPost(input: PublishInput): Promise<void> {
+  const { env, api, channel, streamerId, streamerName, socialAccountId, platform, kind, url, contentId } = input;
 
   const extraLinks = await listExtraLinksByStreamer(env, streamerId);
   const caption = buildCaption(channel, kind, streamerName, input.title);
@@ -143,6 +137,73 @@ export async function publishOrMerge(input: PublishInput): Promise<void> {
     await addPostPlatform(env, post.id, socialAccountId, platform, contentId, url);
   } catch (err) {
     console.error(`Failed to record post for streamer ${streamerId}`, err);
+  }
+}
+
+/** Call when a monitored platform goes live / publishes new content for a
+ * streamer. Merges into an already-open post for the same streamer+kind if
+ * one exists, otherwise creates a new Telegram message.
+ *
+ * Safe to call concurrently for the same streamer+kind, from either of the
+ * two places that can happen:
+ *  - Two accounts of the SAME streamer checked in the SAME Worker
+ *    invocation (e.g. one streamer tracked on both YouTube and TikTok, both
+ *    going live in the same 5-minute cron run) -- prevented from ever
+ *    reaching here concurrently in the first place by
+ *    src/lib/streamer-serializer.ts, which src/scheduled.ts routes every
+ *    call through.
+ *  - Two genuinely SEPARATE invocations -- a Kick webhook (src/handlers/kick.ts)
+ *    landing mid-cron-run, or two overlapping cron runs -- which an
+ *    in-memory lock can't reach. This is what the claim/retry loop below
+ *    guards against, via src/db.ts's claimPostSlot/releasePostSlot. */
+export async function publishOrMerge(input: PublishInput): Promise<void> {
+  const { env, streamerId, kind } = input;
+
+  for (let attempt = 0; ; attempt++) {
+    const openPost = await findOpenPost(env, streamerId, kind);
+    if (openPost) {
+      await mergeIntoOpenPost(input, openPost);
+      return;
+    }
+
+    // No open post to merge into -- about to create a brand-new one. Claim
+    // the right to do so BEFORE calling the Telegram API, so a concurrent
+    // caller for this exact streamer+kind (see this function's own doc
+    // comment for the two ways that happens) can't make this same "no open
+    // post yet" read and independently send its own message too.
+    const claimed = await claimPostSlot(env, streamerId, kind);
+    if (claimed) {
+      try {
+        await createNewPost(input);
+      } finally {
+        await releasePostSlot(env, streamerId, kind);
+      }
+      return;
+    }
+
+    if (attempt < MAX_CLAIM_RETRIES) {
+      // Another request is (very likely) mid-flight creating the first
+      // post for this exact streamer+kind right now. Back off briefly and
+      // re-check from the top -- by the time this runs, that request has
+      // almost always already finished, so findOpenPost above will find
+      // its post and this merges into it instead of racing it again.
+      await sleep(CLAIM_RETRY_DELAY_MS);
+      continue;
+    }
+
+    // Gave the claim holder up to MAX_CLAIM_RETRIES * CLAIM_RETRY_DELAY_MS
+    // and its post still isn't visible -- far longer than a normal
+    // claim/send/create/release cycle takes, so treat this as abnormal
+    // rather than keep retrying forever. Proceed WITHOUT the claim rather
+    // than silently dropping a genuine "went live" notification: a rare
+    // duplicate message is a much better failure mode than a missed one.
+    // (Not wrapped in a release call below -- we were never granted this
+    // claim, so there is nothing of ours to release.)
+    console.error(
+      `publishOrMerge: post_claims still held for streamer ${streamerId}/${kind} after ${MAX_CLAIM_RETRIES} retries — publishing without the claim`,
+    );
+    await createNewPost(input);
+    return;
   }
 }
 

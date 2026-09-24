@@ -1,0 +1,39 @@
+# Run once, manually (Actions tab -> this workflow -> "Run workflow"), to
+# apply migrations/003_add_post_claims.sql to the live D1 database -- closes
+# the duplicate-post race from a different angle than migration 002 (see the
+# comment at the top of that migration file for details).
+#
+# Safe to re-run accidentally: the migration uses CREATE TABLE IF NOT
+# EXISTS, so running it again when it's already applied is a no-op, not an
+# error.
+#
+# Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repo secrets
+# (same ones 1-bootstrap-db.yml, 0-sync-secrets.yml, 3-migrate-kick.yml and
+# 4-migrate-live-post-uniqueness.yml already use).
+name: "5) Add post_claims table to D1"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply migrations/003_add_post_claims.sql
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --file=./migrations/003_add_post_claims.sql
+
+      - name: List all tables (confirm post_claims is there)
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --command "SELECT name FROM sqlite_master"

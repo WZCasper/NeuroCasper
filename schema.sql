@@ -9,6 +9,7 @@
 
 PRAGMA foreign_keys = ON;
 
+DROP TABLE IF EXISTS post_claims;
 DROP TABLE IF EXISTS post_platforms;
 DROP TABLE IF EXISTS posts;
 DROP TABLE IF EXISTS extra_links;
@@ -167,6 +168,38 @@ CREATE TABLE post_platforms (
   UNIQUE(post_id, social_account_id)
 );
 
+-- Short-lived claim used ONLY to serialize "create the brand-new first post
+-- for this streamer+kind" across CONCURRENT WORKER INVOCATIONS -- the race
+-- an in-memory lock can't reach (a same-invocation race, e.g. one streamer
+-- tracked on both YouTube and TikTok going live in the same cron run, is
+-- already prevented in-memory by src/lib/streamer-serializer.ts before any
+-- of this is touched). This table exists for the case that IS a genuinely
+-- separate invocation: a Kick webhook (its own HTTP request, see
+-- src/handlers/kick.ts) landing while the cron's scheduled() run
+-- (src/scheduled.ts) is concurrently deciding the same thing for the same
+-- streamer, or two overlapping cron runs.
+--
+-- A row here means "some request is currently in the middle of creating a
+-- new post for this streamer+kind" -- NOT "a post is open" (posts.is_open
+-- / the video merge-window check are unaffected and still answer that).
+-- src/db.ts's claimPostSlot INSERTs a row before src/lib/publish.ts's
+-- publishOrMerge sends the Telegram message; the INSERT either succeeds
+-- (caller proceeds) or fails on the PRIMARY KEY (caller backs off and
+-- retries publishOrMerge from the top, which will by then very likely find
+-- the winner's freshly-created open post via findOpenPost and merge into
+-- it instead of sending its own message). releasePostSlot deletes the row
+-- right after, success or failure -- claimed_at exists purely so a request
+-- killed mid-flight (Worker CPU/wall-clock limit, uncaught crash) before
+-- it can release its own claim doesn't wedge this streamer+kind out of
+-- ever getting a new post again: claimPostSlot treats a claim older than
+-- POST_CLAIM_STALE_AFTER_SECONDS (src/db.ts) as abandoned and steals it.
+CREATE TABLE post_claims (
+  streamer_id  INTEGER NOT NULL REFERENCES streamers(id) ON DELETE CASCADE,
+  kind         TEXT NOT NULL CHECK (kind IN ('live','video')),
+  claimed_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (streamer_id, kind)
+);
+
 CREATE INDEX idx_channels_owner       ON channels(owner_user_id);
 CREATE INDEX idx_streamers_channel    ON streamers(channel_id);
 CREATE INDEX idx_social_streamer      ON social_accounts(streamer_id);
@@ -175,25 +208,20 @@ CREATE INDEX idx_kick_tokens_broadcaster ON kick_tokens(broadcaster_user_id);
 CREATE INDEX idx_extra_links_streamer ON extra_links(streamer_id);
 CREATE INDEX idx_posts_streamer_open  ON posts(streamer_id, kind, is_open);
 
--- At most one OPEN 'live' post per streamer -- a safety net against the
--- rare race where two "went live" events for the same streamer (e.g. a
--- Kick webhook arriving while the same cron run is mid-check for that
--- streamer's YouTube/TikTok account -- realistic, since a simulcasting
--- streamer often starts every platform within moments of the others) get
--- processed closely enough together that both read "no open post yet"
--- (src/lib/publish.ts's publishOrMerge) before either has inserted one.
--- Without this, both inserts would succeed and the streamer would get two
--- separate Telegram posts instead of one merged post, with only one of
--- them ever receiving further button updates or auto-unpin -- silent and
--- easy to miss. With it, the second INSERT fails outright (already caught
--- and logged in publishOrMerge) instead of silently succeeding, turning a
--- silent data-integrity bug into a loud, logged one. This does not fully
--- close the race -- the Telegram message for the losing request has
--- typically already been sent by the time its INSERT is attempted, see
--- publish.ts's comment -- but it stops the worse outcome of two
--- independently-tracked open posts drifting apart. Partial index, so
--- closed posts and 'video' posts (which use a time-window check instead
--- of is_open, see VIDEO_POST_MERGE_WINDOW_MINUTES) are unaffected.
+-- At most one OPEN 'live' post per streamer -- a database-level backstop
+-- against ever ending up with two, on top of (not instead of) the
+-- post_claims-based fix above that actually prevents the race in normal
+-- operation: post_claims stops a second "create a new post" attempt for
+-- the same streamer+kind before it ever calls the Telegram API, so this
+-- index is not expected to fire in practice anymore. It stays as a second
+-- line of defence -- if something ever bypasses claimPostSlot (a future
+-- code path that calls createPost directly, a bug in the claim/retry
+-- logic), this still makes the resulting duplicate INSERT fail loudly
+-- (caught and logged in publishOrMerge) instead of silently succeeding as
+-- two independently-tracked posts, only one of which would ever receive
+-- further button updates or auto-unpin. Partial index, so closed posts and
+-- 'video' posts (which use a time-window check instead of is_open, see
+-- VIDEO_POST_MERGE_WINDOW_MINUTES) are unaffected.
 CREATE UNIQUE INDEX idx_posts_one_open_live_per_streamer
   ON posts(streamer_id) WHERE kind = 'live' AND is_open = 1;
 

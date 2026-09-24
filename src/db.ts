@@ -172,6 +172,19 @@ export async function getStreamerById(env: Env, id: number): Promise<StreamerRow
   return row ?? null;
 }
 
+/** Deletes a streamer and everything under it: schema.sql's ON DELETE
+ * CASCADE takes care of social_accounts, extra_links, kick_tokens,
+ * kick_oauth_states, posts and post_platforms — nothing about a removed
+ * streamer is left behind. Callers that need to clean up state OUTSIDE
+ * D1 first (e.g. unsubscribing a Kick webhook via src/lib/kick.ts's
+ * unsubscribeFromEvents, which needs each kick_tokens row's access token
+ * while it still exists) must do that before calling this — see
+ * src/lib/removal.ts's removeStreamer, which is what every caller in this
+ * codebase actually uses instead of calling this directly. */
+export async function deleteStreamer(env: Env, id: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM streamers WHERE id = ?").bind(id).run();
+}
+
 // ---------------------------------------------------------------------------
 // social_accounts (monitored platforms)
 // ---------------------------------------------------------------------------
@@ -221,6 +234,21 @@ export async function createSocialAccount(
     .first<SocialAccountRow>();
   if (!row) throw new Error("Failed to create social account");
   return row;
+}
+
+/** Unlinks one monitored platform account from its streamer. schema.sql's
+ * ON DELETE CASCADE also removes its kick_tokens row (if any) and any
+ * post_platforms rows referencing it (a post that had OTHER platforms
+ * folded in keeps existing, just loses this one's button next time its
+ * keyboard is rebuilt — it never renders a stale button for a since-removed
+ * account, since nothing rebuilds a post's keyboard from social_accounts
+ * directly). For a Kick account, the caller MUST unsubscribe from Kick's
+ * webhook first (see src/lib/kick.ts's unsubscribeFromEvents) — this
+ * function only touches D1 and has no way to reach Kick's API itself. See
+ * src/lib/removal.ts's removeSocialAccount, which every caller in this
+ * codebase actually uses instead of calling this directly. */
+export async function deleteSocialAccount(env: Env, id: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM social_accounts WHERE id = ?").bind(id).run();
 }
 
 export async function updateLastVideoId(env: Env, socialAccountId: number, videoId: string): Promise<void> {
@@ -365,6 +393,10 @@ export async function createExtraLink(
   return row;
 }
 
+export async function deleteExtraLink(env: Env, id: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM extra_links WHERE id = ?").bind(id).run();
+}
+
 // ---------------------------------------------------------------------------
 // posts / post_platforms
 // ---------------------------------------------------------------------------
@@ -498,4 +530,61 @@ export async function closePost(env: Env, id: number): Promise<void> {
   await env.DB.prepare("UPDATE posts SET is_open = 0, closed_at = datetime('now') WHERE id = ?")
     .bind(id)
     .run();
+}
+
+// ---------------------------------------------------------------------------
+// post_claims (cross-invocation duplicate-post guard — see schema.sql's
+// comment on this table and publishOrMerge's comment in src/lib/publish.ts)
+// ---------------------------------------------------------------------------
+
+/** A claim older than this is treated as abandoned by a request that died
+ * mid-flight (Worker CPU/wall-clock limit, uncaught crash) before it could
+ * release its own claim, and is safe to steal — a normal claim -> send
+ * Telegram message -> createPost -> release cycle finishes in well under a
+ * second, so 30 seconds is generous headroom, not a tight deadline. */
+const POST_CLAIM_STALE_AFTER_SECONDS = 30;
+
+/** D1 wraps the underlying SQLite error as an Error whose .message is
+ * "D1_ERROR: UNIQUE constraint failed: ..." and whose .cause is itself an
+ * Error with the same "UNIQUE constraint failed: ..." text but without the
+ * "D1_ERROR: " prefix — confirmed empirically against a local D1 instance
+ * (wrangler dev), since this exact shape isn't documented anywhere. Checked
+ * on both .message and .cause so this keeps working even if a future D1
+ * version stops wrapping one of the two. */
+function isUniqueConstraintError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.message.includes("UNIQUE constraint failed")) return true;
+  return err.cause instanceof Error && err.cause.message.includes("UNIQUE constraint failed");
+}
+
+/** Attempts to atomically claim the right to create a brand-new post for
+ * this streamer+kind. Returns true if the caller may proceed (send the
+ * Telegram message, then createPost + addPostPlatform, then ALWAYS
+ * releasePostSlot — success or failure, in a finally); false if another
+ * request already holds a live claim, meaning the caller should back off
+ * briefly and retry publishOrMerge from the top instead of sending
+ * anything — see its comment in src/lib/publish.ts. */
+export async function claimPostSlot(env: Env, streamerId: number, kind: PostKind): Promise<boolean> {
+  try {
+    await env.DB.prepare("INSERT INTO post_claims (streamer_id, kind) VALUES (?, ?)").bind(streamerId, kind).run();
+    return true;
+  } catch (err) {
+    if (!isUniqueConstraintError(err)) throw err;
+  }
+
+  // The INSERT above hit an existing claim. Steal it if it's stale (see
+  // POST_CLAIM_STALE_AFTER_SECONDS) instead of leaving this streamer+kind
+  // permanently unable to open a new post because some earlier request
+  // never got to release its own claim.
+  const result = await env.DB.prepare(
+    `UPDATE post_claims SET claimed_at = datetime('now')
+     WHERE streamer_id = ? AND kind = ? AND claimed_at < datetime('now', ?)`,
+  )
+    .bind(streamerId, kind, `-${POST_CLAIM_STALE_AFTER_SECONDS} seconds`)
+    .run();
+  return result.meta.changes > 0;
+}
+
+export async function releasePostSlot(env: Env, streamerId: number, kind: PostKind): Promise<void> {
+  await env.DB.prepare("DELETE FROM post_claims WHERE streamer_id = ? AND kind = ?").bind(streamerId, kind).run();
 }
