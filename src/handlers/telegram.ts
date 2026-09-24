@@ -5,8 +5,10 @@ import {
   createKickOAuthState,
   createSocialAccount,
   createStreamer,
+  deleteExtraLink,
   getChannelById,
   getChannelByOwnerAndChatId,
+  getStreamerById,
   listChannelsByOwner,
   listExtraLinksByStreamer,
   listSocialAccountsByStreamer,
@@ -17,8 +19,9 @@ import {
 } from "../db.js";
 import { buildAuthorizationUrl, generatePkcePair } from "../lib/kick.js";
 import { DEFAULT_TEMPLATE } from "../lib/message-templates.js";
+import { removeSocialAccount, removeStreamer } from "../lib/removal.js";
 import { IDLE_SESSION } from "../types.js";
-import type { ChannelRow, Env, Platform, SessionState, UserRow } from "../types.js";
+import type { ChannelRow, Env, Platform, SessionState, StreamerRow, UserRow } from "../types.js";
 
 export interface BotContext extends Context {
   dbUser: UserRow;
@@ -455,6 +458,63 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
     return;
   }
 
+  if (action === "strs" && rest[1]) {
+    const channel = await getChannelById(env, Number(rest[1]));
+    if (channel) await renderStreamerList(ctx, env, channel);
+    return;
+  }
+
+  if (action === "str" && rest[1]) {
+    const streamer = await getStreamerById(env, Number(rest[1]));
+    if (streamer) await renderStreamerDetail(ctx, env, streamer);
+    return;
+  }
+
+  if (action === "ra" && rest[1] && rest[2]) {
+    await renderConfirmRemoveAccount(ctx, env, Number(rest[1]), Number(rest[2]));
+    return;
+  }
+
+  if (action === "rac" && rest[1] && rest[2]) {
+    const streamerId = Number(rest[1]);
+    const accountId = Number(rest[2]);
+    const accounts = await listSocialAccountsByStreamer(env, streamerId);
+    const account = accounts.find((a) => a.id === accountId);
+    if (account) await removeSocialAccount(env, account);
+    const streamer = await getStreamerById(env, streamerId);
+    if (streamer) await renderStreamerDetail(ctx, env, streamer);
+    return;
+  }
+
+  if (action === "rl" && rest[1] && rest[2]) {
+    await renderConfirmRemoveLink(ctx, env, Number(rest[1]), Number(rest[2]));
+    return;
+  }
+
+  if (action === "rlc" && rest[1] && rest[2]) {
+    const streamerId = Number(rest[1]);
+    await deleteExtraLink(env, Number(rest[2]));
+    const streamer = await getStreamerById(env, streamerId);
+    if (streamer) await renderStreamerDetail(ctx, env, streamer);
+    return;
+  }
+
+  if (action === "rs" && rest[1]) {
+    await renderConfirmRemoveStreamer(ctx, env, Number(rest[1]));
+    return;
+  }
+
+  if (action === "rsc" && rest[1]) {
+    const streamerId = Number(rest[1]);
+    const streamer = await getStreamerById(env, streamerId);
+    if (!streamer) return;
+    const channelId = streamer.channel_id;
+    await removeStreamer(env, streamerId);
+    const channel = await getChannelById(env, channelId);
+    if (channel) await renderStreamerList(ctx, env, channel);
+    return;
+  }
+
   if (action === "back") {
     const channels = await listChannelsByOwner(env, ctx.dbUser.id);
     const kb = new InlineKeyboard();
@@ -493,7 +553,114 @@ async function renderChannelSettings(ctx: BotContext, env: Env, channel: Channel
     .row()
     .text("Изменить текст уведомления", `set:tpl:${channel.id}`)
     .row()
+    .text("👤 Управлять стримерами", `set:strs:${channel.id}`)
+    .row()
     .text("⬅ Назад", "set:back");
+
+  await ctx.editMessageText(text, { reply_markup: kb });
+}
+
+// ---------------------------------------------------------------------------
+// Управление стримерами: список → карточка стримера → отвязка аккаунта/
+// ссылки или удаление стримера целиком (с подтверждением на каждое
+// разрушительное действие, чтобы случайное нажатие ничего не сносило).
+// ---------------------------------------------------------------------------
+
+async function renderStreamerList(ctx: BotContext, env: Env, channel: ChannelRow): Promise<void> {
+  const streamers = await listStreamersByChannel(env, channel.id);
+
+  const kb = new InlineKeyboard();
+  for (const s of streamers) kb.text(`👤 ${s.display_name}`, `set:str:${s.id}`).row();
+  kb.text("⬅ Назад", `set:ch:${channel.id}`);
+
+  const text = streamers.length
+    ? `👤 Стримеры канала «${channel.title ?? channel.telegram_chat_id}»\n\nВыберите, кого настроить или отвязать.`
+    : `В этом канале пока нет ни одного стримера — добавьте через /add_social.`;
+
+  await ctx.editMessageText(text, { reply_markup: kb });
+}
+
+async function renderStreamerDetail(ctx: BotContext, env: Env, streamer: StreamerRow): Promise<void> {
+  const [accounts, links] = await Promise.all([
+    listSocialAccountsByStreamer(env, streamer.id),
+    listExtraLinksByStreamer(env, streamer.id),
+  ]);
+
+  const accountLines = accounts.map((a) => `• ${PLATFORM_DISPLAY[a.platform]} (${a.platform_username})`);
+  const linkLines = links.map((l) => `• ${l.label} — ${l.url}`);
+  const text =
+    `👤 ${streamer.display_name}\n\n` +
+    `Отслеживаемые аккаунты:\n${accountLines.length ? accountLines.join("\n") : "нет"}\n\n` +
+    `Доп. ссылки:\n${linkLines.length ? linkLines.join("\n") : "нет"}`;
+
+  const kb = new InlineKeyboard();
+  for (const a of accounts) {
+    kb.text(`❌ Отвязать ${PLATFORM_DISPLAY[a.platform]}`, `set:ra:${streamer.id}:${a.id}`).row();
+  }
+  for (const l of links) {
+    kb.text(`❌ Убрать «${l.label}»`, `set:rl:${streamer.id}:${l.id}`).row();
+  }
+  kb.text("🗑 Удалить стримера целиком", `set:rs:${streamer.id}`).row();
+  kb.text("⬅ Назад", `set:strs:${streamer.channel_id}`);
+
+  await ctx.editMessageText(text, { reply_markup: kb });
+}
+
+async function renderConfirmRemoveAccount(
+  ctx: BotContext,
+  env: Env,
+  streamerId: number,
+  accountId: number,
+): Promise<void> {
+  const [streamer, accounts] = await Promise.all([
+    getStreamerById(env, streamerId),
+    listSocialAccountsByStreamer(env, streamerId),
+  ]);
+  const account = accounts.find((a) => a.id === accountId);
+  if (!streamer || !account) return;
+
+  const text =
+    `Отвязать ${PLATFORM_DISPLAY[account.platform]} (${account.platform_username}) от стримера «${streamer.display_name}»?\n\n` +
+    `Бот перестанет отслеживать этот аккаунт. Уже опубликованные посты не удаляются.`;
+  const kb = new InlineKeyboard()
+    .text("✅ Да, отвязать", `set:rac:${streamerId}:${accountId}`)
+    .row()
+    .text("❌ Отмена", `set:str:${streamerId}`);
+
+  await ctx.editMessageText(text, { reply_markup: kb });
+}
+
+async function renderConfirmRemoveLink(ctx: BotContext, env: Env, streamerId: number, linkId: number): Promise<void> {
+  const [streamer, links] = await Promise.all([
+    getStreamerById(env, streamerId),
+    listExtraLinksByStreamer(env, streamerId),
+  ]);
+  const link = links.find((l) => l.id === linkId);
+  if (!streamer || !link) return;
+
+  const text = `Убрать дополнительную ссылку «${link.label}» (${link.url}) у стримера «${streamer.display_name}»?`;
+  const kb = new InlineKeyboard()
+    .text("✅ Да, убрать", `set:rlc:${streamerId}:${linkId}`)
+    .row()
+    .text("❌ Отмена", `set:str:${streamerId}`);
+
+  await ctx.editMessageText(text, { reply_markup: kb });
+}
+
+async function renderConfirmRemoveStreamer(ctx: BotContext, env: Env, streamerId: number): Promise<void> {
+  const streamer = await getStreamerById(env, streamerId);
+  if (!streamer) return;
+  const accounts = await listSocialAccountsByStreamer(env, streamerId);
+  const platforms = accounts.map((a) => PLATFORM_DISPLAY[a.platform]).join(", ") || "нет привязанных аккаунтов";
+
+  const text =
+    `🗑 Удалить стримера «${streamer.display_name}» целиком?\n\n` +
+    `Будут отвязаны все его аккаунты (${platforms}), удалены дополнительные ссылки и история постов. ` +
+    `Отменить это действие нельзя.`;
+  const kb = new InlineKeyboard()
+    .text("✅ Да, удалить", `set:rsc:${streamerId}`)
+    .row()
+    .text("❌ Отмена", `set:str:${streamerId}`);
 
   await ctx.editMessageText(text, { reply_markup: kb });
 }
