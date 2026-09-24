@@ -19,7 +19,9 @@ import {
   touchLastCheckedAt,
   updateLastVideoId,
 } from "./db.js";
+import { DEFAULT_CONCURRENCY, runWithConcurrency } from "./lib/concurrency.js";
 import { closeLivePlatform, publishOrMerge } from "./lib/publish.js";
+import { StreamerSerializer } from "./lib/streamer-serializer.js";
 import { checkTiktokStatus } from "./lib/tiktok.js";
 import { checkChannelLiveNow, checkIsCurrentlyLive, fetchLatestVideo } from "./lib/youtube.js";
 import type { Env, SocialAccountWithStreamer } from "./types.js";
@@ -164,6 +166,32 @@ async function checkTiktokAccount(env: Env, api: Api, account: SocialAccountWith
   }
 }
 
+interface CheckTask {
+  platform: "youtube" | "tiktok";
+  account: SocialAccountWithStreamer;
+}
+
+/** Runs one account's check, serialized against any other account of the
+ * SAME streamer (see StreamerSerializer's comment for why), with the exact
+ * per-platform error isolation the old sequential for-loops had: one
+ * account failing is logged and never stops any other account's check. */
+async function runAccountCheck(
+  env: Env,
+  api: Api,
+  serializer: StreamerSerializer,
+  task: CheckTask,
+): Promise<void> {
+  const { platform, account } = task;
+  try {
+    await serializer.run(account.streamer_id, () =>
+      platform === "youtube" ? checkYoutubeAccount(env, api, account) : checkTiktokAccount(env, api, account),
+    );
+  } catch (err) {
+    const label = platform === "youtube" ? "YouTube" : "TikTok";
+    console.error(`${label} check failed for account ${account.id} (${account.platform_username})`, err);
+  }
+}
+
 export async function runScheduledCheck(env: Env): Promise<void> {
   const api = new Api(env.BOT_TOKEN);
 
@@ -174,21 +202,22 @@ export async function runScheduledCheck(env: Env): Promise<void> {
 
   console.log(`Checking ${youtubeAccounts.length} YouTube account(s) and ${tiktokAccounts.length} TikTok account(s)…`);
 
-  for (const account of youtubeAccounts) {
-    try {
-      await checkYoutubeAccount(env, api, account);
-    } catch (err) {
-      console.error(`YouTube check failed for account ${account.id} (${account.platform_username})`, err);
-    }
-  }
+  // One combined pool across both platforms (not two separate pools run
+  // back-to-back) so the two platforms' checks overlap each other too, not
+  // just accounts within the same platform -- see src/lib/concurrency.ts
+  // for why DEFAULT_CONCURRENCY is 6 and not "everything at once". Accounts
+  // belonging to the same streamer (e.g. one streamer tracked on both
+  // YouTube and TikTok) can now run concurrently with each other; `serializer`
+  // is what keeps their publishOrMerge/closeLivePlatform calls from racing
+  // (see StreamerSerializer's own comment for the cross-invocation case this
+  // does NOT cover, which src/lib/publish.ts's claimPostSlot handles instead).
+  const tasks: CheckTask[] = [
+    ...youtubeAccounts.map((account): CheckTask => ({ platform: "youtube", account })),
+    ...tiktokAccounts.map((account): CheckTask => ({ platform: "tiktok", account })),
+  ];
+  const serializer = new StreamerSerializer();
 
-  for (const account of tiktokAccounts) {
-    try {
-      await checkTiktokAccount(env, api, account);
-    } catch (err) {
-      console.error(`TikTok check failed for account ${account.id} (${account.platform_username})`, err);
-    }
-  }
+  await runWithConcurrency(tasks, DEFAULT_CONCURRENCY, (task) => runAccountCheck(env, api, serializer, task));
 
   console.log("Scheduled check done.");
 }
