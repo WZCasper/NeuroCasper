@@ -40,6 +40,14 @@ export interface ChannelRow {
   message_template: string;
   auto_pin: number;
   auto_unpin: number;
+  /** 1/0: greet new group members (see src/lib/moderation-settings.ts). */
+  welcome_enabled: number;
+  /** NULL = the built-in default welcome text. */
+  welcome_template: string | null;
+  /** 1/0: check a new member's bio against spam_phrases. */
+  spam_filter_enabled: number;
+  /** JSON array of strings; NULL = the built-in default phrase list. */
+  spam_phrases: string | null;
   created_at: string;
 }
 
@@ -124,6 +132,9 @@ export type SessionState =
   | { step: "awaiting_social_username"; data: { streamer_id: number; platform: Platform } }
   | { step: "awaiting_link_label"; data: { streamer_id: number } }
   | { step: "awaiting_link_url"; data: { streamer_id: number; label: string } }
-  | { step: "awaiting_template"; data: { channel_id: number } };
+  | { step: "awaiting_link_url_edit"; data: { streamer_id: number; link_id: number } }
+  | { step: "awaiting_template"; data: { channel_id: number } }
+  | { step: "awaiting_welcome_template"; data: { channel_id: number } }
+  | { step: "awaiting_spam_phrases"; data: { channel_id: number } };
 
 export const IDLE_SESSION: SessionState = { step: "idle" };

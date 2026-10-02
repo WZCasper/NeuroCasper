@@ -25,9 +25,23 @@ jobs:
 
       - name: Call Telegram setWebhook
         run: |
+          # allowed_updates is explicit (rather than omitted, which would
+          # get Telegram's default set) so that chat_member -- needed for
+          # greeting new chat members and for the future no-longer-a-member
+          # spam/report handling, see README's "Новые участники" section --
+          # is included. Telegram only sends chat_member updates for a chat
+          # the bot is currently an administrator of, same restriction the
+          # bot already needs for posting/pinning notifications, so this
+          # doesn't add a new permission requirement beyond what setup
+          # already asks admins for. Passing allowed_updates at all REPLACES
+          # Telegram's default set entirely, so every type the bot actually
+          # handles must be listed here, not just the new one -- see
+          # src/handlers/telegram.ts's bot.on(...) calls for the current
+          # list (message, callback_query, my_chat_member).
           RESPONSE=$(curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook" \
             --data-urlencode "url=${WORKER_URL}/webhook/telegram" \
-            --data-urlencode "secret_token=${{ secrets.WEBHOOK_SECRET }}")
+            --data-urlencode "secret_token=${{ secrets.WEBHOOK_SECRET }}" \
+            --data-urlencode 'allowed_updates=["message","callback_query","my_chat_member","chat_member"]')
           echo "$RESPONSE"
           echo "$RESPONSE" | grep -q '"ok":true' || (echo "::error::setWebhook call failed, see response above" && exit 1)
 

@@ -9,6 +9,7 @@
 
 PRAGMA foreign_keys = ON;
 
+DROP TABLE IF EXISTS user_reports;
 DROP TABLE IF EXISTS post_claims;
 DROP TABLE IF EXISTS post_platforms;
 DROP TABLE IF EXISTS posts;
@@ -47,6 +48,12 @@ CREATE TABLE channels (
   message_template  TEXT NOT NULL DEFAULT '{title}',
   auto_pin          INTEGER NOT NULL DEFAULT 1,
   auto_unpin        INTEGER NOT NULL DEFAULT 1,
+  -- New-member moderation, editable per chat in /settings. NULL template /
+  -- phrases mean "use the built-in default" (src/lib/moderation-settings.ts).
+  welcome_enabled      INTEGER NOT NULL DEFAULT 1,
+  welcome_template     TEXT,
+  spam_filter_enabled  INTEGER NOT NULL DEFAULT 1,
+  spam_phrases         TEXT,
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(owner_user_id, telegram_chat_id)
 );
@@ -227,3 +234,23 @@ CREATE UNIQUE INDEX idx_posts_one_open_live_per_streamer
 
 CREATE INDEX idx_post_platforms_post  ON post_platforms(post_id, ended);
 CREATE INDEX idx_post_platforms_acct  ON post_platforms(social_account_id, ended);
+
+-- Backs the /report command and the auto-ban-after-2-reports behavior.
+-- Deliberately not foreign-keyed to channels/streamers/users -- a
+-- reported person, whoever reports them, and the chat a report came from
+-- are all arbitrary Telegram entities, not necessarily anyone who has
+-- registered anything with /start or /add_channel. See
+-- migrations/004_add_user_reports.sql for the full rationale, in
+-- particular why UNIQUE(reported_user_id, chat_telegram_id) is the actual
+-- mechanism preventing several members of ONE group from colluding to hit
+-- the global ban threshold on their own.
+CREATE TABLE user_reports (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  reported_user_id  INTEGER NOT NULL,
+  reporter_user_id  INTEGER NOT NULL,
+  chat_telegram_id  INTEGER NOT NULL,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (reported_user_id, chat_telegram_id)
+);
+
+CREATE INDEX idx_user_reports_reported ON user_reports (reported_user_id);

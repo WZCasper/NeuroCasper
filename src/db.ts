@@ -108,6 +108,23 @@ export async function getChannelByOwnerAndChatId(
   return row ?? null;
 }
 
+/** Wipes every bot configuration for a Telegram chat — the channels row(s)
+ * and, via ON DELETE CASCADE (D1 enforces foreign keys on every query, see
+ * schema.sql's PRAGMA foreign_keys = ON and Cloudflare's docs on this --
+ * unlike plain SQLite, this isn't a per-connection setting that could be
+ * silently unset here), everything under them: streamers, social_accounts,
+ * extra_links, posts, post_platforms, kick_tokens, kick_oauth_states,
+ * post_claims. Matches on telegram_chat_id alone, not a specific owner --
+ * channels has no UNIQUE constraint on telegram_chat_id by itself (only on
+ * the (owner_user_id, telegram_chat_id) pair), so in principle more than
+ * one admin could have registered the same physical chat; when the bot is
+ * removed, all of them should be cleared, not just whichever owner's row
+ * happens to be looked up first. Called from the my_chat_member handler
+ * when the bot's own status in a chat becomes "left" or "kicked". */
+export async function deleteChannelsByTelegramChatId(env: Env, telegramChatId: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM channels WHERE telegram_chat_id = ?").bind(telegramChatId).run();
+}
+
 export async function createChannel(
   env: Env,
   ownerUserId: number,
@@ -127,20 +144,62 @@ export async function updateChannelTemplate(env: Env, channelId: number, templat
   await env.DB.prepare("UPDATE channels SET message_template = ? WHERE id = ?").bind(template, channelId).run();
 }
 
-export async function toggleChannelFlag(
+/** The chat's settings row, looked up by Telegram chat ID alone -- used by
+ * the chat_member handler, which knows only which chat someone joined, not
+ * who registered it. Returns null when nobody has registered the chat with
+ * /add_channel (the caller then applies the built-in defaults). Nothing
+ * stops two different owners registering the same chat (UNIQUE is on the
+ * (owner, chat) pair), so this deterministically takes the earliest
+ * registration. */
+export async function getChannelByTelegramChatId(env: Env, telegramChatId: number): Promise<ChannelRow | null> {
+  const row = await env.DB.prepare("SELECT * FROM channels WHERE telegram_chat_id = ? ORDER BY id ASC LIMIT 1")
+    .bind(telegramChatId)
+    .first<ChannelRow>();
+  return row ?? null;
+}
+
+/** Sets the chat's custom welcome text; null goes back to the built-in
+ * default. Returns the updated row. */
+export async function updateChannelWelcomeTemplate(
   env: Env,
   channelId: number,
-  flag: "auto_pin" | "auto_unpin",
+  template: string | null,
 ): Promise<ChannelRow | null> {
-  // Literal SQL per flag rather than interpolating the column name into the
-  // query string — `flag` is always a hardcoded literal from the call sites
-  // in src/handlers/telegram.ts today, but this keeps the query text fixed
-  // regardless, rather than relying on that staying true.
-  const sql =
-    flag === "auto_pin"
-      ? "UPDATE channels SET auto_pin = 1 - auto_pin WHERE id = ?"
-      : "UPDATE channels SET auto_unpin = 1 - auto_unpin WHERE id = ?";
-  await env.DB.prepare(sql).bind(channelId).run();
+  await env.DB.prepare("UPDATE channels SET welcome_template = ? WHERE id = ?").bind(template, channelId).run();
+  return getChannelById(env, channelId);
+}
+
+/** Sets the chat's spam-phrase list (a JSON array, see
+ * serializeSpamPhrases); null goes back to the built-in default list.
+ * Returns the updated row. */
+export async function updateChannelSpamPhrases(
+  env: Env,
+  channelId: number,
+  phrasesJson: string | null,
+): Promise<ChannelRow | null> {
+  await env.DB.prepare("UPDATE channels SET spam_phrases = ? WHERE id = ?").bind(phrasesJson, channelId).run();
+  return getChannelById(env, channelId);
+}
+
+export async function updateExtraLinkUrl(env: Env, linkId: number, url: string): Promise<void> {
+  await env.DB.prepare("UPDATE extra_links SET url = ? WHERE id = ?").bind(url, linkId).run();
+}
+
+export type ChannelFlag = "auto_pin" | "auto_unpin" | "welcome_enabled" | "spam_filter_enabled";
+
+// Literal SQL per flag rather than interpolating the column name into the
+// query string — `flag` is always a hardcoded literal from the call sites
+// in src/handlers/telegram.ts today, but this keeps the query text fixed
+// regardless, rather than relying on that staying true.
+const TOGGLE_CHANNEL_FLAG_SQL: Record<ChannelFlag, string> = {
+  auto_pin: "UPDATE channels SET auto_pin = 1 - auto_pin WHERE id = ?",
+  auto_unpin: "UPDATE channels SET auto_unpin = 1 - auto_unpin WHERE id = ?",
+  welcome_enabled: "UPDATE channels SET welcome_enabled = 1 - welcome_enabled WHERE id = ?",
+  spam_filter_enabled: "UPDATE channels SET spam_filter_enabled = 1 - spam_filter_enabled WHERE id = ?",
+};
+
+export async function toggleChannelFlag(env: Env, channelId: number, flag: ChannelFlag): Promise<ChannelRow | null> {
+  await env.DB.prepare(TOGGLE_CHANNEL_FLAG_SQL[flag]).bind(channelId).run();
   return getChannelById(env, channelId);
 }
 
@@ -587,4 +646,51 @@ export async function claimPostSlot(env: Env, streamerId: number, kind: PostKind
 
 export async function releasePostSlot(env: Env, streamerId: number, kind: PostKind): Promise<void> {
   await env.DB.prepare("DELETE FROM post_claims WHERE streamer_id = ? AND kind = ?").bind(streamerId, kind).run();
+}
+
+// ---------------------------------------------------------------------------
+// /report — see migrations/004_add_user_reports.sql for the schema and the
+// collusion-guard rationale (UNIQUE(reported_user_id, chat_telegram_id)).
+// ---------------------------------------------------------------------------
+
+/** Records a report of reportedUserId, filed by reporterUserId, from the
+ * chat identified by chatTelegramId. Returns "created" for a genuinely new
+ * report; "already_reported_from_this_chat" if this exact chat has
+ * already filed a report against this same person (the UNIQUE constraint
+ * caught it) -- this is the collusion guard doing its job, not an error,
+ * so the caller should tell the reporter their target already has an
+ * active report from this chat rather than presenting this as a failure. */
+export async function createUserReport(
+  env: Env,
+  reportedUserId: number,
+  reporterUserId: number,
+  chatTelegramId: number,
+): Promise<"created" | "already_reported_from_this_chat"> {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO user_reports (reported_user_id, reporter_user_id, chat_telegram_id) VALUES (?, ?, ?)",
+    )
+      .bind(reportedUserId, reporterUserId, chatTelegramId)
+      .run();
+    return "created";
+  } catch (err) {
+    if (!isUniqueConstraintError(err)) throw err;
+    return "already_reported_from_this_chat";
+  }
+}
+
+/** How many DISTINCT chats have filed a report against reportedUserId.
+ * This -- not a raw row count -- is the number the auto-ban threshold is
+ * checked against, since the UNIQUE constraint already guarantees at most
+ * one row per (reportedUserId, chat), making a plain COUNT(*) equivalent
+ * to this in practice; COUNT(DISTINCT chat_telegram_id) is used anyway to
+ * make that invariant explicit at the call site rather than relying on
+ * readers to know it holds from the schema alone. */
+export async function countDistinctReportingChats(env: Env, reportedUserId: number): Promise<number> {
+  const row = await env.DB.prepare(
+    "SELECT COUNT(DISTINCT chat_telegram_id) AS count FROM user_reports WHERE reported_user_id = ?",
+  )
+    .bind(reportedUserId)
+    .first<{ count: number }>();
+  return row?.count ?? 0;
 }

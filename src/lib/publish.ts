@@ -46,7 +46,9 @@ export interface PublishInput {
 
 function buildCaption(channel: ChannelRow, kind: PostKind, streamerName: string, title: string): string {
   const header =
-    kind === "live" ? `\u{1F534} ${streamerName} is live!` : `\u{1F3AC} New video from ${streamerName}!`;
+    kind === "live"
+      ? `\u{1F534} ${streamerName} начал трансляцию!`
+      : `\u{1F3AC} Новое видео от ${streamerName}!`;
   const body = renderTemplate(channel.message_template, {
     streamer: streamerName,
     platform: "",

@@ -1,0 +1,2901 @@
+diff --git a/.github/workflows/2-set-webhook.yml b/.github/workflows/2-set-webhook.yml
+index 1eaa6c4..325b30b 100644
+--- a/.github/workflows/2-set-webhook.yml
++++ b/.github/workflows/2-set-webhook.yml
+@@ -25,9 +25,23 @@ jobs:
+ 
+       - name: Call Telegram setWebhook
+         run: |
++          # allowed_updates is explicit (rather than omitted, which would
++          # get Telegram's default set) so that chat_member -- needed for
++          # greeting new chat members and for the future no-longer-a-member
++          # spam/report handling, see README's "Новые участники" section --
++          # is included. Telegram only sends chat_member updates for a chat
++          # the bot is currently an administrator of, same restriction the
++          # bot already needs for posting/pinning notifications, so this
++          # doesn't add a new permission requirement beyond what setup
++          # already asks admins for. Passing allowed_updates at all REPLACES
++          # Telegram's default set entirely, so every type the bot actually
++          # handles must be listed here, not just the new one -- see
++          # src/handlers/telegram.ts's bot.on(...) calls for the current
++          # list (message, callback_query, my_chat_member).
+           RESPONSE=$(curl -s "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook" \
+             --data-urlencode "url=${WORKER_URL}/webhook/telegram" \
+-            --data-urlencode "secret_token=${{ secrets.WEBHOOK_SECRET }}")
++            --data-urlencode "secret_token=${{ secrets.WEBHOOK_SECRET }}" \
++            --data-urlencode 'allowed_updates=["message","callback_query","my_chat_member","chat_member"]')
+           echo "$RESPONSE"
+           echo "$RESPONSE" | grep -q '"ok":true' || (echo "::error::setWebhook call failed, see response above" && exit 1)
+ 
+diff --git a/.github/workflows/6-migrate-moderation-settings.yml b/.github/workflows/6-migrate-moderation-settings.yml
+new file mode 100644
+index 0000000..738a901
+--- /dev/null
++++ b/.github/workflows/6-migrate-moderation-settings.yml
+@@ -0,0 +1,79 @@
++# Run once, manually (Actions tab -> this workflow -> "Run workflow"), to
++# apply migrations/005_add_moderation_settings.sql to the live D1 database --
++# adds the four columns that back per-chat welcome/spam-filter settings
++# (/settings -> chat -> «👥 Модерация группы»).
++#
++# Safe to re-run: unlike migration 003 (CREATE TABLE IF NOT EXISTS, itself
++# idempotent), this migration is four ALTER TABLE ... ADD COLUMN statements,
++# and SQLite has no ADD COLUMN IF NOT EXISTS (confirmed against the SQLite
++# project's own forum -- this was explicitly proposed and not accepted into
++# the engine). So this workflow checks first, itself, via PRAGMA
++# table_info(channels): if welcome_enabled is already there, it skips
++# straight to a clear "already applied" message instead of running the
++# ALTER TABLE statements a second time and failing on "duplicate column
++# name" -- which would still leave the database correct (nothing from the
++# first run is undone by a rejected second run), but would surface a raw
++# SQLite error instead of a plain answer to "did this work".
++#
++# Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repo secrets
++# (same ones 1-bootstrap-db.yml, 0-sync-secrets.yml, 3-migrate-kick.yml,
++# 4-migrate-live-post-uniqueness.yml and 5-migrate-post-claims.yml already
++# use).
++name: "6) Add moderation settings columns to D1"
++
++on:
++  workflow_dispatch: {}
++
++permissions:
++  contents: read
++
++jobs:
++  migrate:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Check whether the migration is already applied
++        id: check
++        uses: cloudflare/wrangler-action@v4
++        with:
++          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
++          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
++          command: d1 execute neurocasper-db --remote --json --command "PRAGMA table_info(channels)"
++
++      - name: Decide whether to apply it
++        id: decide
++        env:
++          # command-output is wrangler-action's own documented output
++          # variable (since v3.4.0) holding the previous step's stdout as a
++          # string -- not a file path. Routed through env here (rather than
++          # interpolated directly into the script) so the JSON content is
++          # never substituted into shell syntax, keeping this immune to
++          # anything unexpected the JSON might contain.
++          CHECK_OUTPUT: ${{ steps.check.outputs.command-output }}
++        run: |
++          HAS_COLUMN=$(echo "$CHECK_OUTPUT" | jq -r '.[0].results[] | select(.name == "welcome_enabled") | .name')
++          if [ -n "$HAS_COLUMN" ]; then
++            echo "already_applied=true" >> "$GITHUB_OUTPUT"
++          else
++            echo "already_applied=false" >> "$GITHUB_OUTPUT"
++          fi
++
++      - name: Already applied -- nothing to do
++        if: steps.decide.outputs.already_applied == 'true'
++        run: echo "welcome_enabled already exists on channels -- migration 005 was already applied, skipping."
++
++      - name: Apply migrations/005_add_moderation_settings.sql
++        if: steps.decide.outputs.already_applied == 'false'
++        uses: cloudflare/wrangler-action@v4
++        with:
++          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
++          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
++          command: d1 execute neurocasper-db --remote --file=./migrations/005_add_moderation_settings.sql
++
++      - name: Confirm the four new columns are there
++        uses: cloudflare/wrangler-action@v4
++        with:
++          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
++          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
++          command: d1 execute neurocasper-db --remote --command "PRAGMA table_info(channels)"
+diff --git a/README.md b/README.md
+index 889b9b9..5a9f981 100644
+--- a/README.md
++++ b/README.md
+@@ -190,7 +190,29 @@ Workers & Pages → воркер → подключён к репозитори
+ 
+ После деплоя и когда `BOT_TOKEN`/`WEBHOOK_SECRET` установлены — запустите
+ `2-set-webhook.yml` вручную из вкладки Actions (нужны те же два секрета в
+-GitHub тоже).
++GitHub тоже). Обновлённый `allowed_updates` в этом файле включает
++`chat_member` — без повторного запуска после обновления бота Telegram не
++пришлёт события вступления участников, и приветствие с проверкой на спам
++работать не будут (жалобы через `/report` от этого не зависят — это
++отдельный тип обновления, `message`, который уже был включён).
++
++### 4. Миграции для уже работающей базы
++
++Для **нового** деплоя ничего дополнительно делать не нужно — `schema.sql`
++уже содержит все таблицы и столбцы, включая систему жалоб и настройки
++модерации. Для **уже развёрнутого** бота, где база создавалась раньше —
++примените файлы из `migrations/` по номеру, каждый ровно один раз:
++
++```
++npx wrangler d1 execute neurocasper-db --remote --file=./migrations/004_add_user_reports.sql
++npx wrangler d1 execute neurocasper-db --remote --file=./migrations/005_add_moderation_settings.sql
++```
++
++(сначала без `--remote` — против локальной базы; `005` использует
++`ALTER TABLE ADD COLUMN`, у SQLite нет `IF NOT EXISTS` для колонок, так что
++повторный запуск упадёт с «duplicate column name» — это безопасно, значит
++уже применено). Более ранние `migrations/001`–`003`, если ещё не
++применялись, — по тому же принципу и в том же порядке.
+ 
+ ## Известные ограничения (важно прочитать)
+ 
+@@ -218,6 +240,15 @@ GitHub тоже).
+ - **Определение эфира на YouTube без `YOUTUBE_API_KEY`** — эвристика по
+   разметке страницы просмотра, не официальный сигнал. С ключом — надёжная
+   проверка через `liveBroadcastContent`.
++- **Приветствие, проверка на спам и `/report` требуют, чтобы бот был
++  администратором** именно той группы. Это ограничение самого Telegram Bot
++  API, не этого кода: событие о вступлении участника (`chat_member`)
++  Telegram присылает только для чатов, где бот — админ; `/report` находит
++  нарушителя и записывает жалобу в любом случае, но заблокировать
++  участника (`banChatMember`) без прав администратора физически не может.
++  В каналах (в отличие от групп) у `chat_member` нет смысла — там нет
++  привычного «участник вступил», поэтому приветствие и спам-фильтр там не
++  применяются вовсе.
+ - **У TikTok вообще нет публичного API** для статуса эфира или списка видео.
+   `src/lib/tiktok.ts` парсит публичную страницу профиля в поисках метки
+   `roomId` и ссылки на последнее видео. При изменении разметки TikTok может
+@@ -255,10 +286,26 @@ GitHub тоже).
+   адрес получения публичного ключа
+   (`api.kick.com/public/v1/public-key`) сверен только по документации Kick
+   и независимым сторонним SDK (см. комментарий в `src/lib/kick.ts`), не
+-  вызван по-настоящему. Telegram- и YouTube/TikTok-запросы (`src/bot.ts`,
+-  `src/lib/youtube.ts`, `src/lib/tiktok.ts`), включая новые экраны отвязки
+-  стримера в `/settings`, тестами пока не покрыты вообще — первое реальное
+-  использование после деплоя остаётся первой настоящей проверкой для них.
++  вызван по-настоящему. Реальные вызовы Telegram Bot API (`src/bot.ts` и
++  весь `src/handlers/telegram.ts` — отправка сообщений, работа с
++  клавиатурами, `/report`, приветствие, блокировка участника) и запросы к
++  YouTube/TikTok (`src/lib/youtube.ts`, `src/lib/tiktok.ts`) тестами не
++  покрыты вообще — первое реальное использование после деплоя остаётся
++  первой настоящей проверкой для них. Против реальной локальной D1 (через
++  `node:sqlite` и актуальный `schema.sql`, не переписанная вручную копия
++  таблицы) проверена логика хранения для системы жалоб — что одна и та же
++  группа не может дважды засчитаться в счётчик на одного человека
++  (`UNIQUE` в `user_reports`, см. `migrations/004`), а жалобы из разных
++  групп считаются верно — и для настроек модерации на чат — переключатели,
++  свой текст приветствия и свой список спам-фраз действительно сохраняются
++  и читаются по столбцам `channels` из `migrations/005`, с возвратом к
++  стандартным значениям при сбросе. Оценка даты регистрации по ID аккаунта
++  (Bot API не отдаёт её никак) сверена с независимым пересчётом по тому же
++  открытому набору калибровочных точек и тому же алгоритму, на которых она
++  основана (`src/lib/registration-date-estimate.ts`), но остаётся именно
++  оценкой с точностью по исходным данным «обычно в пределах недель», а для
++  очень новых аккаунтов (новее последней калиброванной точки набора) —
++  грубее; в тексте приветствия это помечено явно.
+ - **Дубль поста при почти одновременном «в эфире» на двух платформах** —
+   раньше была теоретическая гонка: если для одного стримера два события «в
+   эфире» (например, вебхук Kick и проверка YouTube/TikTok по расписанию)
+@@ -301,7 +348,24 @@ GitHub тоже).
+   к каждому стримеру, а через «👤 Управлять стримерами» — отвязать один
+   аккаунт или дополнительную ссылку у стримера, либо удалить стримера
+   целиком (с подтверждением на каждое действие; для Kick отвязка сама
+-  отписывает бота от вебхука на стороне Kick, см. «Известные ограничения»)
++  отписывает бота от вебхука на стороне Kick, см. «Известные ограничения»),
++  а через «👥 Модерация группы» — настройки приветствия и спам-фильтра
++  этого чата (см. ниже)
++- В **группе** (бот там должен быть админом — иначе `/report` найдёт
++  участника, но заблокировать его не сможет): ответьте `/report` на
++  сообщение нарушителя. Жалобы от одной и той же группы на одного человека
++  считаются как одна (защита от сговора нескольких участников одной
++  группы); когда жалобы приходят минимум из **двух разных** групп — бот
++  блокирует участника на 30 дней всюду, где сам является админом (сразу
++  в группе, где счёт набрался, и при каждой попытке вступить в любую
++  другую такую группу впоследствии)
++- Приветствие новых участников (кто вступил, фото профиля, ник,
++  приблизительная дата регистрации — Bot API не отдаёт её напрямую, это
++  оценка по ID аккаунта) и проверка описания профиля на спам-фразы при
++  вступлении включены по умолчанию для каждой группы, где бот админ;
++  текст приветствия, список фраз и оба переключателя — через
++  «👥 Модерация группы» в `/settings`, заданные изначально значения
++  меняются и дополняются прямо там
+ 
+ ## Локальная разработка (опционально — для деплоя не обязательно)
+ 
+diff --git a/migrations/004_add_user_reports.sql b/migrations/004_add_user_reports.sql
+new file mode 100644
+index 0000000..3cdd26f
+--- /dev/null
++++ b/migrations/004_add_user_reports.sql
+@@ -0,0 +1,40 @@
++-- Migration: add the user_reports table, backing the /report command and
++-- the auto-ban-after-2-reports behavior (see this repo's own README/task
++-- notes for the exact rules this enforces).
++--
++-- Run once, manually, against a live database with:
++--   npx wrangler d1 execute neurocasper-db --remote --file=./migrations/004_add_user_reports.sql
++-- (drop --remote to test against the local dev database first, which is
++-- strongly recommended before running this against --remote).
++--
++-- Additive and safe to run against a database that already has real
++-- streamers/posts/etc in it -- it only adds one new, empty table, nothing
++-- existing is dropped, rebuilt, or backfilled.
++--
++-- Deliberately NOT foreign-keyed to channels/streamers/users: a reported
++-- person and the chat a report came from are arbitrary Telegram entities
++-- (any group member, any group the bot is in), not necessarily anyone who
++-- has ever registered anything with /start or /add_channel. reported_user_id
++-- and reporter_user_id are raw Telegram user IDs; chat_telegram_id is a raw
++-- Telegram chat ID.
++--
++-- The UNIQUE(reported_user_id, chat_telegram_id) constraint is the actual
++-- collusion guard, not application logic layered on top of an unconstrained
++-- table: it caps how much a single group's reports of one person can count
++-- toward that person's GLOBAL (bot-wide) report total at exactly one row,
++-- no matter how many different members of that one group each run
++-- /report on the same target. Reaching the ban threshold therefore
++-- requires reports to have landed from at least two DIFFERENT groups, not
++-- just two different reporters within one group. See listDistinctReportingChats
++-- (src/db.ts) and handleReportCommand (src/handlers/telegram.ts) for how
++-- this is read and enforced.
++CREATE TABLE IF NOT EXISTS user_reports (
++  id                INTEGER PRIMARY KEY AUTOINCREMENT,
++  reported_user_id  INTEGER NOT NULL,
++  reporter_user_id  INTEGER NOT NULL,
++  chat_telegram_id  INTEGER NOT NULL,
++  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
++  UNIQUE (reported_user_id, chat_telegram_id)
++);
++
++CREATE INDEX IF NOT EXISTS idx_user_reports_reported ON user_reports (reported_user_id);
+diff --git a/migrations/005_add_moderation_settings.sql b/migrations/005_add_moderation_settings.sql
+new file mode 100644
+index 0000000..36bb029
+--- /dev/null
++++ b/migrations/005_add_moderation_settings.sql
+@@ -0,0 +1,22 @@
++-- Migration: per-chat settings for the new-member welcome message and the
++-- bio spam filter, editable in the bot (/settings -> chat -> «👥 Модерация
++-- группы»).
++--
++-- Run ONCE, manually, against a live database with:
++--   npx wrangler d1 execute neurocasper-db --remote --file=./migrations/005_add_moderation_settings.sql
++-- (drop --remote to try it against the local dev database first).
++--
++-- Unlike the CREATE ... IF NOT EXISTS migrations before it, SQLite has no
++-- "ADD COLUMN IF NOT EXISTS": running this a second time fails with a
++-- "duplicate column name" error. That is harmless (nothing is changed), but
++-- it means there is nothing to re-run if it already succeeded.
++--
++-- Additive and safe on a database with real data: every existing chat gets
++-- the welcome and the spam filter switched ON (the behavior the bot already
++-- has today) and NULL for the two text columns, which means "use the
++-- built-in defaults" -- so nothing changes for anyone until an owner edits
++-- these in the bot.
++ALTER TABLE channels ADD COLUMN welcome_enabled INTEGER NOT NULL DEFAULT 1;
++ALTER TABLE channels ADD COLUMN welcome_template TEXT;
++ALTER TABLE channels ADD COLUMN spam_filter_enabled INTEGER NOT NULL DEFAULT 1;
++ALTER TABLE channels ADD COLUMN spam_phrases TEXT;
+diff --git a/package.json b/package.json
+index 4196c65..dfd76ed 100644
+--- a/package.json
++++ b/package.json
+@@ -8,7 +8,7 @@
+     "dev": "wrangler dev --test-scheduled",
+     "deploy": "wrangler deploy",
+     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+-    "test": "tsx --test src/**/*.test.ts",
++    "test": "tsx --test \"src/**/*.test.ts\"",
+     "build": "npm run typecheck",
+     "db:migrate:local": "wrangler d1 execute neurocasper-db --local --file=./schema.sql",
+     "db:migrate:remote": "wrangler d1 execute neurocasper-db --remote --file=./schema.sql"
+diff --git a/schema.sql b/schema.sql
+index 2b06080..4c6ca62 100644
+--- a/schema.sql
++++ b/schema.sql
+@@ -9,6 +9,7 @@
+ 
+ PRAGMA foreign_keys = ON;
+ 
++DROP TABLE IF EXISTS user_reports;
+ DROP TABLE IF EXISTS post_claims;
+ DROP TABLE IF EXISTS post_platforms;
+ DROP TABLE IF EXISTS posts;
+@@ -47,6 +48,12 @@ CREATE TABLE channels (
+   message_template  TEXT NOT NULL DEFAULT '{title}',
+   auto_pin          INTEGER NOT NULL DEFAULT 1,
+   auto_unpin        INTEGER NOT NULL DEFAULT 1,
++  -- New-member moderation, editable per chat in /settings. NULL template /
++  -- phrases mean "use the built-in default" (src/lib/moderation-settings.ts).
++  welcome_enabled      INTEGER NOT NULL DEFAULT 1,
++  welcome_template     TEXT,
++  spam_filter_enabled  INTEGER NOT NULL DEFAULT 1,
++  spam_phrases         TEXT,
+   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+   UNIQUE(owner_user_id, telegram_chat_id)
+ );
+@@ -227,3 +234,23 @@ CREATE UNIQUE INDEX idx_posts_one_open_live_per_streamer
+ 
+ CREATE INDEX idx_post_platforms_post  ON post_platforms(post_id, ended);
+ CREATE INDEX idx_post_platforms_acct  ON post_platforms(social_account_id, ended);
++
++-- Backs the /report command and the auto-ban-after-2-reports behavior.
++-- Deliberately not foreign-keyed to channels/streamers/users -- a
++-- reported person, whoever reports them, and the chat a report came from
++-- are all arbitrary Telegram entities, not necessarily anyone who has
++-- registered anything with /start or /add_channel. See
++-- migrations/004_add_user_reports.sql for the full rationale, in
++-- particular why UNIQUE(reported_user_id, chat_telegram_id) is the actual
++-- mechanism preventing several members of ONE group from colluding to hit
++-- the global ban threshold on their own.
++CREATE TABLE user_reports (
++  id                INTEGER PRIMARY KEY AUTOINCREMENT,
++  reported_user_id  INTEGER NOT NULL,
++  reporter_user_id  INTEGER NOT NULL,
++  chat_telegram_id  INTEGER NOT NULL,
++  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
++  UNIQUE (reported_user_id, chat_telegram_id)
++);
++
++CREATE INDEX idx_user_reports_reported ON user_reports (reported_user_id);
+diff --git a/src/db.test.ts b/src/db.test.ts
+new file mode 100644
+index 0000000..754b9f5
+--- /dev/null
++++ b/src/db.test.ts
+@@ -0,0 +1,207 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import { fileURLToPath } from "node:url";
++import { DatabaseSync } from "node:sqlite";
++import {
++  countDistinctReportingChats,
++  createChannel,
++  createUserReport,
++  getChannelByTelegramChatId,
++  getOrCreateUser,
++  toggleChannelFlag,
++  updateChannelSpamPhrases,
++  updateChannelWelcomeTemplate,
++} from "./db.js";
++import type { Env } from "./types.js";
++
++// ---------------------------------------------------------------------------
++// createUserReport / countDistinctReportingChats
++//
++// Cloudflare D1 isn't available outside Workers, so these run the real
++// functions against an in-memory SQLite database (node:sqlite -- the same
++// engine D1 is built on) created from the repo's REAL schema.sql, not a
++// hand-copied table definition. That matters here specifically: the
++// collusion guard (at most one report per reported person per chat) is a
++// UNIQUE constraint in the schema, not application logic, so a test that
++// re-declared the table itself could stay green while the real schema
++// drifted. FakeD1 below implements only the small slice of D1's API that
++// these two functions use (prepare().bind().run()/first()).
++// ---------------------------------------------------------------------------
++
++class FakeD1Statement {
++  private params: unknown[] = [];
++  constructor(
++    private readonly db: DatabaseSync,
++    private readonly sql: string,
++  ) {}
++
++  bind(...params: unknown[]): this {
++    this.params = params;
++    return this;
++  }
++
++  async run(): Promise<{ success: true }> {
++    this.db.prepare(this.sql).run(...(this.params as Array<string | number | null>));
++    return { success: true };
++  }
++
++  async first<T>(): Promise<T | null> {
++    const row = this.db.prepare(this.sql).get(...(this.params as Array<string | number | null>));
++    return (row as T | undefined) ?? null;
++  }
++}
++
++function createTestEnv(): Env {
++  const db = new DatabaseSync(":memory:");
++  // fileURLToPath(string) rather than passing a URL object straight to
++  // readFileSync: tsconfig.test.json resolves the global URL type to
++  // Cloudflare Workers' definition, which node:fs's overloads reject.
++  const schemaPath = fileURLToPath(new URL("../schema.sql", import.meta.url).href);
++  db.exec(readFileSync(schemaPath, "utf8"));
++  const fakeD1 = { prepare: (sql: string) => new FakeD1Statement(db, sql) };
++  return { DB: fakeD1 } as unknown as Env;
++}
++
++test("a first report against a person is recorded as created", async () => {
++  const env = createTestEnv();
++  assert.equal(await createUserReport(env, 111, 222, -1001), "created");
++  assert.equal(await countDistinctReportingChats(env, 111), 1);
++});
++
++test("a second report against the same person from the SAME chat is rejected, even from a different reporter (collusion guard)", async () => {
++  const env = createTestEnv();
++  assert.equal(await createUserReport(env, 111, 222, -1001), "created");
++  // A different member of the same group tries to add a second report.
++  assert.equal(await createUserReport(env, 111, 333, -1001), "already_reported_from_this_chat");
++  // The count must not have been inflated by the rejected attempt.
++  assert.equal(await countDistinctReportingChats(env, 111), 1);
++});
++
++test("the same reporter repeating /report on the same person in the same chat is also rejected", async () => {
++  const env = createTestEnv();
++  assert.equal(await createUserReport(env, 111, 222, -1001), "created");
++  assert.equal(await createUserReport(env, 111, 222, -1001), "already_reported_from_this_chat");
++  assert.equal(await countDistinctReportingChats(env, 111), 1);
++});
++
++test("reports from two DIFFERENT chats against the same person both count, reaching 2", async () => {
++  const env = createTestEnv();
++  assert.equal(await createUserReport(env, 111, 222, -1001), "created");
++  assert.equal(await createUserReport(env, 111, 444, -1002), "created");
++  assert.equal(await countDistinctReportingChats(env, 111), 2);
++});
++
++test("reports against different people do not affect each other's counts", async () => {
++  const env = createTestEnv();
++  await createUserReport(env, 111, 222, -1001);
++  await createUserReport(env, 111, 444, -1002);
++  await createUserReport(env, 999, 222, -1001);
++  assert.equal(await countDistinctReportingChats(env, 111), 2);
++  assert.equal(await countDistinctReportingChats(env, 999), 1);
++});
++
++test("a person nobody has reported has a count of zero", async () => {
++  const env = createTestEnv();
++  assert.equal(await countDistinctReportingChats(env, 12345), 0);
++});
++
++test("a non-uniqueness database error is rethrown rather than swallowed as 'already reported'", async () => {
++  const env = createTestEnv();
++  // Break the table out from under the function so the INSERT fails for a
++  // reason that is NOT a UNIQUE violation -- createUserReport must not
++  // misreport that as a duplicate report.
++  await env.DB.prepare("DROP TABLE user_reports").run();
++  await assert.rejects(() => createUserReport(env, 111, 222, -1001), /no such table/);
++});
++
++// ---------------------------------------------------------------------------
++// Per-chat moderation settings: getChannelByTelegramChatId,
++// updateChannelWelcomeTemplate, updateChannelSpamPhrases, and the two new
++// toggleChannelFlag flags. Same rationale as above for testing against the
++// real schema.sql rather than a hand-copied table shape -- the new columns'
++// defaults (welcome_enabled/spam_filter_enabled = 1, the two text columns =
++// NULL) are declared in the schema, not in application code, so a test that
++// re-declared the table could stay green while the real schema drifted.
++// ---------------------------------------------------------------------------
++
++/** owner_user_id must reference an existing users row (foreign keys are
++ * enforced, matching D1's real behavior -- see this repo's own notes on
++ * that in the my_chat_member handling), so every moderation-settings test
++ * needs a real user before it can create a channel. */
++async function createTestChannel(env: Env, telegramChatId: number): Promise<Awaited<ReturnType<typeof createChannel>>> {
++  const owner = await getOrCreateUser(env, 900000 + telegramChatId, undefined, "Test Owner");
++  return createChannel(env, owner.id, telegramChatId, "Test Chat");
++}
++
++test("a freshly-created channel defaults to welcome and spam-filter both enabled, with no custom text", async () => {
++  const env = createTestEnv();
++  const channel = await createTestChannel(env, -2001);
++  assert.equal(channel.welcome_enabled, 1);
++  assert.equal(channel.spam_filter_enabled, 1);
++  assert.equal(channel.welcome_template, null);
++  assert.equal(channel.spam_phrases, null);
++});
++
++test("getChannelByTelegramChatId finds a registered chat by its Telegram chat ID", async () => {
++  const env = createTestEnv();
++  const created = await createTestChannel(env, -2002);
++  const found = await getChannelByTelegramChatId(env, -2002);
++  assert.ok(found);
++  assert.equal(found.id, created.id);
++});
++
++test("getChannelByTelegramChatId returns null for a chat nobody has registered", async () => {
++  const env = createTestEnv();
++  assert.equal(await getChannelByTelegramChatId(env, -999999), null);
++});
++
++test("toggleChannelFlag flips welcome_enabled independently of spam_filter_enabled", async () => {
++  const env = createTestEnv();
++  const channel = await createTestChannel(env, -2003);
++
++  const afterFirstToggle = await toggleChannelFlag(env, channel.id, "welcome_enabled");
++  assert.ok(afterFirstToggle);
++  assert.equal(afterFirstToggle.welcome_enabled, 0);
++  assert.equal(afterFirstToggle.spam_filter_enabled, 1); // untouched
++
++  const afterSecondToggle = await toggleChannelFlag(env, channel.id, "welcome_enabled");
++  assert.ok(afterSecondToggle);
++  assert.equal(afterSecondToggle.welcome_enabled, 1); // back to on
++});
++
++test("toggleChannelFlag flips spam_filter_enabled independently of welcome_enabled", async () => {
++  const env = createTestEnv();
++  const channel = await createTestChannel(env, -2004);
++
++  const afterToggle = await toggleChannelFlag(env, channel.id, "spam_filter_enabled");
++  assert.ok(afterToggle);
++  assert.equal(afterToggle.spam_filter_enabled, 0);
++  assert.equal(afterToggle.welcome_enabled, 1); // untouched
++});
++
++test("updateChannelWelcomeTemplate stores a custom template, and null resets it back", async () => {
++  const env = createTestEnv();
++  const channel = await createTestChannel(env, -2005);
++
++  const withCustom = await updateChannelWelcomeTemplate(env, channel.id, "Привет, {name}!");
++  assert.ok(withCustom);
++  assert.equal(withCustom.welcome_template, "Привет, {name}!");
++
++  const reset = await updateChannelWelcomeTemplate(env, channel.id, null);
++  assert.ok(reset);
++  assert.equal(reset.welcome_template, null);
++});
++
++test("updateChannelSpamPhrases stores a custom phrase list as JSON, and null resets it back", async () => {
++  const env = createTestEnv();
++  const channel = await createTestChannel(env, -2006);
++
++  const withCustom = await updateChannelSpamPhrases(env, channel.id, JSON.stringify(["продам гараж"]));
++  assert.ok(withCustom);
++  assert.equal(withCustom.spam_phrases, '["продам гараж"]');
++
++  const reset = await updateChannelSpamPhrases(env, channel.id, null);
++  assert.ok(reset);
++  assert.equal(reset.spam_phrases, null);
++});
+diff --git a/src/db.ts b/src/db.ts
+index 62af65d..58b9569 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -108,6 +108,23 @@ export async function getChannelByOwnerAndChatId(
+   return row ?? null;
+ }
+ 
++/** Wipes every bot configuration for a Telegram chat — the channels row(s)
++ * and, via ON DELETE CASCADE (D1 enforces foreign keys on every query, see
++ * schema.sql's PRAGMA foreign_keys = ON and Cloudflare's docs on this --
++ * unlike plain SQLite, this isn't a per-connection setting that could be
++ * silently unset here), everything under them: streamers, social_accounts,
++ * extra_links, posts, post_platforms, kick_tokens, kick_oauth_states,
++ * post_claims. Matches on telegram_chat_id alone, not a specific owner --
++ * channels has no UNIQUE constraint on telegram_chat_id by itself (only on
++ * the (owner_user_id, telegram_chat_id) pair), so in principle more than
++ * one admin could have registered the same physical chat; when the bot is
++ * removed, all of them should be cleared, not just whichever owner's row
++ * happens to be looked up first. Called from the my_chat_member handler
++ * when the bot's own status in a chat becomes "left" or "kicked". */
++export async function deleteChannelsByTelegramChatId(env: Env, telegramChatId: number): Promise<void> {
++  await env.DB.prepare("DELETE FROM channels WHERE telegram_chat_id = ?").bind(telegramChatId).run();
++}
++
+ export async function createChannel(
+   env: Env,
+   ownerUserId: number,
+@@ -127,20 +144,62 @@ export async function updateChannelTemplate(env: Env, channelId: number, templat
+   await env.DB.prepare("UPDATE channels SET message_template = ? WHERE id = ?").bind(template, channelId).run();
+ }
+ 
+-export async function toggleChannelFlag(
++/** The chat's settings row, looked up by Telegram chat ID alone -- used by
++ * the chat_member handler, which knows only which chat someone joined, not
++ * who registered it. Returns null when nobody has registered the chat with
++ * /add_channel (the caller then applies the built-in defaults). Nothing
++ * stops two different owners registering the same chat (UNIQUE is on the
++ * (owner, chat) pair), so this deterministically takes the earliest
++ * registration. */
++export async function getChannelByTelegramChatId(env: Env, telegramChatId: number): Promise<ChannelRow | null> {
++  const row = await env.DB.prepare("SELECT * FROM channels WHERE telegram_chat_id = ? ORDER BY id ASC LIMIT 1")
++    .bind(telegramChatId)
++    .first<ChannelRow>();
++  return row ?? null;
++}
++
++/** Sets the chat's custom welcome text; null goes back to the built-in
++ * default. Returns the updated row. */
++export async function updateChannelWelcomeTemplate(
+   env: Env,
+   channelId: number,
+-  flag: "auto_pin" | "auto_unpin",
++  template: string | null,
+ ): Promise<ChannelRow | null> {
+-  // Literal SQL per flag rather than interpolating the column name into the
+-  // query string — `flag` is always a hardcoded literal from the call sites
+-  // in src/handlers/telegram.ts today, but this keeps the query text fixed
+-  // regardless, rather than relying on that staying true.
+-  const sql =
+-    flag === "auto_pin"
+-      ? "UPDATE channels SET auto_pin = 1 - auto_pin WHERE id = ?"
+-      : "UPDATE channels SET auto_unpin = 1 - auto_unpin WHERE id = ?";
+-  await env.DB.prepare(sql).bind(channelId).run();
++  await env.DB.prepare("UPDATE channels SET welcome_template = ? WHERE id = ?").bind(template, channelId).run();
++  return getChannelById(env, channelId);
++}
++
++/** Sets the chat's spam-phrase list (a JSON array, see
++ * serializeSpamPhrases); null goes back to the built-in default list.
++ * Returns the updated row. */
++export async function updateChannelSpamPhrases(
++  env: Env,
++  channelId: number,
++  phrasesJson: string | null,
++): Promise<ChannelRow | null> {
++  await env.DB.prepare("UPDATE channels SET spam_phrases = ? WHERE id = ?").bind(phrasesJson, channelId).run();
++  return getChannelById(env, channelId);
++}
++
++export async function updateExtraLinkUrl(env: Env, linkId: number, url: string): Promise<void> {
++  await env.DB.prepare("UPDATE extra_links SET url = ? WHERE id = ?").bind(url, linkId).run();
++}
++
++export type ChannelFlag = "auto_pin" | "auto_unpin" | "welcome_enabled" | "spam_filter_enabled";
++
++// Literal SQL per flag rather than interpolating the column name into the
++// query string — `flag` is always a hardcoded literal from the call sites
++// in src/handlers/telegram.ts today, but this keeps the query text fixed
++// regardless, rather than relying on that staying true.
++const TOGGLE_CHANNEL_FLAG_SQL: Record<ChannelFlag, string> = {
++  auto_pin: "UPDATE channels SET auto_pin = 1 - auto_pin WHERE id = ?",
++  auto_unpin: "UPDATE channels SET auto_unpin = 1 - auto_unpin WHERE id = ?",
++  welcome_enabled: "UPDATE channels SET welcome_enabled = 1 - welcome_enabled WHERE id = ?",
++  spam_filter_enabled: "UPDATE channels SET spam_filter_enabled = 1 - spam_filter_enabled WHERE id = ?",
++};
++
++export async function toggleChannelFlag(env: Env, channelId: number, flag: ChannelFlag): Promise<ChannelRow | null> {
++  await env.DB.prepare(TOGGLE_CHANNEL_FLAG_SQL[flag]).bind(channelId).run();
+   return getChannelById(env, channelId);
+ }
+ 
+@@ -588,3 +647,50 @@ export async function claimPostSlot(env: Env, streamerId: number, kind: PostKind
+ export async function releasePostSlot(env: Env, streamerId: number, kind: PostKind): Promise<void> {
+   await env.DB.prepare("DELETE FROM post_claims WHERE streamer_id = ? AND kind = ?").bind(streamerId, kind).run();
+ }
++
++// ---------------------------------------------------------------------------
++// /report — see migrations/004_add_user_reports.sql for the schema and the
++// collusion-guard rationale (UNIQUE(reported_user_id, chat_telegram_id)).
++// ---------------------------------------------------------------------------
++
++/** Records a report of reportedUserId, filed by reporterUserId, from the
++ * chat identified by chatTelegramId. Returns "created" for a genuinely new
++ * report; "already_reported_from_this_chat" if this exact chat has
++ * already filed a report against this same person (the UNIQUE constraint
++ * caught it) -- this is the collusion guard doing its job, not an error,
++ * so the caller should tell the reporter their target already has an
++ * active report from this chat rather than presenting this as a failure. */
++export async function createUserReport(
++  env: Env,
++  reportedUserId: number,
++  reporterUserId: number,
++  chatTelegramId: number,
++): Promise<"created" | "already_reported_from_this_chat"> {
++  try {
++    await env.DB.prepare(
++      "INSERT INTO user_reports (reported_user_id, reporter_user_id, chat_telegram_id) VALUES (?, ?, ?)",
++    )
++      .bind(reportedUserId, reporterUserId, chatTelegramId)
++      .run();
++    return "created";
++  } catch (err) {
++    if (!isUniqueConstraintError(err)) throw err;
++    return "already_reported_from_this_chat";
++  }
++}
++
++/** How many DISTINCT chats have filed a report against reportedUserId.
++ * This -- not a raw row count -- is the number the auto-ban threshold is
++ * checked against, since the UNIQUE constraint already guarantees at most
++ * one row per (reportedUserId, chat), making a plain COUNT(*) equivalent
++ * to this in practice; COUNT(DISTINCT chat_telegram_id) is used anyway to
++ * make that invariant explicit at the call site rather than relying on
++ * readers to know it holds from the schema alone. */
++export async function countDistinctReportingChats(env: Env, reportedUserId: number): Promise<number> {
++  const row = await env.DB.prepare(
++    "SELECT COUNT(DISTINCT chat_telegram_id) AS count FROM user_reports WHERE reported_user_id = ?",
++  )
++    .bind(reportedUserId)
++    .first<{ count: number }>();
++  return row?.count ?? 0;
++}
+diff --git a/src/handlers/telegram.ts b/src/handlers/telegram.ts
+index b005b05..8825485 100644
+--- a/src/handlers/telegram.ts
++++ b/src/handlers/telegram.ts
+@@ -1,13 +1,17 @@
+-import { Bot, Context, InlineKeyboard } from "grammy";
++import { Bot, Context, GrammyError, InlineKeyboard } from "grammy";
+ import {
++  countDistinctReportingChats,
+   createChannel,
+   createExtraLink,
+   createKickOAuthState,
+   createSocialAccount,
+   createStreamer,
++  createUserReport,
++  deleteChannelsByTelegramChatId,
+   deleteExtraLink,
+   getChannelById,
+   getChannelByOwnerAndChatId,
++  getChannelByTelegramChatId,
+   getStreamerById,
+   listChannelsByOwner,
+   listExtraLinksByStreamer,
+@@ -15,8 +19,29 @@ import {
+   listStreamersByChannel,
+   setSession,
+   toggleChannelFlag,
++  updateChannelSpamPhrases,
+   updateChannelTemplate,
++  updateChannelWelcomeTemplate,
++  updateExtraLinkUrl,
+ } from "../db.js";
++import { bioLooksLikeSpam, escapeHtml, isMemberStatus } from "../lib/chat-membership.js";
++import {
++  DEFAULT_WELCOME_TEMPLATE,
++  MAX_SPAM_PHRASES,
++  SPAM_PHRASE_MAX_LENGTH,
++  SPAM_PHRASE_MIN_LENGTH,
++  TELEGRAM_CAPTION_LIMIT,
++  WELCOME_TEMPLATE_MAX_LENGTH,
++  addSpamPhrases,
++  removeSpamPhraseAt,
++  renderWelcomeText,
++  resolveSpamPhrases,
++  resolveWelcomeTemplate,
++  serializeSpamPhrases,
++  validateWelcomeTemplate,
++  type SpamPhraseSkipReason,
++} from "../lib/moderation-settings.js";
++import { estimateRegistrationDate, formatApproximateRegistrationDate } from "../lib/registration-date-estimate.js";
+ import { buildAuthorizationUrl, generatePkcePair } from "../lib/kick.js";
+ import { DEFAULT_TEMPLATE } from "../lib/message-templates.js";
+ import { removeSocialAccount, removeStreamer } from "../lib/removal.js";
+@@ -45,9 +70,12 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
+         "   • Группа: отправьте /add_channel прямо в группе.\n" +
+         "   • Канал: перешлите мне сюда, в личку, любой пост из канала.\n" +
+         "3) Вернитесь в эту личку и отправьте /add_social, чтобы привязать стримера.\n" +
+-        "4) Команда /settings в любой момент — изменить текст уведомления или поведение закрепления.\n\n" +
++        "4) Команда /settings в любой момент — изменить текст уведомления, поведение закрепления, а также " +
++        "отвязать, изменить или удалить любую соцсеть/ссылку стримера (раздел «👤 Управлять стримерами»).\n\n" +
+         "Если один и тот же стример одновременно в эфире на нескольких отслеживаемых платформах, я объединяю " +
+-        "это в одно сообщение с кнопкой на каждую платформу вместо дублей.",
++        "это в одно сообщение с кнопкой на каждую платформу вместо дублей.\n\n" +
++        "Модерация в группах (где я админ): приветствую новых участников, а команда /report в ответ на сообщение " +
++        "позволяет пожаловаться на участника — если на него жалуются минимум 2 разные группы, я блокирую его на 30 дней.",
+     );
+   });
+ 
+@@ -119,6 +147,18 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
+     await promptChannelChoice(ctx, channels, "set");
+   });
+ 
++  bot.command("report", async (ctx) => {
++    await handleReportCommand(ctx, env);
++  });
++
++  bot.on("my_chat_member", async (ctx) => {
++    await handleMyChatMemberUpdate(ctx, env);
++  });
++
++  bot.on("chat_member", async (ctx) => {
++    await handleChatMemberUpdate(ctx, env);
++  });
++
+   bot.on("callback_query:data", async (ctx) => {
+     const [scope, ...rest] = ctx.callbackQuery.data.split(":");
+     try {
+@@ -148,12 +188,305 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
+       await handleLinkLabelInput(ctx, env, session.data);
+     } else if (session.step === "awaiting_link_url") {
+       await handleLinkUrlInput(ctx, env, session.data);
++    } else if (session.step === "awaiting_link_url_edit") {
++      await handleLinkUrlEditInput(ctx, env, session.data);
+     } else if (session.step === "awaiting_template") {
+       await handleTemplateInput(ctx, env, session.data);
++    } else if (session.step === "awaiting_welcome_template") {
++      await handleWelcomeTemplateInput(ctx, env, session.data);
++    } else if (session.step === "awaiting_spam_phrases") {
++      await handleSpamPhrasesInput(ctx, env, session.data);
+     }
+   });
+ }
+ 
++// ---------------------------------------------------------------------------
++// Присутствие бота в группе/канале: добавление (с проверкой, что добавил
++// админ), исключение (полная очистка настроек этого чата), назначение
++// прав администратора отдельным более поздним действием.
++// ---------------------------------------------------------------------------
++
++/** Сколько РАЗНЫХ групп должны пожаловаться на одного человека (через
++ * /report), прежде чем бот начнёт банить его при попытке вступить в любую
++ * группу, где сам является админом. См. схему user_reports и
++ * countDistinctReportingChats в src/db.ts — почему это именно «разных
++ * групп», а не «разных людей одной группы». */
++const REPORT_BAN_THRESHOLD = 2;
++
++/** Секунд в 30 днях — срок временного бана, как для срабатывания по
++ * порогу жалоб, так и для срабатывания по bio-спам-фильтру. Единый срок
++ * для обоих триггеров: разная длительность для «жалобы» и «спам-bio» не
++ * была запрошена, а лишние настраиваемые параметры без явного запроса
++ * добавляют сложность без пользы. */
++const REPORT_BAN_DURATION_SECONDS = 30 * 24 * 60 * 60;
++
++/** Банит userId в chatId на REPORT_BAN_DURATION_SECONDS (Telegram сам
++ * снимет бан по истечении срока — until_date, а не отдельная запись в
++ * нашей БД о том, до какого числа длится бан: если человек всё ещё
++ * состоит в «чёрном списке» после разбана по времени и попытается
++ * вступить снова, тот же самый chat_member-обработчик отработает заново и
++ * забанит его на новый срок). Ошибки не выбрасывает наружу — например,
++ * если у бота вдруг нет прав ограничивать участников в этом конкретном
++ * чате — только логирует, чтобы разовый сбой одной операции не обрывал
++ * остальную обработку обновления.
++ */
++async function banMemberTemporarily(ctx: BotContext, chatId: number, userId: number): Promise<void> {
++  const untilDate = Math.floor(Date.now() / 1000) + REPORT_BAN_DURATION_SECONDS;
++  await ctx.api
++    .banChatMember(chatId, userId, { until_date: untilDate })
++    .catch((err) => console.error(`banChatMember failed for user ${userId} in chat ${chatId}:`, err));
++}
++
++async function handleReportCommand(ctx: BotContext, env: Env): Promise<void> {
++  const chat = ctx.chat;
++  if (!chat) return; // bot.command("report", ...) всегда даёт message-контекст с chat, но BotContext сам по себе типизирует его как опциональный
++  if (chat.type !== "group" && chat.type !== "supergroup") {
++    await ctx.reply("Команда /report работает только в группах.");
++    return;
++  }
++
++  const target = ctx.message?.reply_to_message?.from;
++  if (!target) {
++    await ctx.reply("Ответьте командой /report на сообщение того, на кого хотите пожаловаться.");
++    return;
++  }
++  if (target.is_bot) {
++    await ctx.reply("Нельзя пожаловаться на бота.");
++    return;
++  }
++  const reporter = ctx.from;
++  if (!reporter) return;
++  if (target.id === reporter.id) {
++    await ctx.reply("Нельзя пожаловаться на самого себя.");
++    return;
++  }
++
++  // Заявитель должен САМ сейчас быть участником этой группы (не вышедшим
++  // сразу после подачи жалобы, не кем-то без реального отношения к
++  // группе) — см. обсуждение при выборе этого решения.
++  const reporterMember = await ctx.api.getChatMember(chat.id, reporter.id).catch((err) => {
++    console.error(`getChatMember (report) failed for reporter ${reporter.id} in chat ${chat.id}:`, err);
++    return null;
++  });
++  if (!reporterMember || !isMemberStatus(reporterMember)) {
++    await ctx.reply("Подать жалобу может только действующий участник этой группы.");
++    return;
++  }
++
++  // Если БД недоступна, честно говорим, что жалоба НЕ записана, — иначе
++  // человек останется уверен, что пожаловался (глобальный bot.catch
++  // только пишет в лог и ничего не отвечает пользователю).
++  let reportCount: number;
++  try {
++    const outcome = await createUserReport(env, target.id, reporter.id, chat.id);
++    if (outcome === "already_reported_from_this_chat") {
++      await ctx.reply("На этого участника уже есть активная жалоба от этой группы.");
++      return;
++    }
++    reportCount = await countDistinctReportingChats(env, target.id);
++  } catch (err) {
++    console.error(`/report failed to record or count a report against user ${target.id} in chat ${chat.id}:`, err);
++    await ctx.reply("Не удалось обработать жалобу из-за временной ошибки. Попробуйте ещё раз чуть позже.");
++    return;
++  }
++
++  if (reportCount >= REPORT_BAN_THRESHOLD) {
++    await banMemberTemporarily(ctx, chat.id, target.id);
++    await ctx.reply(
++      `Жалоба принята. На этого участника набралось ${reportCount} жалоб(ы) из разных групп — он временно заблокирован в этой группе на 30 дней.`,
++    );
++  } else {
++    await ctx.reply(
++      `Жалоба принята (${reportCount} из ${REPORT_BAN_THRESHOLD} групп, необходимых для блокировки).`,
++    );
++  }
++}
++
++async function handleMyChatMemberUpdate(ctx: BotContext, env: Env): Promise<void> {
++  const update = ctx.myChatMember;
++  if (!update) return;
++  const chat = update.chat;
++  if (chat.type !== "group" && chat.type !== "supergroup" && chat.type !== "channel") return;
++
++  const wasMember = isMemberStatus(update.old_chat_member);
++  const isNowMember = isMemberStatus(update.new_chat_member);
++  const noun = chat.type === "channel" ? "канал" : "группу";
++
++  // Бот только что покинул чат (исключён администратором или вышел сам) —
++  // обнуляем все настройки, зарегистрированные для этого чата, у всех
++  // владельцев (см. deleteChannelsByTelegramChatId в src/db.ts на тему
++  // того, почему это не привязано к одному конкретному owner_user_id).
++  if (wasMember && !isNowMember) {
++    await deleteChannelsByTelegramChatId(env, chat.id);
++    return;
++  }
++
++  // Бот только что добавлен (ранее не состоял в чате, теперь состоит —
++  // независимо от того, дали ему сразу права администратора или только
++  // права обычного участника).
++  if (!wasMember && isNowMember) {
++    const actor = update.from;
++
++    // Fails closed on purpose: if this lookup itself fails (a transient
++    // Telegram API error), actorMember stays null and actorIsAdmin below
++    // becomes false -- same outcome as a confirmed non-admin. The
++    // asymmetry is deliberate: worst case on a network hiccup is the bot
++    // leaves and an admin re-adds it, which is a minor inconvenience; the
++    // alternative (fail open, treat a lookup failure as "assume admin")
++    // would let exactly the case point 4 asks to block -- a non-admin
++    // adding the bot -- through undetected during any such hiccup.
++    const actorMember = await ctx.api.getChatMember(chat.id, actor.id).catch((err) => {
++      console.error(`getChatMember failed while checking who added the bot to chat ${chat.id}:`, err);
++      return null;
++    });
++    const actorIsAdmin =
++      !!actorMember && (actorMember.status === "creator" || actorMember.status === "administrator");
++
++    if (!actorIsAdmin) {
++      await ctx.api
++        .sendMessage(
++          chat.id,
++          `Добавлять меня в ${noun} может только администратор. Покидаю чат — попросите администратора добавить меня снова.`,
++        )
++        .catch(() => undefined);
++      await ctx.api.leaveChat(chat.id).catch(() => undefined);
++      return;
++    }
++
++    const actorName = actor.username ? `@${actor.username}` : actor.first_name;
++    await ctx.api
++      .sendMessage(
++        chat.id,
++        "🤖 <b>NeuroCasper</b> — бот для уведомлений о стримах\n\n" +
++          "Я слежу за стримерами на YouTube, TikTok и Kick и мгновенно присылаю сюда сообщение, когда " +
++          "кто-то из них начинает трансляцию или выпускает новое видео — с кнопкой на каждую соцсеть " +
++          "стримера (YouTube, TikTok, Kick, Twitch, Discord и другие, любые ссылки настраиваются).\n\n" +
++          "<b>Как настроить для этого чата:</b>\n" +
++          "1. Отправьте здесь, в группе, команду /add_channel — так вы зарегистрируете этот чат за собой.\n" +
++          "2. Напишите мне в личные сообщения /add_social — привяжете стримера и его аккаунты.\n" +
++          "3. Команда /settings в личке — автозакрепление, текст уведомления, стримеры, а также приветствие " +
++          "новых участников и список спам-фраз для этого чата.\n\n" +
++          "Чтобы приветствовать новичков и блокировать спамеров, мне нужны права администратора " +
++          "(с правом блокировки участников).\n\n" +
++          `Спасибо администратору ${escapeHtml(actorName)} этого чата за то, что выбрал(а) именно меня! ` +
++          `Разработчик бота — <a href="https://t.me/WZ_Casper">亗 Casper</a>.`,
++        { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
++      )
++      .catch(() => undefined);
++    return;
++  }
++
++  // Осталось изменение статуса, при котором бот и до, и после числится
++  // участником (например, только что назначили админом отдельным
++  // действием после обычного добавления) — этому чату можно продолжать
++  // отправлять команду /add_channel как обычно, дополнительной реакции
++  // здесь не требуется.
++}
++
++async function handleChatMemberUpdate(ctx: BotContext, env: Env): Promise<void> {
++  const update = ctx.chatMember;
++  if (!update) return;
++  const chat = update.chat;
++  // Только группы/супергруппы — у каналов нет привычного «участника
++  // вступил», а сам bot.on("chat_member") в принципе не срабатывает для
++  // private-чатов (см. официальную документацию Update.chat_member).
++  if (chat.type !== "group" && chat.type !== "supergroup") return;
++
++  const wasMember = isMemberStatus(update.old_chat_member);
++  const isNowMember = isMemberStatus(update.new_chat_member);
++  if (wasMember || !isNowMember) return; // интересует только «вступил впервые»
++
++  const newMember = update.new_chat_member.user;
++  if (newMember.is_bot) return; // приветствуем людей, не сервисных ботов (включая самого себя)
++
++  // Настройки этого чата, если его кто-то зарегистрировал через /add_channel
++  // (там же владелец меняет текст приветствия и список спам-фраз). Если чат
++  // не зарегистрирован или настройки не прочитались — стандартные:
++  // приветствие и проверка bio включены, тексты и фразы встроенные.
++  const channel = await getChannelByTelegramChatId(env, chat.id).catch((err) => {
++    console.error(`getChannelByTelegramChatId failed for chat ${chat.id}, using default moderation settings:`, err);
++    return null;
++  });
++  const welcomeEnabled = channel ? Boolean(channel.welcome_enabled) : true;
++  const spamFilterEnabled = channel ? Boolean(channel.spam_filter_enabled) : true;
++
++  // Два независимых триггера немедленного временного бана вместо
++  // приветствия: (а) на человека уже подано 2+ жалобы из разных групп
++  // (порог достигнут, возможно, ещё до того, как он вступил именно сюда —
++  // это тот самый механизм «банить при попытке вступить в ЛЮБУЮ группу,
++  // где бот админ», см. countDistinctReportingChats/handleReportCommand);
++  // (б) его bio совпало с фразой из списка этого чата (см. bioLooksLikeSpam)
++  // прямо в момент именно этого вступления — жалоб на него при этом может
++  // не быть вовсе. Триггер (а) от переключателя проверки bio не зависит.
++  //
++  // Fails OPEN on purpose, the opposite of the "who added the bot" check
++  // in handleMyChatMemberUpdate: there, wrongly letting someone through
++  // violated an explicit requirement (only admins may add the bot); here
++  // the wrong outcome of failing closed would be a 30-day ban of an
++  // innocent person because the database blinked, which is a far worse and
++  // harder-to-undo harm than letting a genuinely-reported person through
++  // for one join (they get re-checked on their next join, and any further
++  // /report re-triggers the ban). A DB error must also not abort the whole
++  // handler and take the welcome message down with it.
++  const reportCount = await countDistinctReportingChats(env, newMember.id).catch((err) => {
++    console.error(`countDistinctReportingChats failed for user ${newMember.id}, treating as 0 reports:`, err);
++    return 0;
++  });
++
++  let bioIsSpam = false;
++  if (spamFilterEnabled) {
++    const chatInfo = await ctx.api.getChat(newMember.id).catch((err) => {
++      console.error(`getChat failed while checking bio for user ${newMember.id}:`, err);
++      return null;
++    });
++    const bio = chatInfo && "bio" in chatInfo ? chatInfo.bio : undefined;
++    bioIsSpam = bioLooksLikeSpam(bio, resolveSpamPhrases(channel?.spam_phrases));
++  }
++
++  if (reportCount >= REPORT_BAN_THRESHOLD || bioIsSpam) {
++    await banMemberTemporarily(ctx, chat.id, newMember.id);
++    return;
++  }
++
++  if (!welcomeEnabled) return;
++
++  const fullName = newMember.last_name ? `${newMember.first_name} ${newMember.last_name}` : newMember.first_name;
++  const text = renderWelcomeText(resolveWelcomeTemplate(channel?.welcome_template), {
++    name: fullName,
++    username: newMember.username ? `@${newMember.username}` : "— не указан",
++    registered: formatApproximateRegistrationDate(estimateRegistrationDate(newMember.id)),
++    chat: chat.title,
++  });
++
++  // Обычный текст без parse_mode: владелец чата может написать в
++  // приветствии что угодно (включая «<» и «&»), и это не превратится в
++  // разметку.
++  const sendPlain = async (): Promise<void> => {
++    await ctx.api
++      .sendMessage(chat.id, text)
++      .catch((err) => console.error(`sendMessage (welcome) failed in chat ${chat.id}:`, err));
++  };
++
++  const photos = await ctx.api.getUserProfilePhotos(newMember.id, { limit: 1 }).catch((err) => {
++    console.error(`getUserProfilePhotos failed for user ${newMember.id}:`, err);
++    return null;
++  });
++  const bestPhoto = photos?.photos[0]?.at(-1); // последний размер в списке — самый крупный
++
++  // Подпись к фото у Telegram ограничена 1024 символами; если после
++  // подстановок текст длиннее, шлём обычным сообщением без фото. Так же —
++  // если у человека нет фото или оно скрыто настройками приватности, или
++  // если сама отправка фото не удалась.
++  if (bestPhoto && text.length <= TELEGRAM_CAPTION_LIMIT) {
++    await ctx.api.sendPhoto(chat.id, bestPhoto.file_id, { caption: text }).catch(async (err) => {
++      console.error(`sendPhoto (welcome) failed in chat ${chat.id}, falling back to plain message:`, err);
++      await sendPlain();
++    });
++  } else {
++    await sendPlain();
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // Регистрация канала через пересланный пост (для broadcast-каналов)
+ // ---------------------------------------------------------------------------
+@@ -424,6 +757,20 @@ async function handleLinkUrlInput(
+   );
+ }
+ 
++async function handleLinkUrlEditInput(
++  ctx: BotContext,
++  env: Env,
++  data: { streamer_id: number; link_id: number },
++): Promise<void> {
++  const raw = ctx.message?.text?.trim();
++  if (!raw) return;
++  const url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
++
++  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++  await updateExtraLinkUrl(env, data.link_id, url);
++  await ctx.reply("✅ Ссылка обновлена.");
++}
++
+ // ---------------------------------------------------------------------------
+ // /settings
+ // ---------------------------------------------------------------------------
+@@ -431,12 +778,25 @@ async function handleLinkUrlInput(
+ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[]): Promise<void> {
+   const action = rest[0];
+ 
++  if (action === "menu") {
++    const channels = await listChannelsByOwner(env, ctx.dbUser.id);
++    const kb = new InlineKeyboard();
++    for (const ch of channels) kb.text(ch.title ?? String(ch.telegram_chat_id), `set:ch:${ch.id}`).row();
++    await ctx.editMessageText("Какой канал/группа?", { reply_markup: kb });
++    return;
++  }
++
+   if (action === "ch" && rest[1]) {
+     const channel = await getChannelById(env, Number(rest[1]));
+     if (channel) await renderChannelSettings(ctx, env, channel);
+     return;
+   }
+ 
++  if (action && MODERATION_ACTIONS.has(action) && rest[1]) {
++    await handleModerationCallback(ctx, env, action, rest);
++    return;
++  }
++
+   if (action === "pin" && rest[1]) {
+     const channel = await toggleChannelFlag(env, Number(rest[1]), "auto_pin");
+     if (channel) await renderChannelSettings(ctx, env, channel);
+@@ -453,7 +813,7 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
+     const channelId = Number(rest[1]);
+     await setSession(env, ctx.dbUser.id, { step: "awaiting_template", data: { channel_id: channelId } });
+     await ctx.editMessageText(
+-      `Отправьте новый текст уведомления (показывается под заголовком «\u{1F534} {streamer} в эфире!»).\nПлейсхолдеры: {title} {game}\n\nПо умолчанию:\n${DEFAULT_TEMPLATE}`,
++      `Отправьте новый текст уведомления (показывается под заголовком «\u{1F534} {streamer} начал трансляцию!»).\nПлейсхолдеры: {title} {game}\n\nПо умолчанию:\n${DEFAULT_TEMPLATE}`,
+     );
+     return;
+   }
+@@ -486,6 +846,19 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
+     return;
+   }
+ 
++  if (action === "el" && rest[1] && rest[2]) {
++    const streamerId = Number(rest[1]);
++    const linkId = Number(rest[2]);
++    const links = await listExtraLinksByStreamer(env, streamerId);
++    const link = links.find((l) => l.id === linkId);
++    if (!link) return;
++    await setSession(env, ctx.dbUser.id, { step: "awaiting_link_url_edit", data: { streamer_id: streamerId, link_id: linkId } });
++    await ctx.editMessageText(
++      `Текущая ссылка «${link.label}»:\n${link.url}\n\nОтправьте новую ссылку — заменит текущую (название «${link.label}» останется тем же).`,
++    );
++    return;
++  }
++
+   if (action === "rl" && rest[1] && rest[2]) {
+     await renderConfirmRemoveLink(ctx, env, Number(rest[1]), Number(rest[2]));
+     return;
+@@ -555,7 +928,11 @@ async function renderChannelSettings(ctx: BotContext, env: Env, channel: Channel
+     .row()
+     .text("👤 Управлять стримерами", `set:strs:${channel.id}`)
+     .row()
+-    .text("⬅ Назад", "set:back");
++    .text("👥 Модерация группы", `set:mod:${channel.id}`)
++    .row()
++    .text("⬅ Назад", "set:menu")
++    .row()
++    .text("🏠 Меню", "set:menu");
+ 
+   await ctx.editMessageText(text, { reply_markup: kb });
+ }
+@@ -571,7 +948,8 @@ async function renderStreamerList(ctx: BotContext, env: Env, channel: ChannelRow
+ 
+   const kb = new InlineKeyboard();
+   for (const s of streamers) kb.text(`👤 ${s.display_name}`, `set:str:${s.id}`).row();
+-  kb.text("⬅ Назад", `set:ch:${channel.id}`);
++  kb.text("⬅ Назад", `set:ch:${channel.id}`).row();
++  kb.text("🏠 Меню", "set:menu");
+ 
+   const text = streamers.length
+     ? `👤 Стримеры канала «${channel.title ?? channel.telegram_chat_id}»\n\nВыберите, кого настроить или отвязать.`
+@@ -598,10 +976,12 @@ async function renderStreamerDetail(ctx: BotContext, env: Env, streamer: Streame
+     kb.text(`❌ Отвязать ${PLATFORM_DISPLAY[a.platform]}`, `set:ra:${streamer.id}:${a.id}`).row();
+   }
+   for (const l of links) {
++    kb.text(`✏️ Изменить «${l.label}»`, `set:el:${streamer.id}:${l.id}`).row();
+     kb.text(`❌ Убрать «${l.label}»`, `set:rl:${streamer.id}:${l.id}`).row();
+   }
+   kb.text("🗑 Удалить стримера целиком", `set:rs:${streamer.id}`).row();
+-  kb.text("⬅ Назад", `set:strs:${streamer.channel_id}`);
++  kb.text("⬅ Назад", `set:strs:${streamer.channel_id}`).row();
++  kb.text("🏠 Меню", "set:menu");
+ 
+   await ctx.editMessageText(text, { reply_markup: kb });
+ }
+@@ -625,7 +1005,9 @@ async function renderConfirmRemoveAccount(
+   const kb = new InlineKeyboard()
+     .text("✅ Да, отвязать", `set:rac:${streamerId}:${accountId}`)
+     .row()
+-    .text("❌ Отмена", `set:str:${streamerId}`);
++    .text("❌ Отмена", `set:str:${streamerId}`)
++    .row()
++    .text("🏠 Меню", "set:menu");
+ 
+   await ctx.editMessageText(text, { reply_markup: kb });
+ }
+@@ -642,7 +1024,9 @@ async function renderConfirmRemoveLink(ctx: BotContext, env: Env, streamerId: nu
+   const kb = new InlineKeyboard()
+     .text("✅ Да, убрать", `set:rlc:${streamerId}:${linkId}`)
+     .row()
+-    .text("❌ Отмена", `set:str:${streamerId}`);
++    .text("❌ Отмена", `set:str:${streamerId}`)
++    .row()
++    .text("🏠 Меню", "set:menu");
+ 
+   await ctx.editMessageText(text, { reply_markup: kb });
+ }
+@@ -660,7 +1044,9 @@ async function renderConfirmRemoveStreamer(ctx: BotContext, env: Env, streamerId
+   const kb = new InlineKeyboard()
+     .text("✅ Да, удалить", `set:rsc:${streamerId}`)
+     .row()
+-    .text("❌ Отмена", `set:str:${streamerId}`);
++    .text("❌ Отмена", `set:str:${streamerId}`)
++    .row()
++    .text("🏠 Меню", "set:menu");
+ 
+   await ctx.editMessageText(text, { reply_markup: kb });
+ }
+@@ -672,3 +1058,270 @@ async function handleTemplateInput(ctx: BotContext, env: Env, data: { channel_id
+   await updateChannelTemplate(env, data.channel_id, text);
+   await ctx.reply("✅ Текст уведомления обновлён.");
+ }
++
++// ---------------------------------------------------------------------------
++// Модерация группы: приветствие новых участников и список спам-фраз.
++// Настройки свои у каждого чата; стандартные значения и вся чистая логика —
++// в src/lib/moderation-settings.ts. Экран: /settings → чат → «👥 Модерация
++// группы».
++// ---------------------------------------------------------------------------
++
++const MODERATION_ACTIONS = new Set(["mod", "wtg", "wtx", "wrs", "stg", "spl", "spa", "spd", "spr"]);
++
++interface View {
++  text: string;
++  kb: InlineKeyboard;
++}
++
++/** Чат, который зарегистрирован именно этим пользователем (через
++ * /add_channel), иначе null. */
++async function getOwnedChannel(ctx: BotContext, env: Env, channelId: number): Promise<ChannelRow | null> {
++  const channel = await getChannelById(env, channelId);
++  return channel && channel.owner_user_id === ctx.dbUser.id ? channel : null;
++}
++
++function truncateLabel(text: string, max: number): string {
++  const chars = Array.from(text); // по символам, а не по кодовым единицам — эмодзи не разрезается
++  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : text;
++}
++
++/** Показывает экран правкой текущего сообщения. Telegram отвечает ошибкой
++ * «message is not modified», если новый текст и клавиатура совпали с
++ * прежними (например, «сбросить к стандартным», когда уже стандартное) —
++ * это не сбой: экран и так актуален. */
++async function editScreen(ctx: BotContext, view: View): Promise<void> {
++  try {
++    await ctx.editMessageText(view.text, { reply_markup: view.kb });
++  } catch (err) {
++    if (err instanceof GrammyError && err.description.includes("message is not modified")) return;
++    throw err;
++  }
++}
++
++function buildModerationView(channel: ChannelRow): View {
++  const phrases = resolveSpamPhrases(channel.spam_phrases);
++  const text =
++    `👥 Модерация: ${channel.title ?? channel.telegram_chat_id}\n` +
++    "Работает в группах, где бот — администратор (в каналах не применяется).\n\n" +
++    `Приветствие новых участников: ${channel.welcome_enabled ? "вкл" : "выкл"}\n` +
++    `Проверка описания профиля на спам: ${channel.spam_filter_enabled ? "вкл" : "выкл"} ` +
++    `(фраз в списке: ${phrases.length}; при совпадении — блокировка на 30 дней)\n\n` +
++    `Текст приветствия (${channel.welcome_template ? "свой" : "стандартный"}):\n` +
++    resolveWelcomeTemplate(channel.welcome_template);
++  const kb = new InlineKeyboard()
++    .text(channel.welcome_enabled ? "Выключить приветствие" : "Включить приветствие", `set:wtg:${channel.id}`)
++    .row()
++    .text("✏️ Изменить текст приветствия", `set:wtx:${channel.id}`)
++    .row()
++    .text(channel.spam_filter_enabled ? "Выключить проверку спама" : "Включить проверку спама", `set:stg:${channel.id}`)
++    .row()
++    .text(`📝 Спам-фразы (${phrases.length})`, `set:spl:${channel.id}`)
++    .row()
++    .text("⬅ Назад", `set:ch:${channel.id}`)
++    .row()
++    .text("🏠 Меню", "set:menu");
++  return { text, kb };
++}
++
++function buildWelcomePromptView(channelId: number): View {
++  const text =
++    `Отправьте новый текст приветствия для новых участников (обычный текст, до ${WELCOME_TEMPLATE_MAX_LENGTH} символов).\n\n` +
++    "Подстановки:\n" +
++    "{name} — имя и фамилия\n" +
++    "{username} — ник (@...)\n" +
++    "{registered} — приблизительная дата регистрации\n" +
++    "{chat} — название группы\n\n" +
++    `Если у человека есть фото профиля, оно прикрепляется к приветствию (при тексте длиннее ${TELEGRAM_CAPTION_LIMIT} символов — без фото).\n\n` +
++    `Стандартный текст:\n${DEFAULT_WELCOME_TEMPLATE}`;
++  const kb = new InlineKeyboard()
++    .text("↩️ Вернуть стандартный текст", `set:wrs:${channelId}`)
++    .row()
++    .text("⬅ Отмена", `set:mod:${channelId}`);
++  return { text, kb };
++}
++
++function buildSpamPhraseListView(channel: ChannelRow): View {
++  const phrases = resolveSpamPhrases(channel.spam_phrases);
++  const body = phrases.length
++    ? phrases.map((p, i) => `${i + 1}. ${p}`).join("\n")
++    : "(список пуст — проверка ничего не ловит)";
++  const text =
++    `📝 Спам-фразы: ${channel.title ?? channel.telegram_chat_id}\n` +
++    "Если в описании (bio) нового участника есть любая из этих фраз, бот блокирует его на 30 дней. " +
++    "Регистр и лишние пробелы не важны.\n\n" +
++    `${body}\n\n` +
++    `${channel.spam_phrases === null ? "Список стандартный. " : ""}` +
++    "Чтобы изменить фразу — удалите её (❌) и добавьте заново.";
++  const kb = new InlineKeyboard();
++  phrases.forEach((p, i) => {
++    kb.text(`❌ ${truncateLabel(p, 28)}`, `set:spd:${channel.id}:${i}`).row();
++  });
++  kb.text("➕ Добавить фразы", `set:spa:${channel.id}`)
++    .row()
++    .text("↩️ Сбросить к стандартным", `set:spr:${channel.id}`)
++    .row()
++    .text("⬅ Назад", `set:mod:${channel.id}`)
++    .row()
++    .text("🏠 Меню", "set:menu");
++  return { text, kb };
++}
++
++function buildSpamAddPromptView(channelId: number): View {
++  const text =
++    "Отправьте фразы, которые нужно добавить, — по одной на строку.\n" +
++    `Длина фразы — от ${SPAM_PHRASE_MIN_LENGTH} до ${SPAM_PHRASE_MAX_LENGTH} символов, всего в списке не более ${MAX_SPAM_PHRASES} фраз. ` +
++    "Слишком короткая фраза совпала бы с описаниями обычных людей и привела бы к ложным блокировкам.";
++  const kb = new InlineKeyboard().text("⬅ Отмена", `set:spl:${channelId}`);
++  return { text, kb };
++}
++
++async function handleModerationCallback(ctx: BotContext, env: Env, action: string, rest: string[]): Promise<void> {
++  const channel = await getOwnedChannel(ctx, env, Number(rest[1]));
++  if (!channel) {
++    await editScreen(ctx, {
++      text: "Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Откройте /settings заново.",
++      kb: new InlineKeyboard().text("🏠 Меню", "set:menu"),
++    });
++    return;
++  }
++
++  switch (action) {
++    case "mod": {
++      await setSession(env, ctx.dbUser.id, IDLE_SESSION); // «Отмена» с экрана ввода тоже приходит сюда
++      await editScreen(ctx, buildModerationView(channel));
++      return;
++    }
++    case "wtg":
++    case "stg": {
++      const updated = await toggleChannelFlag(
++        env,
++        channel.id,
++        action === "wtg" ? "welcome_enabled" : "spam_filter_enabled",
++      );
++      await editScreen(ctx, buildModerationView(updated ?? channel));
++      return;
++    }
++    case "wtx": {
++      await setSession(env, ctx.dbUser.id, { step: "awaiting_welcome_template", data: { channel_id: channel.id } });
++      await editScreen(ctx, buildWelcomePromptView(channel.id));
++      return;
++    }
++    case "wrs": {
++      const updated = await updateChannelWelcomeTemplate(env, channel.id, null);
++      await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++      await editScreen(ctx, buildModerationView(updated ?? channel));
++      return;
++    }
++    case "spl": {
++      await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++      await editScreen(ctx, buildSpamPhraseListView(channel));
++      return;
++    }
++    case "spa": {
++      await setSession(env, ctx.dbUser.id, { step: "awaiting_spam_phrases", data: { channel_id: channel.id } });
++      await editScreen(ctx, buildSpamAddPromptView(channel.id));
++      return;
++    }
++    case "spd": {
++      // Индекс относится к списку в момент показа экрана; если список
++      // успел измениться (устаревшая кнопка), removeSpamPhraseAt вернёт null
++      // и ничего не удалится — экран просто обновится.
++      const next = removeSpamPhraseAt(resolveSpamPhrases(channel.spam_phrases), Number(rest[2]));
++      const updated = next ? await updateChannelSpamPhrases(env, channel.id, serializeSpamPhrases(next)) : channel;
++      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel));
++      return;
++    }
++    case "spr": {
++      const updated = await updateChannelSpamPhrases(env, channel.id, null);
++      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel));
++      return;
++    }
++  }
++}
++
++async function handleWelcomeTemplateInput(ctx: BotContext, env: Env, data: { channel_id: number }): Promise<void> {
++  const raw = ctx.message?.text;
++  if (!raw) return;
++
++  const channel = await getOwnedChannel(ctx, env, data.channel_id);
++  if (!channel) {
++    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
++    return;
++  }
++
++  const checked = validateWelcomeTemplate(raw);
++  if (!checked.ok) {
++    await ctx.reply(checked.error); // остаёмся в режиме ввода — можно отправить исправленный текст
++    return;
++  }
++
++  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++  const updated = await updateChannelWelcomeTemplate(env, channel.id, checked.template);
++  const view = buildModerationView(updated ?? channel);
++  await ctx.reply(`✅ Текст приветствия обновлён.\n\n${view.text}`, { reply_markup: view.kb });
++}
++
++function describeSkipReason(reason: SpamPhraseSkipReason): string {
++  switch (reason) {
++    case "too_short":
++      return `слишком короткая (нужно от ${SPAM_PHRASE_MIN_LENGTH} символов)`;
++    case "too_long":
++      return `слишком длинная (не больше ${SPAM_PHRASE_MAX_LENGTH} символов)`;
++    case "duplicate":
++      return "уже есть в списке";
++    case "limit_reached":
++      return `в списке уже максимум (${MAX_SPAM_PHRASES}) фраз`;
++  }
++}
++
++/** Маркированный список, обрезанный до `max` строк, чтобы ответ на
++ * добавление пачки фраз не вышел за лимит длины сообщения Telegram. */
++function bulletLines(items: string[], max = 10): string[] {
++  const lines = items.slice(0, max).map((item) => `• ${item}`);
++  if (items.length > max) lines.push(`…и ещё ${items.length - max}`);
++  return lines;
++}
++
++async function handleSpamPhrasesInput(ctx: BotContext, env: Env, data: { channel_id: number }): Promise<void> {
++  const raw = ctx.message?.text;
++  if (!raw || raw.trim() === "") return;
++
++  const channel = await getOwnedChannel(ctx, env, data.channel_id);
++  if (!channel) {
++    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
++    return;
++  }
++
++  const result = addSpamPhrases(resolveSpamPhrases(channel.spam_phrases), raw);
++  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++  const updated =
++    result.added.length > 0
++      ? ((await updateChannelSpamPhrases(env, channel.id, serializeSpamPhrases(result.phrases))) ?? channel)
++      : channel;
++
++  // Отчёт о результате отправляется ОТДЕЛЬНО от полного списка (не
++  // склеивается с ним в одно сообщение): при почти заполненном списке из
++  // длинных фраз и большой вставленной пачке сумма легко превышает лимит
++  // Telegram в 4096 символов на сообщение, и тогда пользователь не получил
++  // бы вообще никакого ответа, хотя фразы уже сохранились бы в БД. Здесь
++  // каждое сообщение ограничено независимо от размера списка/пачки:
++  // bulletLines сама по себе обрезает до 10 строк на секцию.
++  const lines: string[] = [];
++  if (result.added.length > 0) lines.push(`✅ Добавлено: ${result.added.length}`, ...bulletLines(result.added));
++  else lines.push("Ничего не добавлено.");
++  if (result.skipped.length > 0) {
++    lines.push(
++      "",
++      "Пропущено:",
++      ...bulletLines(
++        result.skipped.map((s) => `«${truncateLabel(s.phrase, 40)}» — ${describeSkipReason(s.reason)}`),
++      ),
++    );
++  }
++  await ctx.reply(lines.join("\n"));
++
++  const view = buildSpamPhraseListView(updated);
++  await ctx.reply(view.text, { reply_markup: view.kb });
++}
+diff --git a/src/lib/chat-membership.test.ts b/src/lib/chat-membership.test.ts
+new file mode 100644
+index 0000000..382e82f
+--- /dev/null
++++ b/src/lib/chat-membership.test.ts
+@@ -0,0 +1,136 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { bioLooksLikeSpam, escapeHtml, isMemberStatus } from "./chat-membership.js";
++
++// ---------------------------------------------------------------------------
++// isMemberStatus
++// ---------------------------------------------------------------------------
++
++test("creator, administrator and member all count as being in the chat", () => {
++  assert.equal(isMemberStatus({ status: "creator" }), true);
++  assert.equal(isMemberStatus({ status: "administrator" }), true);
++  assert.equal(isMemberStatus({ status: "member" }), true);
++});
++
++test("left and kicked never count as being in the chat", () => {
++  assert.equal(isMemberStatus({ status: "left" }), false);
++  assert.equal(isMemberStatus({ status: "kicked" }), false);
++});
++
++test("restricted defers to its own is_member flag rather than being treated as always in or always out", () => {
++  assert.equal(isMemberStatus({ status: "restricted", is_member: true }), true);
++  assert.equal(isMemberStatus({ status: "restricted", is_member: false }), false);
++});
++
++test("restricted with is_member omitted is treated as not a member (fails closed, not open)", () => {
++  assert.equal(isMemberStatus({ status: "restricted" }), false);
++});
++
++test("an unrecognized status string is treated as not a member rather than throwing", () => {
++  // Defends against a future Bot API status this code doesn't know about
++  // yet -- silently not-a-member is the safe default (it only ever makes
++  // handleMyChatMemberUpdate treat an add/remove transition as having
++  // happened when it possibly hasn't, never the reverse of hiding one).
++  assert.equal(isMemberStatus({ status: "some_future_status" }), false);
++});
++
++// ---------------------------------------------------------------------------
++// escapeHtml
++// ---------------------------------------------------------------------------
++
++test("leaves plain text with no special characters unchanged", () => {
++  assert.equal(escapeHtml("Casper"), "Casper");
++});
++
++test("escapes each of the three HTML-significant characters individually", () => {
++  assert.equal(escapeHtml("A & B"), "A &amp; B");
++  assert.equal(escapeHtml("5 < 10"), "5 &lt; 10");
++  assert.equal(escapeHtml("10 > 5"), "10 &gt; 5");
++});
++
++test("escapes all three together, in order, without double-escaping the ampersands introduced by the other replacements", () => {
++  // & must be escaped first: escaping < and > first would be fine on its
++  // own, but escaping & LAST would double-escape the &amp; / &lt; / &gt;
++  // that the earlier replacements just introduced (producing &amp;amp;
++  // etc). escapeHtml's replace order (& then < then >) avoids that.
++  assert.equal(escapeHtml("<b>A & B</b>"), "&lt;b&gt;A &amp; B&lt;/b&gt;");
++});
++
++test("neutralizes an HTML injection attempt via a spoofed Telegram first_name", () => {
++  // This is exactly the attack src/lib/chat-membership.ts's own doc
++  // comment describes: a user sets their Telegram first_name to something
++  // that looks like a tag, hoping it gets interpreted as real markup once
++  // interpolated into a parse_mode: "HTML" message alongside genuine tags.
++  const maliciousFirstName = '<a href="https://evil.example">click here</a>';
++  const escaped = escapeHtml(maliciousFirstName);
++  assert.equal(escaped, "&lt;a href=\"https://evil.example\"&gt;click here&lt;/a&gt;");
++  // The escaped form must not contain a literal, renderable <a> tag.
++  assert.ok(!escaped.includes("<a "), "escaped output must not contain a literal opening <a> tag");
++});
++
++// ---------------------------------------------------------------------------
++// bioLooksLikeSpam
++// ---------------------------------------------------------------------------
++
++test("an undefined bio (missing or privacy-hidden) is never spam", () => {
++  assert.equal(bioLooksLikeSpam(undefined), false);
++});
++
++test("an empty-string bio is never spam", () => {
++  assert.equal(bioLooksLikeSpam(""), false);
++});
++
++test("an ordinary, unremarkable bio is not spam", () => {
++  assert.equal(bioLooksLikeSpam("Люблю котиков и путешествия"), false);
++});
++
++test("detects the loan-solicitation category (one of the two named examples)", () => {
++  assert.equal(bioLooksLikeSpam("Даю деньги в долг быстро, звони"), true);
++});
++
++test("detects the job-seeking-spam category (the other named example)", () => {
++  assert.equal(bioLooksLikeSpam("Нужна работа, любая, срочно"), true);
++});
++
++test("matches case-insensitively", () => {
++  assert.equal(bioLooksLikeSpam("ДЕНЬГИ В ДОЛГ под расписку"), true);
++  assert.equal(bioLooksLikeSpam("Деньги В Долг"), true);
++});
++
++test("matches as a substring anywhere in a longer bio, not only as the whole bio", () => {
++  assert.equal(bioLooksLikeSpam("21 год, из Москвы. Ищу работу на удалёнке, пишите в личку"), true);
++});
++
++test("a bio that merely shares individual words with a spam phrase, without the phrase itself, is not spam", () => {
++  // Guards against the check being accidentally looser than the literal
++  // phrase list -- "работа" and "деньги" appear individually in plenty of
++  // ordinary bios that aren't soliciting loans or touting for gig work.
++  assert.equal(bioLooksLikeSpam("Работа программистом, увлекаюсь шахматами"), false);
++  assert.equal(bioLooksLikeSpam("Считаю деньги на карманные расходы"), false);
++});
++
++test("uses a custom phrase list when one is passed, instead of the built-in default", () => {
++  // A phrase that IS in the built-in default list must NOT match once a
++  // custom (and different) list is supplied -- the custom list fully
++  // replaces the default, it doesn't merge with it.
++  assert.equal(bioLooksLikeSpam("Даю деньги в долг быстро, звони", ["продам гараж"]), false);
++  // A phrase that is only in the custom list DOES match.
++  assert.equal(bioLooksLikeSpam("Продам гараж недорого", ["продам гараж"]), true);
++});
++
++test("an empty custom phrase list matches nothing, even a bio that would trip the built-in default", () => {
++  assert.equal(bioLooksLikeSpam("Даю деньги в долг быстро, звони", []), false);
++});
++
++test("a blank phrase in a custom list is ignored, not treated as matching every bio", () => {
++  // String#includes("") is true for any string, so a naive implementation
++  // would ban everyone who joins once an empty entry sneaks into the list
++  // (e.g. from a stray blank line). normalizeSpamPhrase("") === "" is
++  // filtered out explicitly for this reason.
++  assert.equal(bioLooksLikeSpam("Совершенно обычное описание профиля", ["", "   "]), false);
++});
++
++test("custom-list matching is case- and spacing-insensitive, same as the default list", () => {
++  assert.equal(bioLooksLikeSpam("ПРОДАМ   Гараж недорого", ["продам гараж"]), true);
++});
++
+diff --git a/src/lib/chat-membership.ts b/src/lib/chat-membership.ts
+new file mode 100644
+index 0000000..0619850
+--- /dev/null
++++ b/src/lib/chat-membership.ts
+@@ -0,0 +1,53 @@
++// Pure helpers around Telegram chat membership: interpreting
++// my_chat_member/chat_member updates (both carry the same
++// ChatMemberUpdated shape -- one for the bot's own membership, the other
++// for any chat member's), safely embedding user-controlled text into an
++// HTML-formatted message, and a narrow bio-based spam check used when
++// deciding whether to greet or auto-ban a newly-joined member. Kept
++// separate from src/handlers/telegram.ts (which wires these into the
++// actual bot, with real API calls and no test coverage of its own -- see
++// that file's other dozens of orchestration functions) so this specific
++// logic can have real, isolated tests the way src/lib/message-templates.ts
++// does for its own similarly-small pure-function surface.
++
++import { DEFAULT_SPAM_PHRASES, normalizeSpamPhrase } from "./moderation-settings.js";
++
++/** Mirrors python-telegram-bot's own reference chatmemberbot example
++ * (docs.python-telegram-bot.org/en/stable/examples.chatmemberbot.html) for
++ * interpreting a ChatMember's status: "member"/"administrator"/"creator"
++ * always count as actually being in the chat, and "restricted" only counts
++ * if its own is_member flag says so -- a restricted-but-not-a-member state
++ * exists in the Bot API and behaves like not being in the chat for this
++ * purpose (e.g. someone removed then re-invited under a restriction). */
++export function isMemberStatus(member: { status: string; is_member?: boolean }): boolean {
++  if (member.status === "member" || member.status === "administrator" || member.status === "creator") return true;
++  if (member.status === "restricted") return member.is_member === true;
++  return false;
++}
++
++/** Escapes the three characters Telegram's HTML parse_mode treats
++ * specially. Needed anywhere user-controlled text (e.g. a Telegram
++ * first_name, which a user can set to arbitrary text including markup-like
++ * strings) is interpolated into a parse_mode: "HTML" message alongside
++ * real formatting tags -- otherwise that text could inject its own tags
++ * (e.g. a first_name of `<a href="evil">x</a>`) into the rendered message. */
++export function escapeHtml(text: string): string {
++  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
++}
++
++/** True if bio contains any of `phrases` (case- and spacing-insensitive
++ * substring match). `phrases` is the chat's own list, see
++ * src/lib/moderation-settings.ts; it defaults to the built-in list. A
++ * missing/empty bio (undefined, e.g. because Telegram's privacy settings
++ * hid it, or the user never set one) is never spam by this check -- absence
++ * of information is not evidence of spam. Blank phrases are ignored: an empty
++ * needle would match every bio (String#includes("") is true) and ban
++ * everyone who joins. */
++export function bioLooksLikeSpam(bio: string | undefined, phrases: readonly string[] = DEFAULT_SPAM_PHRASES): boolean {
++  if (!bio) return false;
++  const normalizedBio = normalizeSpamPhrase(bio);
++  return phrases.some((phrase) => {
++    const needle = normalizeSpamPhrase(phrase);
++    return needle !== "" && normalizedBio.includes(needle);
++  });
++}
+diff --git a/src/lib/message-templates.ts b/src/lib/message-templates.ts
+index 299a991..94bf795 100644
+--- a/src/lib/message-templates.ts
++++ b/src/lib/message-templates.ts
+@@ -9,11 +9,16 @@ export interface TemplateVars {
+ }
+ 
+ /** Replaces {key} placeholders in a template with values from `vars`. Unknown
+- * placeholders are left untouched so a typo doesn't silently delete text. */
+-export function renderTemplate(template: string, vars: TemplateVars): string {
++ * placeholders are left untouched so a typo doesn't silently delete text. Not
++ * tied to one template kind: the stream-notification text and the new-member
++ * welcome text (src/lib/moderation-settings.ts) both use it. */
++export function renderPlaceholders(template: string, vars: Readonly<Record<string, string>>): string {
+   return template.replace(/\{(\w+)\}/g, (match, key: string) => {
+-    return Object.prototype.hasOwnProperty.call(vars, key)
+-      ? vars[key as keyof TemplateVars]
+-      : match;
++    const value = Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : undefined;
++    return value ?? match;
+   });
+ }
++
++export function renderTemplate(template: string, vars: TemplateVars): string {
++  return renderPlaceholders(template, { ...vars });
++}
+diff --git a/src/lib/moderation-settings.test.ts b/src/lib/moderation-settings.test.ts
+new file mode 100644
+index 0000000..27009f3
+--- /dev/null
++++ b/src/lib/moderation-settings.test.ts
+@@ -0,0 +1,210 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import {
++  DEFAULT_SPAM_PHRASES,
++  DEFAULT_WELCOME_TEMPLATE,
++  MAX_SPAM_PHRASES,
++  SPAM_PHRASE_MAX_LENGTH,
++  SPAM_PHRASE_MIN_LENGTH,
++  WELCOME_TEMPLATE_MAX_LENGTH,
++  addSpamPhrases,
++  normalizeSpamPhrase,
++  removeSpamPhraseAt,
++  renderWelcomeText,
++  resolveSpamPhrases,
++  resolveWelcomeTemplate,
++  serializeSpamPhrases,
++  validateWelcomeTemplate,
++} from "./moderation-settings.js";
++
++// ---------------------------------------------------------------------------
++// resolveWelcomeTemplate
++// ---------------------------------------------------------------------------
++
++test("null or undefined stored template resolves to the built-in default", () => {
++  assert.equal(resolveWelcomeTemplate(null), DEFAULT_WELCOME_TEMPLATE);
++  assert.equal(resolveWelcomeTemplate(undefined), DEFAULT_WELCOME_TEMPLATE);
++});
++
++test("a whitespace-only stored template also falls back to the default, not an empty greeting", () => {
++  // validateWelcomeTemplate rejects this on input, but resolveWelcomeTemplate
++  // is a second, independent line of defense for whatever ends up stored.
++  assert.equal(resolveWelcomeTemplate("   "), DEFAULT_WELCOME_TEMPLATE);
++});
++
++test("a real custom template is returned exactly as stored", () => {
++  assert.equal(resolveWelcomeTemplate("Привет, {name}!"), "Привет, {name}!");
++});
++
++// ---------------------------------------------------------------------------
++// renderWelcomeText
++// ---------------------------------------------------------------------------
++
++test("substitutes every documented placeholder", () => {
++  const out = renderWelcomeText("{name} / {username} / {registered} / {chat}", {
++    name: "Иван Иванов",
++    username: "@ivan",
++    registered: "≈ 1 января 2020",
++    chat: "Тестовая группа",
++  });
++  assert.equal(out, "Иван Иванов / @ivan / ≈ 1 января 2020 / Тестовая группа");
++});
++
++test("an unknown placeholder is left untouched rather than silently removed", () => {
++  const out = renderWelcomeText("{name} — {typo}", { name: "Иван", username: "", registered: "", chat: "" });
++  assert.equal(out, "Иван — {typo}");
++});
++
++// ---------------------------------------------------------------------------
++// validateWelcomeTemplate
++// ---------------------------------------------------------------------------
++
++test("rejects an empty or whitespace-only template", () => {
++  assert.equal(validateWelcomeTemplate("").ok, false);
++  assert.equal(validateWelcomeTemplate("   \n  ").ok, false);
++});
++
++test("accepts a normal template and returns it trimmed", () => {
++  const result = validateWelcomeTemplate("  Привет, {name}!  ");
++  assert.deepEqual(result, { ok: true, template: "Привет, {name}!" });
++});
++
++test("accepts a template exactly at the max length, rejects one character over", () => {
++  const atLimit = "a".repeat(WELCOME_TEMPLATE_MAX_LENGTH);
++  assert.equal(validateWelcomeTemplate(atLimit).ok, true);
++
++  const overLimit = "a".repeat(WELCOME_TEMPLATE_MAX_LENGTH + 1);
++  const result = validateWelcomeTemplate(overLimit);
++  assert.equal(result.ok, false);
++  if (!result.ok) assert.ok(result.error.includes(String(WELCOME_TEMPLATE_MAX_LENGTH)));
++});
++
++// ---------------------------------------------------------------------------
++// normalizeSpamPhrase
++// ---------------------------------------------------------------------------
++
++test("lowercases, collapses internal whitespace, and trims", () => {
++  assert.equal(normalizeSpamPhrase("  Деньги   В  Долг  "), "деньги в долг");
++  assert.equal(normalizeSpamPhrase("Нужна\tработа\n"), "нужна работа");
++});
++
++// ---------------------------------------------------------------------------
++// resolveSpamPhrases / serializeSpamPhrases
++// ---------------------------------------------------------------------------
++
++test("null or undefined stored phrases resolve to the built-in default list", () => {
++  assert.deepEqual(resolveSpamPhrases(null), [...DEFAULT_SPAM_PHRASES]);
++  assert.deepEqual(resolveSpamPhrases(undefined), [...DEFAULT_SPAM_PHRASES]);
++});
++
++test("a stored empty array is honored as 'no phrases', distinct from null", () => {
++  assert.deepEqual(resolveSpamPhrases("[]"), []);
++});
++
++test("a real stored list round-trips through serialize/resolve exactly", () => {
++  const phrases = ["деньги в долг", "нужна работа"];
++  assert.deepEqual(resolveSpamPhrases(serializeSpamPhrases(phrases)), phrases);
++});
++
++test("non-string entries in a stored array are dropped, not left in as-is", () => {
++  assert.deepEqual(resolveSpamPhrases('["ok", 5, null, "also ok"]'), ["ok", "also ok"]);
++});
++
++test("corrupted/invalid JSON falls back to the default list rather than throwing", () => {
++  assert.deepEqual(resolveSpamPhrases("{not valid json"), [...DEFAULT_SPAM_PHRASES]);
++});
++
++test("valid JSON that isn't an array (e.g. an object) falls back to the default list", () => {
++  assert.deepEqual(resolveSpamPhrases('{"a": 1}'), [...DEFAULT_SPAM_PHRASES]);
++});
++
++// ---------------------------------------------------------------------------
++// addSpamPhrases
++// ---------------------------------------------------------------------------
++
++test("adds one new phrase, normalized, to an empty list", () => {
++  const result = addSpamPhrases([], "  Деньги В Долг  ");
++  assert.deepEqual(result.phrases, ["деньги в долг"]);
++  assert.deepEqual(result.added, ["деньги в долг"]);
++  assert.deepEqual(result.skipped, []);
++});
++
++test("adds several phrases from separate lines, and normalizes each independently", () => {
++  const result = addSpamPhrases([], "нужна работа\nЗАЙМ НА КАРТУ\n");
++  assert.deepEqual(result.phrases, ["нужна работа", "займ на карту"]);
++  assert.deepEqual(result.added, ["нужна работа", "займ на карту"]);
++});
++
++test("blank lines in the input are silently ignored, not reported as skipped", () => {
++  const result = addSpamPhrases([], "нужна работа\n\n   \nищу работу");
++  assert.deepEqual(result.added, ["нужна работа", "ищу работу"]);
++  assert.deepEqual(result.skipped, []);
++});
++
++test("a phrase shorter than the minimum is skipped with reason too_short, and the rest still get added", () => {
++  const result = addSpamPhrases([], "тел\nнужна работа");
++  assert.deepEqual(result.added, ["нужна работа"]);
++  assert.deepEqual(result.skipped, [{ phrase: "тел", reason: "too_short" }]);
++});
++
++test("a phrase at exactly the minimum length is accepted, one character under is not", () => {
++  const atMin = "a".repeat(SPAM_PHRASE_MIN_LENGTH);
++  const underMin = "a".repeat(SPAM_PHRASE_MIN_LENGTH - 1);
++  const result = addSpamPhrases([], `${atMin}\n${underMin}`);
++  assert.deepEqual(result.added, [atMin]);
++  assert.deepEqual(result.skipped, [{ phrase: underMin, reason: "too_short" }]);
++});
++
++test("a phrase longer than the maximum is skipped with reason too_long", () => {
++  const tooLong = "a".repeat(SPAM_PHRASE_MAX_LENGTH + 1);
++  const result = addSpamPhrases([], tooLong);
++  assert.deepEqual(result.skipped, [{ phrase: tooLong, reason: "too_long" }]);
++  assert.deepEqual(result.added, []);
++});
++
++test("a phrase already in the current list is skipped as a duplicate, case/spacing-insensitively", () => {
++  const result = addSpamPhrases(["нужна работа"], "  НУЖНА   РАБОТА  ");
++  assert.deepEqual(result.added, []);
++  assert.deepEqual(result.skipped, [{ phrase: "нужна работа", reason: "duplicate" }]);
++});
++
++test("two identical phrases within the SAME input are only added once, the second is a duplicate", () => {
++  const result = addSpamPhrases([], "нужна работа\nнужна работа");
++  assert.deepEqual(result.added, ["нужна работа"]);
++  assert.deepEqual(result.skipped, [{ phrase: "нужна работа", reason: "duplicate" }]);
++});
++
++test("respects MAX_SPAM_PHRASES: once the list is full, further additions are skipped with limit_reached", () => {
++  const full = Array.from({ length: MAX_SPAM_PHRASES }, (_, i) => `фраза номер ${i}`);
++  const result = addSpamPhrases(full, "новая фраза сверху лимита");
++  assert.equal(result.phrases.length, MAX_SPAM_PHRASES);
++  assert.deepEqual(result.added, []);
++  assert.deepEqual(result.skipped, [{ phrase: "новая фраза сверху лимита", reason: "limit_reached" }]);
++});
++
++test("fills exactly up to MAX_SPAM_PHRASES from one batch, then skips the rest as limit_reached", () => {
++  const nearFull = Array.from({ length: MAX_SPAM_PHRASES - 1 }, (_, i) => `фраза номер ${i}`);
++  const result = addSpamPhrases(nearFull, "первая новая фраза\nвторая новая фраза");
++  assert.equal(result.phrases.length, MAX_SPAM_PHRASES);
++  assert.deepEqual(result.added, ["первая новая фраза"]);
++  assert.deepEqual(result.skipped, [{ phrase: "вторая новая фраза", reason: "limit_reached" }]);
++});
++
++// ---------------------------------------------------------------------------
++// removeSpamPhraseAt
++// ---------------------------------------------------------------------------
++
++test("removes the phrase at the given index, preserving the order of the rest", () => {
++  const result = removeSpamPhraseAt(["a", "b", "c"], 1);
++  assert.deepEqual(result, ["a", "c"]);
++});
++
++test("returns null for an out-of-range index (stale button after the list changed)", () => {
++  assert.equal(removeSpamPhraseAt(["a", "b"], 2), null);
++  assert.equal(removeSpamPhraseAt(["a", "b"], -1), null);
++  assert.equal(removeSpamPhraseAt([], 0), null);
++});
++
++test("returns null for a non-integer index rather than doing something undefined", () => {
++  assert.equal(removeSpamPhraseAt(["a", "b"], 1.5), null);
++});
+diff --git a/src/lib/moderation-settings.ts b/src/lib/moderation-settings.ts
+new file mode 100644
+index 0000000..98e2432
+--- /dev/null
++++ b/src/lib/moderation-settings.ts
+@@ -0,0 +1,195 @@
++// Per-chat moderation settings: the welcome message shown to new group
++// members and the list of spam phrases checked against a new member's bio.
++// Both ship with built-in defaults (below) that the chat's owner can then
++// edit inside the bot: /settings -> the chat -> «👥 Модерация группы».
++//
++// Storage (channels table, see migrations/005_add_moderation_settings.sql):
++// welcome_template and spam_phrases are NULL until the owner changes them,
++// and NULL means "use the built-in default" -- so a chat that never touched
++// these settings keeps following whatever the defaults here become, and
++// "reset to default" is simply writing NULL back. spam_phrases holds a JSON
++// array of strings; an empty array ("[]") is a deliberate, different state
++// from NULL: the owner removed every phrase, so nothing is matched.
++//
++// Everything here is pure (no I/O) so it can be tested in isolation; the
++// orchestration that reads/writes the database and talks to Telegram lives
++// in src/handlers/telegram.ts.
++
++import { renderPlaceholders } from "./message-templates.js";
++
++// ---------------------------------------------------------------------------
++// Welcome message
++// ---------------------------------------------------------------------------
++
++/** Shown to a new member when the chat has no custom welcome text. Plain
++ * text on purpose (sent without parse_mode): the owner can type anything,
++ * including "<" or "&", without it being interpreted as markup. */
++export const DEFAULT_WELCOME_TEMPLATE =
++  "👋 {name}, добро пожаловать в чат!\n\n" +
++  "Ник: {username}\n" +
++  "Дата регистрации в Telegram: {registered}\n\n" +
++  "Рады видеть вас здесь — надеемся, вам будет тут интересно и уютно. " +
++  "Если возникнут вопросы, не стесняйтесь спрашивать!";
++
++/** Placeholders the welcome text may use (documented to the owner in the
++ * edit prompt; anything else in braces is left as typed, so a typo stays
++ * visible instead of silently disappearing). */
++export interface WelcomeVars {
++  /** First name plus last name, if any. */
++  name: string;
++  /** "@nick", or a "not set" marker when the member has none. */
++  username: string;
++  /** Approximate registration date, already formatted (see
++   * registration-date-estimate.ts). */
++  registered: string;
++  /** The chat's title. */
++  chat: string;
++}
++
++/** Upper bound for a custom welcome text. The welcome goes out as a photo
++ * caption when the member has a profile photo, and Telegram caps captions
++ * at 1024 characters (after substituting the placeholders), so the template
++ * itself is kept well under that; a rendered text that still ends up over
++ * the caption limit is sent as a plain message without the photo instead
++ * (see handleChatMemberUpdate in src/handlers/telegram.ts). */
++export const WELCOME_TEMPLATE_MAX_LENGTH = 900;
++
++/** Telegram's limit for a photo caption. */
++export const TELEGRAM_CAPTION_LIMIT = 1024;
++
++export function resolveWelcomeTemplate(stored: string | null | undefined): string {
++  return stored !== null && stored !== undefined && stored.trim() !== "" ? stored : DEFAULT_WELCOME_TEMPLATE;
++}
++
++export function renderWelcomeText(template: string, vars: WelcomeVars): string {
++  return renderPlaceholders(template, { ...vars });
++}
++
++export type WelcomeTemplateValidation = { ok: true; template: string } | { ok: false; error: string };
++
++export function validateWelcomeTemplate(input: string): WelcomeTemplateValidation {
++  const template = input.trim();
++  if (template === "") return { ok: false, error: "Текст не может быть пустым. Отправьте новый текст приветствия." };
++  if (template.length > WELCOME_TEMPLATE_MAX_LENGTH) {
++    return {
++      ok: false,
++      error: `Слишком длинно: ${template.length} символов, максимум ${WELCOME_TEMPLATE_MAX_LENGTH}. Сократите текст и отправьте снова.`,
++    };
++  }
++  return { ok: true, template };
++}
++
++// ---------------------------------------------------------------------------
++// Spam phrases
++// ---------------------------------------------------------------------------
++
++/** Phrases that, found in a new member's bio, mark the account as spam.
++ * Deliberately narrow: they cover the two categories the bot was asked to
++ * catch (soliciting loans/debts, and "need any job" touting) rather than a
++ * broad keyword blocklist, because a match means an automatic 30-day ban
++ * and a false positive hits a real person. Already normalized (see
++ * normalizeSpamPhrase). The chat's owner extends or trims this list in the
++ * bot. */
++export const DEFAULT_SPAM_PHRASES: readonly string[] = [
++  "деньги в долг",
++  "дам в долг",
++  "деньги под расписку",
++  "займ на карту",
++  "займы на карту",
++  "займ без отказа",
++  "кредит без отказа",
++  "нужна работа",
++  "нужна подработка",
++  "ищу работу",
++  "ищу подработку",
++  "подработка для всех",
++  "работа для всех",
++  "работа без опыта",
++];
++
++/** At most this many phrases per chat: every phrase is a button on the
++ * list screen, and Telegram allows 100 buttons per message. */
++export const MAX_SPAM_PHRASES = 50;
++/** A phrase shorter than this would match a huge share of ordinary bios
++ * ("тел", "ищу") and ban real people, so it is refused. */
++export const SPAM_PHRASE_MIN_LENGTH = 4;
++export const SPAM_PHRASE_MAX_LENGTH = 60;
++
++/** Canonical form used both when storing a phrase and when matching it
++ * against a bio: lowercase, runs of whitespace collapsed to one space,
++ * trimmed. Matching is therefore case- and spacing-insensitive. */
++export function normalizeSpamPhrase(input: string): string {
++  return input.toLowerCase().replace(/\s+/g, " ").trim();
++}
++
++/** Reads the stored value. NULL/undefined -> the built-in defaults. A stored
++ * value that isn't a JSON array of strings (corrupted, hand-edited) also
++ * falls back to the defaults rather than throwing or silently matching
++ * nothing. An empty array is honored as "no phrases". */
++export function resolveSpamPhrases(stored: string | null | undefined): string[] {
++  if (stored === null || stored === undefined) return [...DEFAULT_SPAM_PHRASES];
++  try {
++    const parsed: unknown = JSON.parse(stored);
++    if (Array.isArray(parsed)) return parsed.filter((p): p is string => typeof p === "string");
++  } catch {
++    // fall through to the defaults
++  }
++  return [...DEFAULT_SPAM_PHRASES];
++}
++
++export function serializeSpamPhrases(phrases: readonly string[]): string {
++  return JSON.stringify(phrases);
++}
++
++export type SpamPhraseSkipReason = "too_short" | "too_long" | "duplicate" | "limit_reached";
++
++export interface AddSpamPhrasesResult {
++  /** The full list after adding. */
++  phrases: string[];
++  /** Phrases actually added, in normalized form. */
++  added: string[];
++  /** Lines that were refused, with why. Blank lines are ignored, not listed. */
++  skipped: Array<{ phrase: string; reason: SpamPhraseSkipReason }>;
++}
++
++/** Adds phrases from free text, one per line. Each line is normalized and
++ * checked independently, so one bad line doesn't reject the rest. */
++export function addSpamPhrases(current: readonly string[], rawInput: string): AddSpamPhrasesResult {
++  const phrases = [...current];
++  const added: string[] = [];
++  const skipped: AddSpamPhrasesResult["skipped"] = [];
++
++  for (const line of rawInput.split(/\r?\n/)) {
++    const phrase = normalizeSpamPhrase(line);
++    if (phrase === "") continue;
++    if (phrase.length < SPAM_PHRASE_MIN_LENGTH) skipped.push({ phrase, reason: "too_short" });
++    else if (phrase.length > SPAM_PHRASE_MAX_LENGTH) skipped.push({ phrase, reason: "too_long" });
++    else if (phrases.includes(phrase)) skipped.push({ phrase, reason: "duplicate" });
++    else if (phrases.length >= MAX_SPAM_PHRASES) skipped.push({ phrase, reason: "limit_reached" });
++    else {
++      phrases.push(phrase);
++      added.push(phrase);
++    }
++  }
++  return { phrases, added, skipped };
++}
++
++/** Returns the list without the phrase at `index`, or null if `index` isn't
++ * a valid position (e.g. a stale button pressed after the list changed
++ * shrunk it). Position-based rather than value-based on purpose, even
++ * though a position can in principle point at a different phrase than the
++ * one an owner saw if the list changed between their screen being rendered
++ * and a delete button being tapped: Telegram's callback_data is capped at
++ * 64 bytes, and a phrase up to SPAM_PHRASE_MAX_LENGTH (60) Cyrillic
++ * characters can be well over twice that in UTF-8, so the full phrase
++ * cannot be round-tripped through a button's data at all. The channel row
++ * (and so this list) is re-read fresh on every callback in
++ * handleModerationCallback, so the only actual risk window is between one
++ * screen render and one button tap by the SAME owner -- the same
++ * already-accepted risk every other by-position list in this bot's
++ * settings UI carries for its single owner (this file has no multi-editor
++ * chats to guard against), not a new or larger one introduced here. */
++export function removeSpamPhraseAt(current: readonly string[], index: number): string[] | null {
++  if (!Number.isInteger(index) || index < 0 || index >= current.length) return null;
++  return current.filter((_, i) => i !== index);
++}
+diff --git a/src/lib/publish.ts b/src/lib/publish.ts
+index 94df8cd..41a10e2 100644
+--- a/src/lib/publish.ts
++++ b/src/lib/publish.ts
+@@ -46,7 +46,9 @@ export interface PublishInput {
+ 
+ function buildCaption(channel: ChannelRow, kind: PostKind, streamerName: string, title: string): string {
+   const header =
+-    kind === "live" ? `\u{1F534} ${streamerName} is live!` : `\u{1F3AC} New video from ${streamerName}!`;
++    kind === "live"
++      ? `\u{1F534} ${streamerName} начал трансляцию!`
++      : `\u{1F3AC} Новое видео от ${streamerName}!`;
+   const body = renderTemplate(channel.message_template, {
+     streamer: streamerName,
+     platform: "",
+diff --git a/src/lib/registration-date-estimate.test.ts b/src/lib/registration-date-estimate.test.ts
+new file mode 100644
+index 0000000..ffd739f
+--- /dev/null
++++ b/src/lib/registration-date-estimate.test.ts
+@@ -0,0 +1,118 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { estimateRegistrationDate, formatApproximateRegistrationDate } from "./registration-date-estimate.js";
++
++function isoDate(d: Date): string {
++  return d.toISOString().slice(0, 10);
++}
++
++// ---------------------------------------------------------------------------
++// estimateRegistrationDate
++//
++// The two interpolation cases below are cross-checked against an
++// independent Python re-implementation of the exact same
++// WizardLoop/CreationDate algorithm and dataset (see
++// src/lib/registration-date-estimate.ts's module doc comment for
++// provenance), computed separately from -- not derived from -- this
++// TypeScript port, so a match confirms the port is faithful rather than
++// merely internally consistent.
++// ---------------------------------------------------------------------------
++
++test("an ID exactly at a known reference point returns that point's date verbatim, no interpolation", () => {
++  // 400169472 -> "2017-07-31" is one of the dataset's own points.
++  const result = estimateRegistrationDate(400169472);
++  assert.equal(isoDate(result.date), "2017-07-31");
++  assert.equal(result.extrapolated, false);
++});
++
++test("an ID at or before the very first reference point returns that point's date, not an earlier extrapolation", () => {
++  const result = estimateRegistrationDate(0);
++  assert.equal(isoDate(result.date), "2013-08-14");
++  assert.equal(result.extrapolated, false);
++
++  // Negative/pre-launch IDs (which cannot occur for a real Telegram user,
++  // but the function shouldn't misbehave if ever called with one) clamp
++  // to the same floor rather than extrapolating backwards past it.
++  const resultBelowZero = estimateRegistrationDate(-100);
++  assert.equal(isoDate(resultBelowZero.date), "2013-08-14");
++});
++
++test("interpolates between two known points, matching an independently-computed reference value (case 1)", () => {
++  // Cross-checked in Python: interpolating between (400169472,
++  // "2017-07-31") and (805158066, "2019-07-15") at userId 600000000
++  // yields 2018-07-18.
++  const result = estimateRegistrationDate(600000000);
++  assert.equal(isoDate(result.date), "2018-07-18");
++  assert.equal(result.extrapolated, false);
++});
++
++test("interpolates between two known points, matching an independently-computed reference value (case 2)", () => {
++  // Cross-checked in Python: interpolating between (7002435197,
++  // "2024-04-06") and (7078066115, "2024-09-08") at userId 7050000000
++  // yields 2024-07-12.
++  const result = estimateRegistrationDate(7050000000);
++  assert.equal(isoDate(result.date), "2024-07-12");
++  assert.equal(result.extrapolated, false);
++});
++
++test("an ID past the last reference point extrapolates and is flagged as extrapolated", () => {
++  // The dataset's last point is (8559682245, "2025-11-11"). An ID well
++  // past that must still return SOME date (not throw, not fall through
++  // unhandled) and must be flagged so callers know this specific
++  // estimate isn't bounded by the source dataset's usual accuracy claim.
++  const result = estimateRegistrationDate(9500000000);
++  assert.equal(result.extrapolated, true);
++  assert.ok(result.date.getTime() > 0, "must produce a real date, not an invalid one");
++});
++
++test("an extrapolated date is never later than the current moment (an account cannot register in the future)", () => {
++  const before = Date.now();
++  // An enormous ID, far beyond anything Telegram has issued, to force
++  // the extrapolated estimate as far into the future as the raw linear
++  // formula would otherwise put it.
++  const result = estimateRegistrationDate(9_000_000_000_000);
++  const after = Date.now();
++  assert.ok(
++    result.date.getTime() <= after,
++    `estimated date ${result.date.toISOString()} must not be later than now`,
++  );
++  // Sanity: the clamp actually engaged for an ID this extreme (otherwise
++  // this test would trivially pass without exercising the Math.min at
++  // all).
++  assert.ok(before > 0);
++});
++
++// ---------------------------------------------------------------------------
++// formatApproximateRegistrationDate
++// ---------------------------------------------------------------------------
++
++test("formats a normal (non-extrapolated) estimate with the ≈ prefix and no extra caveat", () => {
++  const formatted = formatApproximateRegistrationDate({ date: new Date("2018-07-18T00:00:00Z"), extrapolated: false });
++  assert.equal(formatted, "≈ 18 июля 2018");
++});
++
++test("formats an extrapolated estimate with the ≈ prefix AND the extra low-confidence note", () => {
++  const formatted = formatApproximateRegistrationDate({ date: new Date("2026-01-01T00:00:00Z"), extrapolated: true });
++  assert.equal(formatted, "≈ 1 января 2026 (очень грубая оценка, данных за этот период мало)");
++});
++
++test("renders every month name correctly (genitive case), not just the ones exercised above", () => {
++  const monthDates: Array<[string, string]> = [
++    ["2020-01-15T00:00:00Z", "15 января 2020"],
++    ["2020-02-15T00:00:00Z", "15 февраля 2020"],
++    ["2020-03-15T00:00:00Z", "15 марта 2020"],
++    ["2020-04-15T00:00:00Z", "15 апреля 2020"],
++    ["2020-05-15T00:00:00Z", "15 мая 2020"],
++    ["2020-06-15T00:00:00Z", "15 июня 2020"],
++    ["2020-07-15T00:00:00Z", "15 июля 2020"],
++    ["2020-08-15T00:00:00Z", "15 августа 2020"],
++    ["2020-09-15T00:00:00Z", "15 сентября 2020"],
++    ["2020-10-15T00:00:00Z", "15 октября 2020"],
++    ["2020-11-15T00:00:00Z", "15 ноября 2020"],
++    ["2020-12-15T00:00:00Z", "15 декабря 2020"],
++  ];
++  for (const [iso, expectedTail] of monthDates) {
++    const formatted = formatApproximateRegistrationDate({ date: new Date(iso), extrapolated: false });
++    assert.equal(formatted, `≈ ${expectedTail}`);
++  }
++});
+diff --git a/src/lib/registration-date-estimate.ts b/src/lib/registration-date-estimate.ts
+new file mode 100644
+index 0000000..c227487
+--- /dev/null
++++ b/src/lib/registration-date-estimate.ts
+@@ -0,0 +1,369 @@
++// Telegram's Bot API does not expose an account's registration date in any
++// field of any endpoint (see the User object: id, is_bot, first_name,
++// last_name, username, language_code, is_premium,
++// added_to_attachment_menu -- no date of any kind). This module estimates
++// it instead, using the well-documented fact that Telegram numeric user
++// IDs are assigned roughly sequentially over time, by linearly
++// interpolating between known (userId -> registration date) reference
++// points collected and published by a third party.
++//
++// Dataset and algorithm: WizardLoop/CreationDate
++// https://github.com/WizardLoop/CreationDate (MIT License, retrieved for
++// this project as of its 2025-11-11 data snapshot -- 212 points spanning
++// 2013-08-14 through 2025-11-11). That project's own accuracy.md
++// describes the result as "usually within weeks" for IDs that fall
++// between two known points, and explicitly warns "This project provides
++// high-quality estimates, not official data. Dates should not be treated
++// as legally or technically authoritative" -- this module inherits that
++// same caveat and is not a source of truth about anyone's real
++// registration date. The interpolation logic below (interpolate /
++// estimateRegistrationDate) is a direct TypeScript port of that project's
++// own src/python/estimate.py, including its exact boundary handling
++// (ID at or before the first point returns that point's date verbatim;
++// an ID past the last point extrapolates from the final pair, clamped to
++// "not later than right now" since an account cannot have registered in
++// the future).
++//
++// Known limitation, inherited from the source dataset rather than
++// introduced here: after sorting the 212 points by ID (ascending), their
++// dates are NOT perfectly monotonic -- roughly 40% of consecutive pairs
++// have the later-ID point dated slightly EARLIER than the point before
++// it (real-world observations collected from varied sources are noisy).
++// This can make a handful of individual estimates a few weeks off in
++// either direction for IDs that fall in one of those pairs. This module
++// does not attempt to smooth or correct that -- doing so would mean
++// substituting a self-devised, unverified adjustment for an algorithm
++// that is otherwise a faithful, auditable port of a cited public source.
++// Given the estimate is already surfaced to users as an approximation
++// (see formatApproximateRegistrationDate below), and the effect is
++// measured in weeks rather than months or years, this is judged an
++// acceptable trade-off rather than a defect to silently paper over.
++
++/** [telegramUserId, "YYYY-MM-DD"], sorted ascending by ID. Copied verbatim
++ * from WizardLoop/CreationDate's data/tg_points.json (see module doc
++ * comment above for provenance, license, and the dataset's known
++ * non-monotonicity). Do not hand-edit -- regenerate from that project's
++ * data file if it publishes a newer snapshot. */
++const REFERENCE_POINTS: ReadonlyArray<readonly [number, string]> = [
++  [0, "2013-08-14"],
++  [2768409, "2013-11-01"],
++  [7679610, "2013-12-31"],
++  [11538514, "2014-02-01"],
++  [15835244, "2014-02-20"],
++  [23646077, "2014-02-26"],
++  [38015510, "2014-03-01"],
++  [44634663, "2014-05-06"],
++  [46145305, "2014-05-15"],
++  [54845238, "2014-09-20"],
++  [63263518, "2014-10-27"],
++  [101260938, "2015-03-06"],
++  [101323197, "2015-03-13"],
++  [103151531, "2015-06-03"],
++  [103258382, "2015-05-27"],
++  [109393468, "2015-08-08"],
++  [111220210, "2015-04-21"],
++  [112594714, "2015-08-15"],
++  [116812045, "2015-07-23"],
++  [122600695, "2015-07-24"],
++  [124872445, "2015-08-17"],
++  [125828524, "2015-10-05"],
++  [130029930, "2015-09-03"],
++  [133909606, "2015-10-07"],
++  [143445125, "2015-12-01"],
++  [148670295, "2016-01-08"],
++  [152079341, "2016-01-22"],
++  [157242073, "2015-11-06"],
++  [171295414, "2016-03-09"],
++  [181783990, "2016-04-10"],
++  [222021233, "2016-06-08"],
++  [225034354, "2016-06-18"],
++  [278941742, "2016-09-10"],
++  [285253072, "2016-10-18"],
++  [294851037, "2016-11-19"],
++  [297621225, "2016-12-16"],
++  [328594461, "2017-01-28"],
++  [337808429, "2017-02-21"],
++  [341546272, "2017-02-22"],
++  [352940995, "2017-02-24"],
++  [369669043, "2017-03-31"],
++  [400169472, "2017-07-31"],
++  [805158066, "2019-07-15"],
++  [1974255900, "2021-10-12"],
++  [5022636255, "2021-12-10"],
++  [5031711230, "2021-12-06"],
++  [5045293264, "2022-01-13"],
++  [5047148663, "2022-04-05"],
++  [5070164216, "2022-01-19"],
++  [5106451106, "2022-03-05"],
++  [5124771193, "2022-02-22"],
++  [5144324763, "2022-04-06"],
++  [5149590651, "2022-01-22"],
++  [5153900870, "2022-03-22"],
++  [5155903109, "2022-03-22"],
++  [5159326926, "2022-06-16"],
++  [5166844465, "2022-05-09"],
++  [5169485538, "2022-03-01"],
++  [5170390109, "2022-02-28"],
++  [5177789190, "2022-01-24"],
++  [5179102906, "2022-03-12"],
++  [5196353812, "2022-02-15"],
++  [5207110227, "2022-02-03"],
++  [5210565134, "2022-02-09"],
++  [5244529493, "2022-04-19"],
++  [5259159476, "2022-05-06"],
++  [5260388619, "2022-03-02"],
++  [5268253519, "2022-03-22"],
++  [5271530336, "2022-04-30"],
++  [5288930461, "2022-01-27"],
++  [5308260177, "2022-04-25"],
++  [5340744210, "2022-10-26"],
++  [5349830748, "2022-04-29"],
++  [5351497367, "2022-05-24"],
++  [5363536419, "2022-08-01"],
++  [5394432429, "2022-05-23"],
++  [5396515972, "2022-04-21"],
++  [5428357996, "2022-07-11"],
++  [5433708969, "2022-05-28"],
++  [5434011049, "2022-06-29"],
++  [5442755368, "2022-07-23"],
++  [5451256696, "2022-08-06"],
++  [5468433192, "2022-07-20"],
++  [5468950164, "2022-07-14"],
++  [5472518401, "2022-11-02"],
++  [5488407539, "2022-05-29"],
++  [5505809357, "2022-05-27"],
++  [5515826405, "2022-10-03"],
++  [5519218712, "2022-08-14"],
++  [5542245357, "2022-07-07"],
++  [5546930145, "2022-07-24"],
++  [5558980075, "2022-10-30"],
++  [5559594088, "2022-11-10"],
++  [5567880858, "2023-01-25"],
++  [5595045952, "2022-10-23"],
++  [5596032583, "2022-06-16"],
++  [5598262640, "2022-06-11"],
++  [5601951167, "2022-10-02"],
++  [5627539474, "2022-12-02"],
++  [5681900282, "2022-10-17"],
++  [5694365966, "2022-08-28"],
++  [5705427359, "2022-10-06"],
++  [5721138769, "2022-09-23"],
++  [5735455201, "2022-10-07"],
++  [5738347976, "2023-04-25"],
++  [5744374534, "2022-10-10"],
++  [5765259845, "2022-10-30"],
++  [5795660441, "2022-11-06"],
++  [5802659303, "2023-03-21"],
++  [5804028268, "2023-03-05"],
++  [5806925457, "2023-01-12"],
++  [5815100469, "2022-12-29"],
++  [5839137822, "2022-12-16"],
++  [5854845236, "2023-04-27"],
++  [5859861622, "2022-11-19"],
++  [5862080962, "2022-12-13"],
++  [5869978651, "2023-03-24"],
++  [5891297818, "2023-05-04"],
++  [5904140174, "2023-05-20"],
++  [5931294587, "2022-11-19"],
++  [5964221956, "2023-01-09"],
++  [5983753471, "2022-12-23"],
++  [5994561143, "2023-05-16"],
++  [6000582627, "2023-05-30"],
++  [6001287799, "2023-05-10"],
++  [6074830852, "2023-05-01"],
++  [6108395402, "2023-05-18"],
++  [6135597783, "2023-05-24"],
++  [6175817126, "2023-05-07"],
++  [6180394472, "2023-05-29"],
++  [6188508923, "2023-06-22"],
++  [6254094947, "2023-02-27"],
++  [6271031786, "2023-02-12"],
++  [6277658932, "2023-03-17"],
++  [6326011828, "2023-07-07"],
++  [6401027363, "2023-11-25"],
++  [6451891234, "2023-12-02"],
++  [6513268158, "2023-12-02"],
++  [6514802524, "2023-11-16"],
++  [6523424924, "2023-08-02"],
++  [6536173556, "2024-01-11"],
++  [6545049031, "2023-12-19"],
++  [6559717847, "2024-02-25"],
++  [6606876583, "2024-03-17"],
++  [6651640269, "2024-05-18"],
++  [6670760749, "2024-01-14"],
++  [6684986493, "2023-09-25"],
++  [6703731755, "2024-05-05"],
++  [6715889959, "2024-02-05"],
++  [6720229740, "2024-03-17"],
++  [6732829831, "2024-02-11"],
++  [6749492866, "2023-11-22"],
++  [6765129195, "2023-11-02"],
++  [6827058708, "2023-11-06"],
++  [6829119388, "2023-12-02"],
++  [6854829938, "2024-02-01"],
++  [6872061796, "2024-05-25"],
++  [6903333095, "2024-01-31"],
++  [6926984452, "2024-01-09"],
++  [6947316117, "2023-12-15"],
++  [7002435197, "2024-04-06"],
++  [7078066115, "2024-09-08"],
++  [7085776398, "2024-05-10"],
++  [7104310277, "2024-04-19"],
++  [7224009547, "2024-08-02"],
++  [7242296450, "2024-05-29"],
++  [7243375923, "2024-08-25"],
++  [7254607307, "2024-06-10"],
++  [7273085448, "2024-11-21"],
++  [7280136256, "2024-07-04"],
++  [7293965553, "2024-06-16"],
++  [7342300216, "2025-01-16"],
++  [7357703634, "2024-09-10"],
++  [7363299295, "2024-07-25"],
++  [7409259451, "2024-06-20"],
++  [7450316621, "2024-12-02"],
++  [7458668365, "2024-08-02"],
++  [7591351660, "2025-03-21"],
++  [7664959631, "2024-12-19"],
++  [7708562823, "2025-05-10"],
++  [7747102337, "2024-11-06"],
++  [7793034911, "2024-09-23"],
++  [7817256746, "2025-06-18"],
++  [7825518194, "2025-01-16"],
++  [7829910989, "2025-05-11"],
++  [7831448272, "2024-11-11"],
++  [7832006200, "2024-09-19"],
++  [7834356221, "2025-09-01"],
++  [7852083588, "2025-06-02"],
++  [7870888707, "2025-06-08"],
++  [7899152800, "2025-04-08"],
++  [7912577935, "2025-09-15"],
++  [7915901421, "2025-07-07"],
++  [7964511972, "2025-03-26"],
++  [8017192943, "2025-10-05"],
++  [8044853035, "2025-03-20"],
++  [8096742229, "2025-08-31"],
++  [8117852491, "2025-10-14"],
++  [8135088730, "2025-03-05"],
++  [8173852075, "2025-02-21"],
++  [8179125032, "2025-07-09"],
++  [8200159552, "2025-09-12"],
++  [8209194945, "2025-10-26"],
++  [8238766847, "2025-07-31"],
++  [8325327280, "2025-10-13"],
++  [8343786378, "2025-08-08"],
++  [8369442459, "2025-08-08"],
++  [8384648263, "2025-10-23"],
++  [8393200797, "2025-10-25"],
++  [8461579295, "2025-09-11"],
++  [8480708838, "2025-11-05"],
++  [8559682245, "2025-11-11"],
++];
++
++const firstReferencePointCandidate = REFERENCE_POINTS[0];
++if (!firstReferencePointCandidate) {
++  // Can only happen if REFERENCE_POINTS above is ever hand-edited down to
++  // empty -- fail loudly at module load rather than silently producing
++  // nonsense dates for every call. TypeScript's control-flow narrowing
++  // doesn't carry this guarantee across the function boundary below, so
++  // the checked value is re-bound to its own explicitly-typed constant
++  // (FIRST_REFERENCE_POINT) rather than relied on via the original
++  // possibly-undefined binding.
++  throw new Error("registration-date-estimate: REFERENCE_POINTS must not be empty");
++}
++const FIRST_REFERENCE_POINT: readonly [number, string] = firstReferencePointCandidate;
++
++const LAST_TWO_REFERENCE_POINTS: readonly [readonly [number, string], readonly [number, string]] = [
++  REFERENCE_POINTS[REFERENCE_POINTS.length - 2]!,
++  REFERENCE_POINTS[REFERENCE_POINTS.length - 1]!,
++];
++const LAST_REFERENCE_ID = LAST_TWO_REFERENCE_POINTS[1][0];
++
++function parseIsoDateAsUtcMillis(isoDate: string): number {
++  // New Date("YYYY-MM-DD") is specified to parse as UTC midnight, matching
++  // how the reference dataset's dates are stored (calendar dates with no
++  // time-of-day component).
++  return new Date(isoDate).getTime();
++}
++
++function interpolate(userId: number, id1: number, date1: string, id2: number, date2: string, now: number): number {
++  if (id1 === id2) return parseIsoDateAsUtcMillis(date1);
++
++  const t1 = parseIsoDateAsUtcMillis(date1);
++  const t2 = parseIsoDateAsUtcMillis(date2);
++  const ratio = (userId - id1) / (id2 - id1);
++  const estimatedMillis = t1 + (t2 - t1) * ratio;
++
++  // An account cannot have registered in the future.
++  return Math.min(estimatedMillis, now);
++}
++
++export interface RegistrationEstimate {
++  /** The estimated date itself, as a UTC-midnight Date. */
++  date: Date;
++  /** True when userId falls beyond the last reference point, meaning
++   * this estimate is an extrapolation rather than an interpolation
++   * between two known points -- accuracy is not bounded by the source
++   * dataset's own "usually within weeks" claim in this case, and
++   * degrades further the more the ID exceeds LAST_REFERENCE_ID. */
++  extrapolated: boolean;
++}
++
++/** Estimates when a Telegram account with the given numeric user ID was
++ * registered. See this module's top-of-file doc comment for the method,
++ * its source, and its known limitations -- this is always an
++ * approximation, never a confirmed fact. */
++export function estimateRegistrationDate(userId: number): RegistrationEstimate {
++  const now = Date.now();
++  const points = REFERENCE_POINTS;
++
++  if (userId <= FIRST_REFERENCE_POINT[0]) {
++    return { date: new Date(parseIsoDateAsUtcMillis(FIRST_REFERENCE_POINT[1])), extrapolated: false };
++  }
++
++  for (let i = 0; i < points.length - 1; i++) {
++    const point1 = points[i];
++    const point2 = points[i + 1];
++    // Both are guaranteed defined: i ranges over valid indices of `points`
++    // and i+1 <= points.length - 1 by the loop bound above.
++    if (!point1 || !point2) continue;
++    const [id1, date1] = point1;
++    const [id2, date2] = point2;
++    if (id1 <= userId && userId <= id2) {
++      return { date: new Date(interpolate(userId, id1, date1, id2, date2, now)), extrapolated: false };
++    }
++  }
++
++  const [id1, date1] = LAST_TWO_REFERENCE_POINTS[0];
++  const [id2, date2] = LAST_TWO_REFERENCE_POINTS[1];
++  return { date: new Date(interpolate(userId, id1, date1, id2, date2, now)), extrapolated: userId > LAST_REFERENCE_ID };
++}
++
++const RU_MONTHS_GENITIVE = [
++  "января",
++  "февраля",
++  "марта",
++  "апреля",
++  "мая",
++  "июня",
++  "июля",
++  "августа",
++  "сентября",
++  "октября",
++  "ноября",
++  "декабря",
++];
++
++/** Renders a RegistrationEstimate as a short Russian phrase for use in a
++ * welcome message, always prefixed with "≈" and, when the estimate falls
++ * past the source dataset's last reference point, with an extra explicit
++ * note that this particular estimate is even less certain than usual --
++ * see RegistrationEstimate.extrapolated. Never presented as a confirmed
++ * fact. */
++export function formatApproximateRegistrationDate(estimate: RegistrationEstimate): string {
++  const d = estimate.date;
++  const day = d.getUTCDate();
++  const month = RU_MONTHS_GENITIVE[d.getUTCMonth()];
++  const year = d.getUTCFullYear();
++  const base = `≈ ${day} ${month} ${year}`;
++  return estimate.extrapolated ? `${base} (очень грубая оценка, данных за этот период мало)` : base;
++}
+diff --git a/src/lib/youtube.test.ts b/src/lib/youtube.test.ts
+new file mode 100644
+index 0000000..042569b
+--- /dev/null
++++ b/src/lib/youtube.test.ts
+@@ -0,0 +1,100 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { checkIsCurrentlyLiveForNewContent, LIVE_FLAG_RECHECK_DELAY_MS } from "./youtube.js";
++
++// ---------------------------------------------------------------------------
++// checkIsCurrentlyLiveForNewContent
++//
++// checkIsCurrentlyLive() itself already has real, working logic (Data API
++// call, then a regex fallback on the watch page) -- these tests don't
++// re-verify that, they only verify the NEW re-check behavior layered on top
++// of it for content seen for the first time this poll. Every case here
++// mocks fetch at the same seam checkIsCurrentlyLive uses (global fetch to
++// googleapis.com / youtube.com), so the assertions exercise the real
++// production code path end to end, not a re-implementation of it.
++// ---------------------------------------------------------------------------
++
++function heuristicWatchPageResponse(isLive: boolean): Response {
++  // No YOUTUBE_API_KEY is passed in any test below, so checkIsCurrentlyLive
++  // always falls through to this regex-matched watch-page path -- matches
++  // how the bot actually behaves for anyone who hasn't set the key yet.
++  const html = isLive ? '"isLiveNow": true' : '"isLiveNow": false';
++  return new Response(html, { status: 200 });
++}
++
++/** Mocked fetch resolves via a real Promise chain (its own body is async),
++ * which node:test's mocked setTimeout does not automatically drain before
++ * mock.timers.tick() runs. setImmediate fires on the event loop's next
++ * turn, after every microtask already queued has run, so awaiting it is a
++ * deterministic way to make sure a preceding mocked-fetch call has fully
++ * resolved before advancing the mocked clock -- no fixed number of
++ * `await Promise.resolve()` guesses, which would be one microtask-queue
++ * depth away from correct the moment the implementation's await chain
++ * changes shape. */
++function flushMicrotasks(): Promise<void> {
++  return new Promise((resolve) => setImmediate(resolve));
++}
++
++test("returns true immediately when the first check already says live, without waiting for the recheck delay", async (t) => {
++  t.mock.timers.enable({ apis: ["setTimeout"] });
++  let fetchCalls = 0;
++  t.mock.method(globalThis, "fetch", async () => {
++    fetchCalls++;
++    return heuristicWatchPageResponse(true);
++  });
++
++  const result = await checkIsCurrentlyLiveForNewContent("video-1", undefined);
++
++  assert.equal(result, true);
++  assert.equal(fetchCalls, 1, "a confirmed-live first check must not trigger a second fetch");
++});
++
++test("re-checks once after the delay when the first check says not-live, and returns true if the recheck now says live", async (t) => {
++  t.mock.timers.enable({ apis: ["setTimeout"] });
++  let fetchCalls = 0;
++  t.mock.method(globalThis, "fetch", async () => {
++    fetchCalls++;
++    // First call (the immediate check) sees the pre-flag-flip state; the
++    // recheck after the delay sees YouTube's live flag having caught up --
++    // exactly the race this function exists to ride out.
++    return heuristicWatchPageResponse(fetchCalls >= 2);
++  });
++
++  const resultPromise = checkIsCurrentlyLiveForNewContent("video-1", undefined);
++
++  await flushMicrotasks();
++  assert.equal(fetchCalls, 1, "should not re-check before the delay elapses");
++
++  t.mock.timers.tick(LIVE_FLAG_RECHECK_DELAY_MS);
++  const result = await resultPromise;
++
++  assert.equal(result, true);
++  assert.equal(fetchCalls, 2, "exactly one recheck, not a retry loop");
++});
++
++test("returns false when both the immediate check and the recheck say not-live (an ordinary uploaded video)", async (t) => {
++  t.mock.timers.enable({ apis: ["setTimeout"] });
++  let fetchCalls = 0;
++  t.mock.method(globalThis, "fetch", async () => {
++    fetchCalls++;
++    return heuristicWatchPageResponse(false);
++  });
++
++  const resultPromise = checkIsCurrentlyLiveForNewContent("video-1", undefined);
++
++  await flushMicrotasks();
++  t.mock.timers.tick(LIVE_FLAG_RECHECK_DELAY_MS);
++  const result = await resultPromise;
++
++  assert.equal(result, false);
++  assert.equal(fetchCalls, 2, "a genuine non-live video still gets exactly the one recheck, never announced as live");
++});
++
++test("returns false without any fetch when videoId is null", async (t) => {
++  t.mock.method(globalThis, "fetch", async () => {
++    throw new Error("must not fetch when videoId is null");
++  });
++
++  const result = await checkIsCurrentlyLiveForNewContent(null, undefined);
++  assert.equal(result, false);
++});
+diff --git a/src/lib/youtube.ts b/src/lib/youtube.ts
+index 8479ea5..30225d0 100644
+--- a/src/lib/youtube.ts
++++ b/src/lib/youtube.ts
+@@ -131,3 +131,46 @@ export async function checkIsCurrentlyLive(videoId: string | null, apiKey: strin
+     return false;
+   }
+ }
++
++function sleep(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++/** Same question as checkIsCurrentlyLive, but for content that was JUST
++ * discovered this same poll (i.e. this is the very first time we've seen
++ * this videoId). A negative answer here is ambiguous in a way it isn't for
++ * already-known content: YouTube can take anywhere from a few seconds up
++ * to a couple of minutes, after a broadcast starts, before either the
++ * official liveBroadcastContent flag or the embedded "isLiveNow" marker on
++ * the watch page actually flips to true -- the video resource and its
++ * watch URL both exist and work immediately, only the flag lags. Treating
++ * that lag as "it's a regular video" is how a genuine live stream gets
++ * mis-announced as "new video" (see src/lib/publish.ts's buildCaption),
++ * and once that first, wrong post exists, a later correct re-check of the
++ * SAME videoId is suppressed by contentAlreadyPosted (src/db.ts) -- so if a
++ * second poll happens after the video-post merge window has closed, it
++ * creates a second, separate Telegram message instead of nothing at all.
++ * A single delayed re-check here is what actually prevents both of those
++ * downstream symptoms, rather than papering over either one after the
++ * fact. Ordinary videos (uploaded, not streamed) stay firmly "not live" on
++ * both the first and the second check, so this adds one extra fetch only
++ * for the rare case that matters and never changes the outcome for a real
++ * upload. */
++export async function checkIsCurrentlyLiveForNewContent(
++  videoId: string | null,
++  apiKey: string | undefined,
++): Promise<boolean> {
++  if (!videoId) return false;
++  if (await checkIsCurrentlyLive(videoId, apiKey)) return true;
++  await sleep(LIVE_FLAG_RECHECK_DELAY_MS);
++  return checkIsCurrentlyLive(videoId, apiKey);
++}
++
++/** How long to wait before the one re-check in
++ * checkIsCurrentlyLiveForNewContent. Long enough for YouTube's live flag to
++ * have caught up in the vast majority of cases observed in practice, short
++ * enough to stay well inside the Cron Trigger's execution budget even when
++ * several accounts hit this path in the same run (each account's check
++ * already runs through src/lib/concurrency.ts's pool, so this delay on one
++ * account doesn't block any other account's check from proceeding). */
++export const LIVE_FLAG_RECHECK_DELAY_MS = 8_000;
+diff --git a/src/scheduled.ts b/src/scheduled.ts
+index e6f81e8..212cbf5 100644
+--- a/src/scheduled.ts
++++ b/src/scheduled.ts
+@@ -23,7 +23,7 @@ import { DEFAULT_CONCURRENCY, runWithConcurrency } from "./lib/concurrency.js";
+ import { closeLivePlatform, publishOrMerge } from "./lib/publish.js";
+ import { StreamerSerializer } from "./lib/streamer-serializer.js";
+ import { checkTiktokStatus } from "./lib/tiktok.js";
+-import { checkChannelLiveNow, checkIsCurrentlyLive, fetchLatestVideo } from "./lib/youtube.js";
++import { checkChannelLiveNow, checkIsCurrentlyLive, checkIsCurrentlyLiveForNewContent, fetchLatestVideo } from "./lib/youtube.js";
+ import type { Env, SocialAccountWithStreamer } from "./types.js";
+ 
+ async function checkYoutubeAccount(
+@@ -98,7 +98,7 @@ async function checkYoutubeAccount(
+   const channel = await getChannelById(env, account.streamer_channel_id);
+   if (!channel) return;
+ 
+-  const isLive = await checkIsCurrentlyLive(latest.videoId, env.YOUTUBE_API_KEY);
++  const isLive = await checkIsCurrentlyLiveForNewContent(latest.videoId, env.YOUTUBE_API_KEY);
+ 
+   await publishOrMerge({
+     env,
+diff --git a/src/types.ts b/src/types.ts
+index 33269ed..0721a58 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -40,6 +40,14 @@ export interface ChannelRow {
+   message_template: string;
+   auto_pin: number;
+   auto_unpin: number;
++  /** 1/0: greet new group members (see src/lib/moderation-settings.ts). */
++  welcome_enabled: number;
++  /** NULL = the built-in default welcome text. */
++  welcome_template: string | null;
++  /** 1/0: check a new member's bio against spam_phrases. */
++  spam_filter_enabled: number;
++  /** JSON array of strings; NULL = the built-in default phrase list. */
++  spam_phrases: string | null;
+   created_at: string;
+ }
+ 
+@@ -124,6 +132,9 @@ export type SessionState =
+   | { step: "awaiting_social_username"; data: { streamer_id: number; platform: Platform } }
+   | { step: "awaiting_link_label"; data: { streamer_id: number } }
+   | { step: "awaiting_link_url"; data: { streamer_id: number; label: string } }
+-  | { step: "awaiting_template"; data: { channel_id: number } };
++  | { step: "awaiting_link_url_edit"; data: { streamer_id: number; link_id: number } }
++  | { step: "awaiting_template"; data: { channel_id: number } }
++  | { step: "awaiting_welcome_template"; data: { channel_id: number } }
++  | { step: "awaiting_spam_phrases"; data: { channel_id: number } };
+ 
+ export const IDLE_SESSION: SessionState = { step: "idle" };

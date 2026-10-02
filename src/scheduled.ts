@@ -23,7 +23,7 @@ import { DEFAULT_CONCURRENCY, runWithConcurrency } from "./lib/concurrency.js";
 import { closeLivePlatform, publishOrMerge } from "./lib/publish.js";
 import { StreamerSerializer } from "./lib/streamer-serializer.js";
 import { checkTiktokStatus } from "./lib/tiktok.js";
-import { checkChannelLiveNow, checkIsCurrentlyLive, fetchLatestVideo } from "./lib/youtube.js";
+import { checkChannelLiveNow, checkIsCurrentlyLive, checkIsCurrentlyLiveForNewContent, fetchLatestVideo } from "./lib/youtube.js";
 import type { Env, SocialAccountWithStreamer } from "./types.js";
 
 async function checkYoutubeAccount(
@@ -98,7 +98,7 @@ async function checkYoutubeAccount(
   const channel = await getChannelById(env, account.streamer_channel_id);
   if (!channel) return;
 
-  const isLive = await checkIsCurrentlyLive(latest.videoId, env.YOUTUBE_API_KEY);
+  const isLive = await checkIsCurrentlyLiveForNewContent(latest.videoId, env.YOUTUBE_API_KEY);
 
   await publishOrMerge({
     env,

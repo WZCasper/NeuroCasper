@@ -131,3 +131,46 @@ export async function checkIsCurrentlyLive(videoId: string | null, apiKey: strin
     return false;
   }
 }
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Same question as checkIsCurrentlyLive, but for content that was JUST
+ * discovered this same poll (i.e. this is the very first time we've seen
+ * this videoId). A negative answer here is ambiguous in a way it isn't for
+ * already-known content: YouTube can take anywhere from a few seconds up
+ * to a couple of minutes, after a broadcast starts, before either the
+ * official liveBroadcastContent flag or the embedded "isLiveNow" marker on
+ * the watch page actually flips to true -- the video resource and its
+ * watch URL both exist and work immediately, only the flag lags. Treating
+ * that lag as "it's a regular video" is how a genuine live stream gets
+ * mis-announced as "new video" (see src/lib/publish.ts's buildCaption),
+ * and once that first, wrong post exists, a later correct re-check of the
+ * SAME videoId is suppressed by contentAlreadyPosted (src/db.ts) -- so if a
+ * second poll happens after the video-post merge window has closed, it
+ * creates a second, separate Telegram message instead of nothing at all.
+ * A single delayed re-check here is what actually prevents both of those
+ * downstream symptoms, rather than papering over either one after the
+ * fact. Ordinary videos (uploaded, not streamed) stay firmly "not live" on
+ * both the first and the second check, so this adds one extra fetch only
+ * for the rare case that matters and never changes the outcome for a real
+ * upload. */
+export async function checkIsCurrentlyLiveForNewContent(
+  videoId: string | null,
+  apiKey: string | undefined,
+): Promise<boolean> {
+  if (!videoId) return false;
+  if (await checkIsCurrentlyLive(videoId, apiKey)) return true;
+  await sleep(LIVE_FLAG_RECHECK_DELAY_MS);
+  return checkIsCurrentlyLive(videoId, apiKey);
+}
+
+/** How long to wait before the one re-check in
+ * checkIsCurrentlyLiveForNewContent. Long enough for YouTube's live flag to
+ * have caught up in the vast majority of cases observed in practice, short
+ * enough to stay well inside the Cron Trigger's execution budget even when
+ * several accounts hit this path in the same run (each account's check
+ * already runs through src/lib/concurrency.ts's pool, so this delay on one
+ * account doesn't block any other account's check from proceeding). */
+export const LIVE_FLAG_RECHECK_DELAY_MS = 8_000;

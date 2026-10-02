@@ -1,0 +1,79 @@
+# Run once, manually (Actions tab -> this workflow -> "Run workflow"), to
+# apply migrations/005_add_moderation_settings.sql to the live D1 database --
+# adds the four columns that back per-chat welcome/spam-filter settings
+# (/settings -> chat -> «👥 Модерация группы»).
+#
+# Safe to re-run: unlike migration 003 (CREATE TABLE IF NOT EXISTS, itself
+# idempotent), this migration is four ALTER TABLE ... ADD COLUMN statements,
+# and SQLite has no ADD COLUMN IF NOT EXISTS (confirmed against the SQLite
+# project's own forum -- this was explicitly proposed and not accepted into
+# the engine). So this workflow checks first, itself, via PRAGMA
+# table_info(channels): if welcome_enabled is already there, it skips
+# straight to a clear "already applied" message instead of running the
+# ALTER TABLE statements a second time and failing on "duplicate column
+# name" -- which would still leave the database correct (nothing from the
+# first run is undone by a rejected second run), but would surface a raw
+# SQLite error instead of a plain answer to "did this work".
+#
+# Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repo secrets
+# (same ones 1-bootstrap-db.yml, 0-sync-secrets.yml, 3-migrate-kick.yml,
+# 4-migrate-live-post-uniqueness.yml and 5-migrate-post-claims.yml already
+# use).
+name: "6) Add moderation settings columns to D1"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether the migration is already applied
+        id: check
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --json --command "PRAGMA table_info(channels)"
+
+      - name: Decide whether to apply it
+        id: decide
+        env:
+          # command-output is wrangler-action's own documented output
+          # variable (since v3.4.0) holding the previous step's stdout as a
+          # string -- not a file path. Routed through env here (rather than
+          # interpolated directly into the script) so the JSON content is
+          # never substituted into shell syntax, keeping this immune to
+          # anything unexpected the JSON might contain.
+          CHECK_OUTPUT: ${{ steps.check.outputs.command-output }}
+        run: |
+          HAS_COLUMN=$(echo "$CHECK_OUTPUT" | jq -r '.[0].results[] | select(.name == "welcome_enabled") | .name')
+          if [ -n "$HAS_COLUMN" ]; then
+            echo "already_applied=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Already applied -- nothing to do
+        if: steps.decide.outputs.already_applied == 'true'
+        run: echo "welcome_enabled already exists on channels -- migration 005 was already applied, skipping."
+
+      - name: Apply migrations/005_add_moderation_settings.sql
+        if: steps.decide.outputs.already_applied == 'false'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --file=./migrations/005_add_moderation_settings.sql
+
+      - name: Confirm the four new columns are there
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --command "PRAGMA table_info(channels)"
