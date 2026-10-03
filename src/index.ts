@@ -9,7 +9,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response("NeuroCasper is running.", { status: 200 });
+      return new Response("NeuroINFO is running.", { status: 200 });
     }
 
     if (request.method === "POST" && url.pathname === "/webhook/telegram") {
