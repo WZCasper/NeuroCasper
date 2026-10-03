@@ -60,7 +60,7 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
   bot.command("start", async (ctx) => {
     await setSession(env, ctx.dbUser.id, IDLE_SESSION);
     await ctx.reply(
-      "NeuroCasper следит за стримерами на YouTube/TikTok/Kick и присылает уведомление «в эфире» или «новое видео» " +
+      "NeuroINFO следит за стримерами на YouTube/TikTok/Kick и присылает уведомление «в эфире» или «новое видео» " +
         "в ваш Telegram-канал или группу — с кнопкой на каждую платформу, плюс любые дополнительные ссылки " +
         "(Twitch, Discord и т.д.), которые показываются в каждом уведомлении независимо от того, какая " +
         "платформа его вызвала.\n\n" +
@@ -357,7 +357,7 @@ async function handleMyChatMemberUpdate(ctx: BotContext, env: Env): Promise<void
     await ctx.api
       .sendMessage(
         chat.id,
-        "🤖 <b>NeuroCasper</b> — бот для уведомлений о стримах\n\n" +
+        "🤖 <b>NeuroINFO</b> — бот для уведомлений о стримах\n\n" +
           "Я слежу за стримерами на YouTube, TikTok и Kick и мгновенно присылаю сюда сообщение, когда " +
           "кто-то из них начинает трансляцию или выпускает новое видео — с кнопкой на каждую соцсеть " +
           "стримера (YouTube, TikTok, Kick, Twitch, Discord и другие, любые ссылки настраиваются).\n\n" +
