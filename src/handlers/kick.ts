@@ -170,7 +170,7 @@ export async function handleKickWebhook(request: Request, env: Env): Promise<Res
 
 function htmlResponse(message: string, status: number): Response {
   return new Response(
-    `<!doctype html><html><head><meta charset="utf-8"><title>NeuroCasper</title></head>` +
+    `<!doctype html><html><head><meta charset="utf-8"><title>NeuroINFO</title></head>` +
       `<body style="font-family:sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;">` +
       `<p>${message}</p></body></html>`,
     { status, headers: { "Content-Type": "text/html; charset=utf-8" } },
