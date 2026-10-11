@@ -10,11 +10,13 @@
 // Polls YouTube (fast /live redirect check + RSS + optional Data API) and
 // TikTok (best-effort page check) for every tracked account, publishing or
 // merging alerts via src/lib/publish.ts.
-import { Api } from "grammy";
+import { Api, GrammyError } from "grammy";
 import {
   contentAlreadyPosted,
+  deletePendingMessageDeletion,
   findOpenPostPlatformForAccount,
   getChannelById,
+  listDuePendingMessageDeletions,
   listSocialAccountsByPlatform,
   touchLastCheckedAt,
   updateLastVideoId,
@@ -219,5 +221,32 @@ export async function runScheduledCheck(env: Env): Promise<void> {
 
   await runWithConcurrency(tasks, DEFAULT_CONCURRENCY, (task) => runAccountCheck(env, api, serializer, task));
 
+  // Deletes welcome messages whose configured delay has elapsed
+  // (channels.welcome_delete_after_seconds, migrations/007).
+  await flushDuePendingMessageDeletions(env, api).catch((err) =>
+    console.error("flushDuePendingMessageDeletions failed:", err),
+  );
+
   console.log("Scheduled check done.");
+}
+
+/** Deletes every queued message whose delete_at has passed. A 400/403 from
+ * Telegram (message already deleted by someone, chat gone, bot removed or
+ * lacking rights) can never succeed on retry, so the row is dropped; anything
+ * else (429 rate limit, 5xx, network error) leaves the row for the next run. */
+async function flushDuePendingMessageDeletions(env: Env, api: Api): Promise<void> {
+  const due = await listDuePendingMessageDeletions(env);
+  for (const row of due) {
+    try {
+      await api.deleteMessage(row.telegram_chat_id, row.message_id);
+      await deletePendingMessageDeletion(env, row.id);
+    } catch (err) {
+      const permanent = err instanceof GrammyError && (err.error_code === 400 || err.error_code === 403);
+      if (permanent) {
+        await deletePendingMessageDeletion(env, row.id);
+      } else {
+        console.error(`deleteMessage failed for message ${row.message_id} in chat ${row.telegram_chat_id}:`, err);
+      }
+    }
+  }
 }
