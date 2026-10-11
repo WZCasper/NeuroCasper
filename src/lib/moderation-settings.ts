@@ -193,3 +193,46 @@ export function removeSpamPhraseAt(current: readonly string[], index: number): s
   if (!Number.isInteger(index) || index < 0 || index >= current.length) return null;
   return current.filter((_, i) => i !== index);
 }
+
+// ---------------------------------------------------------------------------
+// Auto-deletion of welcome messages
+// ---------------------------------------------------------------------------
+
+/** Default delay before a welcome message is deleted: 10 minutes. The
+ * channels column defaults to the same number (migrations/007). */
+export const DEFAULT_WELCOME_DELETE_AFTER_SECONDS = 600;
+
+/** Longest configurable delay: 24 hours. Telegram's deleteMessage only works
+ * on messages sent less than 48 hours ago, so anything longer could silently
+ * never happen; 24 h leaves a wide margin for cron lag. */
+export const WELCOME_DELETE_AFTER_MAX_SECONDS = 24 * 60 * 60;
+
+export type DeleteAfterValidation = { ok: true; seconds: number } | { ok: false; error: string };
+
+/** Parses the owner's reply (minutes, "0" = never delete) into seconds.
+ * Plain non-negative decimal only -- no hex, exponent, sign or text. */
+export function validateWelcomeDeleteAfterMinutes(input: string): DeleteAfterValidation {
+  const trimmed = input.trim();
+  if (!/^\d+(?:[.,]\d+)?$/.test(trimmed)) {
+    return { ok: false, error: "Введите число минут (0 — не удалять). Например: 10" };
+  }
+  const seconds = Math.round(Number(trimmed.replace(",", ".")) * 60);
+  if (seconds > WELCOME_DELETE_AFTER_MAX_SECONDS) {
+    return {
+      ok: false,
+      error:
+        `Слишком долго: максимум ${WELCOME_DELETE_AFTER_MAX_SECONDS / 60} минут (24 часа) — ` +
+        "Telegram позволяет боту удалять только сообщения не старше 48 часов.",
+    };
+  }
+  return { ok: true, seconds };
+}
+
+/** Seconds -> short Russian phrase; 0 is shown as "не удалять", not "0 мин". */
+export function formatDeleteAfter(seconds: number): string {
+  if (seconds <= 0) return "не удалять";
+  if (seconds % 60 === 0) return `${seconds / 60} мин`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return minutes > 0 ? `${minutes} мин ${rest} сек` : `${rest} сек`;
+}
