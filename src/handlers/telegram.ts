@@ -4,6 +4,7 @@ import {
   createChannel,
   createExtraLink,
   createKickOAuthState,
+  createPendingMessageDeletion,
   createSocialAccount,
   createStreamer,
   createUserReport,
@@ -21,11 +22,13 @@ import {
   toggleChannelFlag,
   updateChannelSpamPhrases,
   updateChannelTemplate,
+  updateChannelWelcomeDeleteAfter,
   updateChannelWelcomeTemplate,
   updateExtraLinkUrl,
 } from "../db.js";
 import { bioLooksLikeSpam, escapeHtml, isMemberStatus } from "../lib/chat-membership.js";
 import {
+  DEFAULT_WELCOME_DELETE_AFTER_SECONDS,
   DEFAULT_WELCOME_TEMPLATE,
   MAX_SPAM_PHRASES,
   SPAM_PHRASE_MAX_LENGTH,
@@ -33,11 +36,13 @@ import {
   TELEGRAM_CAPTION_LIMIT,
   WELCOME_TEMPLATE_MAX_LENGTH,
   addSpamPhrases,
+  formatDeleteAfter,
   removeSpamPhraseAt,
   renderWelcomeText,
   resolveSpamPhrases,
   resolveWelcomeTemplate,
   serializeSpamPhrases,
+  validateWelcomeDeleteAfterMinutes,
   validateWelcomeTemplate,
   type SpamPhraseSkipReason,
 } from "../lib/moderation-settings.js";
@@ -194,6 +199,8 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
       await handleTemplateInput(ctx, env, session.data);
     } else if (session.step === "awaiting_welcome_template") {
       await handleWelcomeTemplateInput(ctx, env, session.data);
+    } else if (session.step === "awaiting_welcome_delete_after") {
+      await handleWelcomeDeleteAfterInput(ctx, env, session.data);
     } else if (session.step === "awaiting_spam_phrases") {
       await handleSpamPhrasesInput(ctx, env, session.data);
     }
@@ -461,10 +468,12 @@ async function handleChatMemberUpdate(ctx: BotContext, env: Env): Promise<void> 
   // Обычный текст без parse_mode: владелец чата может написать в
   // приветствии что угодно (включая «<» и «&»), и это не превратится в
   // разметку.
-  const sendPlain = async (): Promise<void> => {
-    await ctx.api
-      .sendMessage(chat.id, text)
-      .catch((err) => console.error(`sendMessage (welcome) failed in chat ${chat.id}:`, err));
+  const sendPlain = async (): Promise<number | null> => {
+    const msg = await ctx.api.sendMessage(chat.id, text).catch((err) => {
+      console.error(`sendMessage (welcome) failed in chat ${chat.id}:`, err);
+      return null;
+    });
+    return msg?.message_id ?? null;
   };
 
   const photos = await ctx.api.getUserProfilePhotos(newMember.id, { limit: 1 }).catch((err) => {
@@ -477,13 +486,26 @@ async function handleChatMemberUpdate(ctx: BotContext, env: Env): Promise<void> 
   // подстановок текст длиннее, шлём обычным сообщением без фото. Так же —
   // если у человека нет фото или оно скрыто настройками приватности, или
   // если сама отправка фото не удалась.
+  let sentMessageId: number | null;
   if (bestPhoto && text.length <= TELEGRAM_CAPTION_LIMIT) {
-    await ctx.api.sendPhoto(chat.id, bestPhoto.file_id, { caption: text }).catch(async (err) => {
-      console.error(`sendPhoto (welcome) failed in chat ${chat.id}, falling back to plain message:`, err);
-      await sendPlain();
-    });
+    sentMessageId = await ctx.api
+      .sendPhoto(chat.id, bestPhoto.file_id, { caption: text })
+      .then((msg) => msg.message_id)
+      .catch(async (err) => {
+        console.error(`sendPhoto (welcome) failed in chat ${chat.id}, falling back to plain message:`, err);
+        return sendPlain();
+      });
   } else {
-    await sendPlain();
+    sentMessageId = await sendPlain();
+  }
+
+  // Автоудаление приветствия: само удаление делает крон (src/scheduled.ts),
+  // здесь только ставим сообщение в очередь. 0 — «не удалять».
+  const deleteAfterSeconds = channel?.welcome_delete_after_seconds ?? DEFAULT_WELCOME_DELETE_AFTER_SECONDS;
+  if (sentMessageId && deleteAfterSeconds > 0) {
+    await createPendingMessageDeletion(env, chat.id, sentMessageId, deleteAfterSeconds).catch((err) =>
+      console.error(`createPendingMessageDeletion failed for message ${sentMessageId} in chat ${chat.id}:`, err),
+    );
   }
 }
 
@@ -1066,7 +1088,7 @@ async function handleTemplateInput(ctx: BotContext, env: Env, data: { channel_id
 // группы».
 // ---------------------------------------------------------------------------
 
-const MODERATION_ACTIONS = new Set(["mod", "wtg", "wtx", "wrs", "stg", "spl", "spa", "spd", "spr"]);
+const MODERATION_ACTIONS = new Set(["mod", "wtg", "wtx", "wrs", "wdt", "wdr", "stg", "spl", "spa", "spd", "spr"]);
 
 interface View {
   text: string;
@@ -1104,6 +1126,7 @@ function buildModerationView(channel: ChannelRow): View {
     `👥 Модерация: ${channel.title ?? channel.telegram_chat_id}\n` +
     "Работает в группах, где бот — администратор (в каналах не применяется).\n\n" +
     `Приветствие новых участников: ${channel.welcome_enabled ? "вкл" : "выкл"}\n` +
+    `Удаление приветствия через: ${formatDeleteAfter(channel.welcome_delete_after_seconds)}\n` +
     `Проверка описания профиля на спам: ${channel.spam_filter_enabled ? "вкл" : "выкл"} ` +
     `(фраз в списке: ${phrases.length}; при совпадении — блокировка на 30 дней)\n\n` +
     `Текст приветствия (${channel.welcome_template ? "свой" : "стандартный"}):\n` +
@@ -1112,6 +1135,8 @@ function buildModerationView(channel: ChannelRow): View {
     .text(channel.welcome_enabled ? "Выключить приветствие" : "Включить приветствие", `set:wtg:${channel.id}`)
     .row()
     .text("✏️ Изменить текст приветствия", `set:wtx:${channel.id}`)
+    .row()
+    .text("⏱ Время удаления приветствия", `set:wdt:${channel.id}`)
     .row()
     .text(channel.spam_filter_enabled ? "Выключить проверку спама" : "Включить проверку спама", `set:stg:${channel.id}`)
     .row()
@@ -1135,6 +1160,18 @@ function buildWelcomePromptView(channelId: number): View {
     `Стандартный текст:\n${DEFAULT_WELCOME_TEMPLATE}`;
   const kb = new InlineKeyboard()
     .text("↩️ Вернуть стандартный текст", `set:wrs:${channelId}`)
+    .row()
+    .text("⬅ Отмена", `set:mod:${channelId}`);
+  return { text, kb };
+}
+
+function buildWelcomeDeletePromptView(channelId: number, currentSeconds: number): View {
+  const text =
+    "Через сколько минут после отправки удалять приветствие из группы?\n\n" +
+    `Сейчас: ${formatDeleteAfter(currentSeconds)}.\n` +
+    "Отправьте число минут (например, 10). 0 — не удалять вообще. Максимум — 1440 (24 часа).";
+  const kb = new InlineKeyboard()
+    .text(`↩️ Вернуть стандартное (${DEFAULT_WELCOME_DELETE_AFTER_SECONDS / 60} мин)`, `set:wdr:${channelId}`)
     .row()
     .text("⬅ Отмена", `set:mod:${channelId}`);
   return { text, kb };
@@ -1212,6 +1249,17 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
       await editScreen(ctx, buildModerationView(updated ?? channel));
       return;
     }
+    case "wdt": {
+      await setSession(env, ctx.dbUser.id, { step: "awaiting_welcome_delete_after", data: { channel_id: channel.id } });
+      await editScreen(ctx, buildWelcomeDeletePromptView(channel.id, channel.welcome_delete_after_seconds));
+      return;
+    }
+    case "wdr": {
+      const updated = await updateChannelWelcomeDeleteAfter(env, channel.id, DEFAULT_WELCOME_DELETE_AFTER_SECONDS);
+      await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+      await editScreen(ctx, buildModerationView(updated ?? channel));
+      return;
+    }
     case "spl": {
       await setSession(env, ctx.dbUser.id, IDLE_SESSION);
       await editScreen(ctx, buildSpamPhraseListView(channel));
@@ -1260,6 +1308,29 @@ async function handleWelcomeTemplateInput(ctx: BotContext, env: Env, data: { cha
   const updated = await updateChannelWelcomeTemplate(env, channel.id, checked.template);
   const view = buildModerationView(updated ?? channel);
   await ctx.reply(`✅ Текст приветствия обновлён.\n\n${view.text}`, { reply_markup: view.kb });
+}
+
+async function handleWelcomeDeleteAfterInput(ctx: BotContext, env: Env, data: { channel_id: number }): Promise<void> {
+  const raw = ctx.message?.text;
+  if (!raw) return;
+
+  const channel = await getOwnedChannel(ctx, env, data.channel_id);
+  if (!channel) {
+    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
+    return;
+  }
+
+  const checked = validateWelcomeDeleteAfterMinutes(raw);
+  if (!checked.ok) {
+    await ctx.reply(checked.error); // остаёмся в режиме ввода — можно отправить исправленное значение
+    return;
+  }
+
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+  const updated = await updateChannelWelcomeDeleteAfter(env, channel.id, checked.seconds);
+  const view = buildModerationView(updated ?? channel);
+  await ctx.reply(`✅ Время удаления приветствия обновлено.\n\n${view.text}`, { reply_markup: view.kb });
 }
 
 function describeSkipReason(reason: SpamPhraseSkipReason): string {
