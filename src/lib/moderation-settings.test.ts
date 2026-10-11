@@ -6,14 +6,17 @@ import {
   MAX_SPAM_PHRASES,
   SPAM_PHRASE_MAX_LENGTH,
   SPAM_PHRASE_MIN_LENGTH,
+  WELCOME_DELETE_AFTER_MAX_SECONDS,
   WELCOME_TEMPLATE_MAX_LENGTH,
   addSpamPhrases,
+  formatDeleteAfter,
   normalizeSpamPhrase,
   removeSpamPhraseAt,
   renderWelcomeText,
   resolveSpamPhrases,
   resolveWelcomeTemplate,
   serializeSpamPhrases,
+  validateWelcomeDeleteAfterMinutes,
   validateWelcomeTemplate,
 } from "./moderation-settings.js";
 
@@ -207,4 +210,41 @@ test("returns null for an out-of-range index (stale button after the list change
 
 test("returns null for a non-integer index rather than doing something undefined", () => {
   assert.equal(removeSpamPhraseAt(["a", "b"], 1.5), null);
+});
+
+// ---------------------------------------------------------------------------
+// validateWelcomeDeleteAfterMinutes / formatDeleteAfter
+// ---------------------------------------------------------------------------
+
+test("whole minutes are converted to seconds", () => {
+  assert.deepEqual(validateWelcomeDeleteAfterMinutes("10"), { ok: true, seconds: 600 });
+  assert.deepEqual(validateWelcomeDeleteAfterMinutes("  1 "), { ok: true, seconds: 60 });
+});
+
+test("0 means never delete and is accepted", () => {
+  assert.deepEqual(validateWelcomeDeleteAfterMinutes("0"), { ok: true, seconds: 0 });
+});
+
+test("decimal minutes work with either a dot or a comma", () => {
+  assert.deepEqual(validateWelcomeDeleteAfterMinutes("1.5"), { ok: true, seconds: 90 });
+  assert.deepEqual(validateWelcomeDeleteAfterMinutes("1,5"), { ok: true, seconds: 90 });
+});
+
+test("the maximum (24 hours) is accepted, one minute over is rejected", () => {
+  const maxMinutes = WELCOME_DELETE_AFTER_MAX_SECONDS / 60;
+  assert.deepEqual(validateWelcomeDeleteAfterMinutes(String(maxMinutes)), { ok: true, seconds: WELCOME_DELETE_AFTER_MAX_SECONDS });
+  assert.equal(validateWelcomeDeleteAfterMinutes(String(maxMinutes + 1)).ok, false);
+});
+
+test("anything that is not a plain non-negative decimal is rejected", () => {
+  for (const bad of ["", "   ", "abc", "-5", "+5", "1e3", "0x10", "10 минут", "5.", ".5", "Infinity", "1,2,3"]) {
+    assert.equal(validateWelcomeDeleteAfterMinutes(bad).ok, false, `"${bad}" must be rejected`);
+  }
+});
+
+test("formatDeleteAfter shows whole minutes, minutes+seconds, seconds, and 0 as 'never'", () => {
+  assert.equal(formatDeleteAfter(600), "10 мин");
+  assert.equal(formatDeleteAfter(90), "1 мин 30 сек");
+  assert.equal(formatDeleteAfter(45), "45 сек");
+  assert.equal(formatDeleteAfter(0), "не удалять");
 });
