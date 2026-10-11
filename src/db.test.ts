@@ -6,11 +6,18 @@ import { DatabaseSync } from "node:sqlite";
 import {
   countDistinctReportingChats,
   createChannel,
+  createPostWithPlatform,
+  createSocialAccount,
+  createStreamer,
+  createPendingMessageDeletion,
   createUserReport,
+  deletePendingMessageDeletion,
   getChannelByTelegramChatId,
+  listDuePendingMessageDeletions,
   getOrCreateUser,
   toggleChannelFlag,
   updateChannelSpamPhrases,
+  updateChannelWelcomeDeleteAfter,
   updateChannelWelcomeTemplate,
 } from "./db.js";
 import type { Env } from "./types.js";
@@ -30,15 +37,16 @@ import type { Env } from "./types.js";
 // ---------------------------------------------------------------------------
 
 class FakeD1Statement {
-  private params: unknown[] = [];
+  // db/sql/params are readable so fakeD1Batch() below can run a batch's
+  // statements itself, inside one real transaction.
   constructor(
-    private readonly db: DatabaseSync,
-    private readonly sql: string,
+    readonly db: DatabaseSync,
+    readonly sql: string,
+    readonly params: unknown[] = [],
   ) {}
 
-  bind(...params: unknown[]): this {
-    this.params = params;
-    return this;
+  bind(...params: unknown[]): FakeD1Statement {
+    return new FakeD1Statement(this.db, this.sql, params);
   }
 
   async run(): Promise<{ success: true }> {
@@ -50,6 +58,28 @@ class FakeD1Statement {
     const row = this.db.prepare(this.sql).get(...(this.params as Array<string | number | null>));
     return (row as T | undefined) ?? null;
   }
+
+  async all<T>(): Promise<{ results: T[] }> {
+    const rows = this.db.prepare(this.sql).all(...(this.params as Array<string | number | null>));
+    return { results: rows as T[] };
+  }
+}
+
+/** A real SQLite transaction (BEGIN / statements / COMMIT, ROLLBACK on any
+ * failure) -- what D1's batch() documents. A loop of independent writes
+ * would let the rollback test below pass for the wrong reason. */
+async function fakeD1Batch<T>(db: DatabaseSync, statements: FakeD1Statement[]): Promise<Array<{ results: T[] }>> {
+  db.exec("BEGIN");
+  try {
+    const out = statements.map((stmt) => ({
+      results: db.prepare(stmt.sql).all(...(stmt.params as Array<string | number | null>)) as T[],
+    }));
+    db.exec("COMMIT");
+    return out;
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }
 
 function createTestEnv(): Env {
@@ -59,7 +89,10 @@ function createTestEnv(): Env {
   // Cloudflare Workers' definition, which node:fs's overloads reject.
   const schemaPath = fileURLToPath(new URL("../schema.sql", import.meta.url).href);
   db.exec(readFileSync(schemaPath, "utf8"));
-  const fakeD1 = { prepare: (sql: string) => new FakeD1Statement(db, sql) };
+  const fakeD1 = {
+    prepare: (sql: string) => new FakeD1Statement(db, sql),
+    batch: <T>(statements: FakeD1Statement[]) => fakeD1Batch<T>(db, statements),
+  };
   return { DB: fakeD1 } as unknown as Env;
 }
 
@@ -204,4 +237,100 @@ test("updateChannelSpamPhrases stores a custom phrase list as JSON, and null res
   const reset = await updateChannelSpamPhrases(env, channel.id, null);
   assert.ok(reset);
   assert.equal(reset.spam_phrases, null);
+});
+
+// ---------------------------------------------------------------------------
+// createPostWithPlatform -- the fix for the orphaned-open-post incident
+// described on the function itself (src/db.ts). The rollback test is the one
+// that matters: it forces the SECOND statement to fail and asserts the FIRST
+// one's row did not survive.
+// ---------------------------------------------------------------------------
+
+async function createTestStreamerWithAccount(env: Env, chatId: number): Promise<{ streamerId: number; socialAccountId: number }> {
+  const channel = await createTestChannel(env, chatId);
+  const streamer = await createStreamer(env, channel.id, "Test Streamer");
+  const account = await createSocialAccount(env, streamer.id, "youtube", "testhandle", "UC123");
+  return { streamerId: streamer.id, socialAccountId: account.id };
+}
+
+test("createPostWithPlatform creates the post and its platform row, correctly linked", async () => {
+  const env = createTestEnv();
+  const { streamerId, socialAccountId } = await createTestStreamerWithAccount(env, -3001);
+  const { post, postPlatform } = await createPostWithPlatform(
+    env, streamerId, 1, "live", -3001, 555, socialAccountId, "youtube", "vid-1", "https://youtube.com/watch?v=vid-1",
+  );
+  assert.equal(post.kind, "live");
+  assert.equal(post.is_open, 1);
+  assert.equal(postPlatform.post_id, post.id);
+  assert.equal(postPlatform.social_account_id, socialAccountId);
+});
+
+test("createPostWithPlatform leaves no orphaned post when the second insert fails", async () => {
+  const env = createTestEnv();
+  const { streamerId } = await createTestStreamerWithAccount(env, -3002);
+  // A nonexistent social_account_id violates post_platforms' foreign key.
+  await assert.rejects(() =>
+    createPostWithPlatform(env, streamerId, 1, "live", -3002, 556, 999999, "youtube", "vid-2", "https://youtube.com/watch?v=vid-2"),
+  );
+  const orphans = await env.DB.prepare(
+    "SELECT p.id FROM posts p WHERE p.streamer_id = ? AND NOT EXISTS (SELECT 1 FROM post_platforms pp WHERE pp.post_id = p.id)",
+  )
+    .bind(streamerId)
+    .all<{ id: number }>();
+  assert.deepEqual(orphans.results, []);
+  const posts = await env.DB.prepare("SELECT id FROM posts WHERE streamer_id = ?").bind(streamerId).all<{ id: number }>();
+  assert.deepEqual(posts.results, [], "the failed batch must not leave any posts row behind");
+});
+
+test("two createPostWithPlatform calls link their own rows (LAST_INSERT_ROWID does not leak across calls)", async () => {
+  const env = createTestEnv();
+  const { streamerId, socialAccountId } = await createTestStreamerWithAccount(env, -3003);
+  const a = await createPostWithPlatform(env, streamerId, 1, "live", -3003, 601, socialAccountId, "youtube", "v1", "https://y/1");
+  const b = await createPostWithPlatform(env, streamerId, 1, "video", -3003, 602, socialAccountId, "youtube", "v2", "https://y/2");
+  assert.notEqual(a.post.id, b.post.id);
+  assert.equal(a.postPlatform.post_id, a.post.id);
+  assert.equal(b.postPlatform.post_id, b.post.id);
+});
+
+// ---------------------------------------------------------------------------
+// Welcome-message auto-deletion: channels.welcome_delete_after_seconds and
+// the pending_message_deletions queue (migrations/007).
+// ---------------------------------------------------------------------------
+
+test("a new channel defaults to deleting welcome messages after 600 seconds", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -4001);
+  assert.equal(channel.welcome_delete_after_seconds, 600);
+});
+
+test("updateChannelWelcomeDeleteAfter stores the new delay, including 0 for never", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -4002);
+  assert.equal((await updateChannelWelcomeDeleteAfter(env, channel.id, 120))?.welcome_delete_after_seconds, 120);
+  assert.equal((await updateChannelWelcomeDeleteAfter(env, channel.id, 0))?.welcome_delete_after_seconds, 0);
+});
+
+test("a freshly queued deletion is not due yet", async () => {
+  const env = createTestEnv();
+  await createPendingMessageDeletion(env, -4003, 900, 600);
+  assert.deepEqual(await listDuePendingMessageDeletions(env), []);
+});
+
+test("a queued deletion whose delete_at has passed is listed as due, oldest first, and can be removed", async () => {
+  const env = createTestEnv();
+  await env.DB.prepare("INSERT INTO pending_message_deletions (telegram_chat_id, message_id, delete_at) VALUES (?, ?, datetime('now', '-1 minutes'))")
+    .bind(-4004, 1)
+    .run();
+  await env.DB.prepare("INSERT INTO pending_message_deletions (telegram_chat_id, message_id, delete_at) VALUES (?, ?, datetime('now', '-10 minutes'))")
+    .bind(-4004, 2)
+    .run();
+  await createPendingMessageDeletion(env, -4004, 3, 600); // not due
+
+  const due = await listDuePendingMessageDeletions(env);
+  assert.deepEqual(due.map((r) => r.message_id), [2, 1], "oldest-due first, and the not-yet-due row is excluded");
+
+  const first = due[0];
+  assert.ok(first);
+  await deletePendingMessageDeletion(env, first.id);
+  assert.deepEqual((await listDuePendingMessageDeletions(env)).map((r) => r.message_id), [1]);
 });
