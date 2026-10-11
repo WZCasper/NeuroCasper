@@ -44,6 +44,8 @@ export interface ChannelRow {
   welcome_enabled: number;
   /** NULL = the built-in default welcome text. */
   welcome_template: string | null;
+  /** Seconds until a welcome message is auto-deleted; 0 = never. Default 600. */
+  welcome_delete_after_seconds: number;
   /** 1/0: check a new member's bio against spam_phrases. */
   spam_filter_enabled: number;
   /** JSON array of strings; NULL = the built-in default phrase list. */
@@ -135,6 +137,16 @@ export type SessionState =
   | { step: "awaiting_link_url_edit"; data: { streamer_id: number; link_id: number } }
   | { step: "awaiting_template"; data: { channel_id: number } }
   | { step: "awaiting_welcome_template"; data: { channel_id: number } }
+  | { step: "awaiting_welcome_delete_after"; data: { channel_id: number } }
   | { step: "awaiting_spam_phrases"; data: { channel_id: number } };
 
 export const IDLE_SESSION: SessionState = { step: "idle" };
+
+/** A Telegram message queued for deletion once delete_at has passed
+ * (currently only welcome messages). See migrations/007. */
+export interface PendingMessageDeletionRow {
+  id: number;
+  telegram_chat_id: number;
+  message_id: number;
+  delete_at: string;
+}
