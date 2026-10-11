@@ -13,7 +13,7 @@ import {
   claimPostSlot,
   closePost,
   closePostPlatform,
-  createPost,
+  createPostWithPlatform,
   findOpenPost,
   findOpenPostPlatformForAccount,
   getChannelById,
@@ -135,8 +135,21 @@ async function createNewPost(input: PublishInput): Promise<void> {
   }
 
   try {
-    const post = await createPost(env, streamerId, channel.id, kind, channel.telegram_chat_id, messageId);
-    await addPostPlatform(env, post.id, socialAccountId, platform, contentId, url);
+    // One atomic batch -- see createPostWithPlatform in src/db.ts for the
+    // production incident two separate inserts here caused (orphaned open
+    // post -> no future notification for this streamer).
+    await createPostWithPlatform(
+      env,
+      streamerId,
+      channel.id,
+      kind,
+      channel.telegram_chat_id,
+      messageId,
+      socialAccountId,
+      platform,
+      contentId,
+      url,
+    );
   } catch (err) {
     console.error(`Failed to record post for streamer ${streamerId}`, err);
   }
