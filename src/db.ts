@@ -8,6 +8,7 @@ import type {
   Env,
   ExtraLinkRow,
   KickTokenRow,
+  PendingMessageDeletionRow,
   Platform,
   PostKind,
   PostPlatformRow,
@@ -528,6 +529,49 @@ export async function addPostPlatform(
   return row;
 }
 
+/** Creates a post AND its first post_platforms row as ONE atomic D1 batch
+ * (D1: "batched statements are SQL transactions"): both commit or neither
+ * does. createNewPost used to do createPost() then addPostPlatform() as two
+ * separate awaits inside one try/catch; if the first committed and the
+ * second threw (transient D1 error), the catch only logged, leaving a posts
+ * row with is_open = 1 and NO post_platforms row. Nothing references such an
+ * orphan's social account, so no "stream ended" event can ever close it,
+ * while findOpenPost keeps matching it -- so every later live/video detection
+ * for that streamer merged into the dead post and no new Telegram message was
+ * ever sent again. Confirmed in production: three orphaned 'live' posts, one
+ * of them silent for 9 days. The second statement uses LAST_INSERT_ROWID()
+ * so no read sits between the two writes. */
+export async function createPostWithPlatform(
+  env: Env,
+  streamerId: number,
+  channelId: number,
+  kind: PostKind,
+  telegramChatId: number,
+  telegramMessageId: number,
+  socialAccountId: number,
+  platform: Platform,
+  contentId: string | null,
+  url: string,
+): Promise<{ post: PostRow; postPlatform: PostPlatformRow }> {
+  const results = await env.DB.batch<PostRow | PostPlatformRow>([
+    env.DB.prepare(
+      `INSERT INTO posts (streamer_id, channel_id, kind, telegram_chat_id, telegram_message_id)
+       VALUES (?, ?, ?, ?, ?)
+       RETURNING *`,
+    ).bind(streamerId, channelId, kind, telegramChatId, telegramMessageId),
+    env.DB.prepare(
+      `INSERT INTO post_platforms (post_id, social_account_id, platform, content_id, url)
+       VALUES (LAST_INSERT_ROWID(), ?, ?, ?, ?)
+       RETURNING *`,
+    ).bind(socialAccountId, platform, contentId, url),
+  ]);
+  // noUncheckedIndexedAccess: index 0/1 are `| undefined` to the compiler.
+  const post = results[0]?.results[0] as PostRow | undefined;
+  const postPlatform = results[1]?.results[0] as PostPlatformRow | undefined;
+  if (!post || !postPlatform) throw new Error("createPostWithPlatform: batch did not return both rows");
+  return { post, postPlatform };
+}
+
 export async function listPostPlatforms(env: Env, postId: number): Promise<PostPlatformRow[]> {
   const { results } = await env.DB.prepare(
     "SELECT * FROM post_platforms WHERE post_id = ? ORDER BY created_at ASC",
@@ -693,4 +737,48 @@ export async function countDistinctReportingChats(env: Env, reportedUserId: numb
     .bind(reportedUserId)
     .first<{ count: number }>();
   return row?.count ?? 0;
+}
+
+export async function updateChannelWelcomeDeleteAfter(
+  env: Env,
+  channelId: number,
+  seconds: number,
+): Promise<ChannelRow | null> {
+  await env.DB.prepare("UPDATE channels SET welcome_delete_after_seconds = ? WHERE id = ?")
+    .bind(seconds, channelId)
+    .run();
+  return getChannelById(env, channelId);
+}
+
+// ---------------------------------------------------------------------------
+// pending_message_deletions -- see migrations/007_add_welcome_delete_after.sql
+// ---------------------------------------------------------------------------
+
+/** Queues a message for deletion `deleteAfterSeconds` from now (a positive
+ * integer; callers skip this entirely for "never delete"). delete_at is
+ * computed once, here, as an absolute time. */
+export async function createPendingMessageDeletion(
+  env: Env,
+  telegramChatId: number,
+  messageId: number,
+  deleteAfterSeconds: number,
+): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO pending_message_deletions (telegram_chat_id, message_id, delete_at) VALUES (?, ?, datetime('now', ?))",
+  )
+    .bind(telegramChatId, messageId, `+${Math.floor(deleteAfterSeconds)} seconds`)
+    .run();
+}
+
+/** Rows whose delete_at has passed, oldest first, capped so one sweep after
+ * a long outage can't run unbounded (the rest are picked up next run). */
+export async function listDuePendingMessageDeletions(env: Env): Promise<PendingMessageDeletionRow[]> {
+  const { results } = await env.DB.prepare(
+    "SELECT * FROM pending_message_deletions WHERE delete_at <= datetime('now') ORDER BY delete_at ASC LIMIT 200",
+  ).all<PendingMessageDeletionRow>();
+  return results ?? [];
+}
+
+export async function deletePendingMessageDeletion(env: Env, id: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM pending_message_deletions WHERE id = ?").bind(id).run();
 }
