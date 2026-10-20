@@ -9,6 +9,7 @@
 
 PRAGMA foreign_keys = ON;
 
+DROP TABLE IF EXISTS pending_message_deletions;
 DROP TABLE IF EXISTS user_reports;
 DROP TABLE IF EXISTS post_claims;
 DROP TABLE IF EXISTS post_platforms;
@@ -52,6 +53,9 @@ CREATE TABLE channels (
   -- phrases mean "use the built-in default" (src/lib/moderation-settings.ts).
   welcome_enabled      INTEGER NOT NULL DEFAULT 1,
   welcome_template     TEXT,
+  -- Seconds until a welcome message is auto-deleted from the group; 0 means
+  -- "never delete". See migrations/007_add_welcome_delete_after.sql.
+  welcome_delete_after_seconds  INTEGER NOT NULL DEFAULT 600,
   spam_filter_enabled  INTEGER NOT NULL DEFAULT 1,
   spam_phrases         TEXT,
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
@@ -254,3 +258,18 @@ CREATE TABLE user_reports (
 );
 
 CREATE INDEX idx_user_reports_reported ON user_reports (reported_user_id);
+
+-- A Telegram message (currently only welcome messages, see
+-- channels.welcome_delete_after_seconds) queued for deletion once delete_at
+-- has passed. delete_at is an ABSOLUTE timestamp computed once at send time;
+-- storing the delay and recomputing "now + delay" on each cron sweep would
+-- push the deletion further away forever. See
+-- migrations/007_add_welcome_delete_after.sql.
+CREATE TABLE pending_message_deletions (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  telegram_chat_id  INTEGER NOT NULL,
+  message_id        INTEGER NOT NULL,
+  delete_at         TEXT NOT NULL
+);
+
+CREATE INDEX idx_pending_message_deletions_delete_at ON pending_message_deletions (delete_at);
