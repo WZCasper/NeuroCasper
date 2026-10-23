@@ -1,0 +1,24 @@
+-- Migration: per-chat AntiLink -- delete any group message containing a
+-- link whose host isn't on the chat's own whitelist (see
+-- src/lib/antilink.ts).
+--   * channels.antilink_enabled: configurable in the bot
+--     (/settings -> chat -> «👥 Модерация группы»), default 0 (OFF).
+--   * channels.antilink_whitelist: JSON array of whitelisted hostnames;
+--     NULL/"[]" both mean nothing is whitelisted yet.
+--
+-- Run once, manually, against a live database:
+--   npx wrangler d1 execute neurocasper-db --remote --file=./migrations/009_add_antilink.sql
+--
+-- The ALTER TABLE statements have no IF NOT EXISTS (SQLite doesn't support
+-- it for ADD COLUMN): running this twice fails on "duplicate column name"
+-- for those two statements -- harmless, it just means it was already
+-- applied.
+--
+-- Additive, safe with real data: antilink_enabled defaults to 0 (off) for
+-- every existing chat, so nothing changes for any chat until its owner
+-- deliberately turns AntiLink on in /settings -- this is a deliberate
+-- choice, unlike welcome_enabled/spam_filter_enabled/leave_enabled
+-- defaulting to 1, because this feature deletes ordinary members' own
+-- messages and should never start doing that without an explicit opt-in.
+ALTER TABLE channels ADD COLUMN antilink_enabled   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE channels ADD COLUMN antilink_whitelist TEXT;

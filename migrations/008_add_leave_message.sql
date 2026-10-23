@@ -1,0 +1,27 @@
+-- Migration: per-chat announcement when a member leaves/is removed from
+-- the group (the mirror of migrations/005_add_moderation_settings.sql's
+-- welcome_enabled/welcome_template, for the opposite event).
+--   * channels.leave_enabled: configurable in the bot
+--     (/settings -> chat -> «👥 Модерация группы»), default 1 (on).
+--   * channels.leave_template: NULL = the built-in default text
+--     (DEFAULT_LEAVE_TEMPLATE in src/lib/moderation-settings.ts).
+--
+-- Auto-deletion of the leave message reuses the existing
+-- welcome_delete_after_seconds column and pending_message_deletions queue
+-- (migrations/007) rather than adding a second delay setting -- one shared
+-- delay for both join/leave notifications was what was actually asked for.
+--
+-- Run once, manually, against a live database:
+--   npx wrangler d1 execute neurocasper-db --remote --file=./migrations/008_add_leave_message.sql
+--
+-- The ALTER TABLE statements have no IF NOT EXISTS (SQLite doesn't support
+-- it for ADD COLUMN): running this twice fails on "duplicate column name"
+-- for those two statements -- harmless, it just means it was already
+-- applied.
+--
+-- Additive, safe with real data: every existing chat gets leave_enabled=1
+-- and leave_template=NULL (built-in default text), so leave announcements
+-- start appearing once the matching code ships, unless the chat's owner
+-- turns it off in /settings.
+ALTER TABLE channels ADD COLUMN leave_enabled  INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE channels ADD COLUMN leave_template TEXT;
