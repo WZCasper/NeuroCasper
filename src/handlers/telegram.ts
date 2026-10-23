@@ -1,4 +1,5 @@
 import { Bot, Context, GrammyError, InlineKeyboard } from "grammy";
+import type { Message } from "grammy/types";
 import {
   countDistinctReportingChats,
   createChannel,
@@ -20,6 +21,8 @@ import {
   listStreamersByChannel,
   setSession,
   toggleChannelFlag,
+  updateChannelAntilinkWhitelist,
+  updateChannelLeaveTemplate,
   updateChannelSpamPhrases,
   updateChannelTemplate,
   updateChannelWelcomeDeleteAfter,
@@ -28,24 +31,38 @@ import {
 } from "../db.js";
 import { bioLooksLikeSpam, escapeHtml, isMemberStatus } from "../lib/chat-membership.js";
 import {
+  DEFAULT_LEAVE_TEMPLATE,
   DEFAULT_WELCOME_DELETE_AFTER_SECONDS,
   DEFAULT_WELCOME_TEMPLATE,
-  MAX_SPAM_PHRASES,
+  LEAVE_TEMPLATE_MAX_LENGTH,
   SPAM_PHRASE_MAX_LENGTH,
   SPAM_PHRASE_MIN_LENGTH,
+  SPAM_PHRASE_PAGE_SIZE,
   TELEGRAM_CAPTION_LIMIT,
   WELCOME_TEMPLATE_MAX_LENGTH,
   addSpamPhrases,
   formatDeleteAfter,
   removeSpamPhraseAt,
+  renderLeaveText,
   renderWelcomeText,
+  resolveLeaveTemplate,
   resolveSpamPhrases,
   resolveWelcomeTemplate,
   serializeSpamPhrases,
+  validateLeaveTemplate,
   validateWelcomeDeleteAfterMinutes,
   validateWelcomeTemplate,
   type SpamPhraseSkipReason,
 } from "../lib/moderation-settings.js";
+import {
+  ANTILINK_WHITELIST_PAGE_SIZE,
+  addWhitelistEntries,
+  messageHasDisallowedLink,
+  removeWhitelistEntryAt,
+  resolveAntilinkWhitelist,
+  serializeAntilinkWhitelist,
+  type WhitelistSkipReason,
+} from "../lib/antilink.js";
 import { estimateRegistrationDate, formatApproximateRegistrationDate } from "../lib/registration-date-estimate.js";
 import { buildAuthorizationUrl, generatePkcePair } from "../lib/kick.js";
 import { DEFAULT_TEMPLATE } from "../lib/message-templates.js";
@@ -174,9 +191,17 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
     }
   });
 
-  // Catch-all for private-chat messages: forwarded channel posts (channel
-  // registration) and free-text replies for the multi-step flows above.
+  // Catch-all for every incoming message: private-chat messages (forwarded
+  // channel posts for registration, free-text replies for the multi-step
+  // flows below) and, separately, group/supergroup messages (AntiLink).
+  // Channel posts are a different Bot API update type (channel_post,
+  // which this bot doesn't subscribe to), so they never reach this
+  // handler at all -- nothing here applies to channels.
   bot.on("message", async (ctx) => {
+    if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
+      await handleGroupMessage(ctx, env);
+      return;
+    }
     if (ctx.chat.type !== "private") return;
 
     if (ctx.message.forward_origin?.type === "channel") {
@@ -201,9 +226,71 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
       await handleWelcomeTemplateInput(ctx, env, session.data);
     } else if (session.step === "awaiting_welcome_delete_after") {
       await handleWelcomeDeleteAfterInput(ctx, env, session.data);
+    } else if (session.step === "awaiting_leave_template") {
+      await handleLeaveTemplateInput(ctx, env, session.data);
     } else if (session.step === "awaiting_spam_phrases") {
       await handleSpamPhrasesInput(ctx, env, session.data);
+    } else if (session.step === "awaiting_antilink_whitelist") {
+      await handleAntilinkWhitelistInput(ctx, env, session.data);
     }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// AntiLink: проверяет каждое обычное сообщение в группе/супергруппе, пока
+// antilink_enabled включён у этого чата, и удаляет его, если там есть хотя
+// бы одна ссылка не из белого списка (см. src/lib/antilink.ts — там же
+// вся логика извлечения ссылок и сравнения с белым списком).
+// ---------------------------------------------------------------------------
+
+/** Админы и создатель группы не фильтруются -- иначе сам владелец или
+ * любой назначенный им админ не смог бы отправить в своей же группе ни
+ * одной ссылки, не добавив предварительно её домен в белый список. Это
+ * не настраиваемая опция: освобождение администраторов от такого фильтра
+ * — почти универсально ожидаемое поведение для подобных ботов, отдельный
+ * тумблер на этот счёт не запрашивался. */
+async function isExemptFromAntilink(ctx: BotContext, chatId: number, userId: number): Promise<boolean> {
+  const member = await ctx.api.getChatMember(chatId, userId).catch((err) => {
+    console.error(`getChatMember failed while checking AntiLink exemption for user ${userId} in chat ${chatId}:`, err);
+    return null;
+  });
+  // Fails OPEN on purpose, the same reasoning as the report/bio-spam ban
+  // check in handleMemberJoined above: if the status check itself fails
+  // (a transient API error), wrongly deleting a real administrator's
+  // message is worse than occasionally missing one spam link while the
+  // API is having trouble -- and the next offending message from a
+  // genuine non-admin still gets caught normally.
+  if (!member) return true;
+  return member.status === "creator" || member.status === "administrator";
+}
+
+async function handleGroupMessage(ctx: BotContext, env: Env): Promise<void> {
+  const chat = ctx.chat;
+  const message = ctx.message;
+  // bot.on("message", ...) в registerHandlers всегда даёт контекст с
+  // chat/message — тот же случай, что и в handleReportCommand выше:
+  // BotContext сам по себе типизирует их как опциональные.
+  if (!chat || !message) return;
+  if (chat.type !== "group" && chat.type !== "supergroup") return;
+  if (!ctx.from || ctx.from.is_bot) return; // ничьи сообщения от ботов (включая сервисные) не трогаем
+
+  const channel = await getChannelByTelegramChatId(env, chat.id).catch((err) => {
+    console.error(`getChannelByTelegramChatId failed for chat ${chat.id} while checking AntiLink:`, err);
+    return null;
+  });
+  // В отличие от welcome/spam_filter, у antilink_enabled нет предположения
+  // "включено, пока не зарегистрировано иначе" — он выключен по умолчанию
+  // (см. комментарий у channels.antilink_enabled в schema.sql), так что
+  // незарегистрированный чат (channel === null) просто ничего не фильтрует.
+  if (!channel || !channel.antilink_enabled) return;
+
+  const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
+  if (!messageHasDisallowedLink(message, whitelist)) return;
+
+  if (await isExemptFromAntilink(ctx, chat.id, ctx.from.id)) return;
+
+  await ctx.api.deleteMessage(chat.id, message.message_id).catch((err) => {
+    console.error(`deleteMessage (AntiLink) failed for message ${message.message_id} in chat ${chat.id}:`, err);
   });
 }
 
@@ -394,16 +481,35 @@ async function handleChatMemberUpdate(ctx: BotContext, env: Env): Promise<void> 
   const update = ctx.chatMember;
   if (!update) return;
   const chat = update.chat;
-  // Только группы/супергруппы — у каналов нет привычного «участника
-  // вступил», а сам bot.on("chat_member") в принципе не срабатывает для
-  // private-чатов (см. официальную документацию Update.chat_member).
+  // Только группы/супергруппы — у каналов нет привычного «участник
+  // вступил»/«вышел», а сам bot.on("chat_member") в принципе не
+  // срабатывает для private-чатов (см. официальную документацию
+  // Update.chat_member).
   if (chat.type !== "group" && chat.type !== "supergroup") return;
 
   const wasMember = isMemberStatus(update.old_chat_member);
   const isNowMember = isMemberStatus(update.new_chat_member);
-  if (wasMember || !isNowMember) return; // интересует только «вступил впервые»
 
-  const newMember = update.new_chat_member.user;
+  // Ровно два интересующих перехода: «не был участником -> стал» (вступил
+  // впервые) и «был участником -> перестал» (вышел сам или был исключён
+  // администратором — ChatMemberUpdated не различает эти два случая
+  // отдельным полем, оба дают статус "left"/"kicked" у new_chat_member, и
+  // объявление о выходе одинаково уместно в обоих случаях). Любой другой
+  // переход (например, «участник» -> «администратор», или повторная
+  // проверка статуса без реального изменения) этот бот не обрабатывает.
+  if (!wasMember && isNowMember) {
+    await handleMemberJoined(ctx, env, chat, update.new_chat_member.user);
+  } else if (wasMember && !isNowMember) {
+    await handleMemberLeft(ctx, env, chat, update.new_chat_member.user);
+  }
+}
+
+async function handleMemberJoined(
+  ctx: BotContext,
+  env: Env,
+  chat: { id: number; type: "group" | "supergroup"; title: string },
+  newMember: NonNullable<BotContext["chatMember"]>["new_chat_member"]["user"],
+): Promise<void> {
   if (newMember.is_bot) return; // приветствуем людей, не сервисных ботов (включая самого себя)
 
   // Настройки этого чата, если его кто-то зарегистрировал через /add_channel
@@ -505,6 +611,58 @@ async function handleChatMemberUpdate(ctx: BotContext, env: Env): Promise<void> 
   if (sentMessageId && deleteAfterSeconds > 0) {
     await createPendingMessageDeletion(env, chat.id, sentMessageId, deleteAfterSeconds).catch((err) =>
       console.error(`createPendingMessageDeletion failed for message ${sentMessageId} in chat ${chat.id}:`, err),
+    );
+  }
+}
+
+/** Mirror of handleMemberJoined above, for the opposite transition: a
+ * member left on their own, or was removed by an administrator (both give
+ * the same "left"/"kicked" new_chat_member.status, and ChatMemberUpdated
+ * carries no separate field distinguishing the two — see the comment in
+ * handleChatMemberUpdate above). No bio/report ban checks here: those only
+ * make sense when someone is trying to get IN, not on the way out. Sent as
+ * a plain message with no profile-photo attachment, unlike the welcome
+ * message -- there's no equivalent reason to attach one for someone who
+ * just left, so it also has no TELEGRAM_CAPTION_LIMIT concern the welcome
+ * path has to work around. */
+async function handleMemberLeft(
+  ctx: BotContext,
+  env: Env,
+  chat: { id: number; type: "group" | "supergroup"; title: string },
+  leftMember: NonNullable<BotContext["chatMember"]>["new_chat_member"]["user"],
+): Promise<void> {
+  if (leftMember.is_bot) return; // не объявляем о «выходе» сервисных ботов (включая самого себя)
+
+  const channel = await getChannelByTelegramChatId(env, chat.id).catch((err) => {
+    console.error(`getChannelByTelegramChatId failed for chat ${chat.id}, using default moderation settings:`, err);
+    return null;
+  });
+  const leaveEnabled = channel ? Boolean(channel.leave_enabled) : true;
+  if (!leaveEnabled) return;
+
+  const fullName = leftMember.last_name ? `${leftMember.first_name} ${leftMember.last_name}` : leftMember.first_name;
+  const text = renderLeaveText(resolveLeaveTemplate(channel?.leave_template), {
+    name: fullName,
+    username: leftMember.username ? `@${leftMember.username}` : "— не указан",
+    chat: chat.title,
+  });
+
+  // Обычный текст без parse_mode — по той же причине, что и у приветствия
+  // выше: владелец чата может написать в тексте что угодно, включая «<»
+  // и «&», и это не превратится в разметку.
+  const sentMessage = await ctx.api.sendMessage(chat.id, text).catch((err) => {
+    console.error(`sendMessage (leave) failed in chat ${chat.id}:`, err);
+    return null;
+  });
+
+  // Та же очередь автоудаления и та же задержка, что и у приветствия выше
+  // -- одна общая настройка «через сколько удалять» на оба вида
+  // сообщений, а не отдельная задержка на каждое, см. комментарий у
+  // channels.leave_enabled в schema.sql.
+  const deleteAfterSeconds = channel?.welcome_delete_after_seconds ?? DEFAULT_WELCOME_DELETE_AFTER_SECONDS;
+  if (sentMessage && deleteAfterSeconds > 0) {
+    await createPendingMessageDeletion(env, chat.id, sentMessage.message_id, deleteAfterSeconds).catch((err) =>
+      console.error(`createPendingMessageDeletion failed for message ${sentMessage.message_id} in chat ${chat.id}:`, err),
     );
   }
 }
@@ -1088,7 +1246,26 @@ async function handleTemplateInput(ctx: BotContext, env: Env, data: { channel_id
 // группы».
 // ---------------------------------------------------------------------------
 
-const MODERATION_ACTIONS = new Set(["mod", "wtg", "wtx", "wrs", "wdt", "wdr", "stg", "spl", "spa", "spd", "spr"]);
+const MODERATION_ACTIONS = new Set([
+  "mod",
+  "wtg",
+  "wtx",
+  "wrs",
+  "wdt",
+  "wdr",
+  "stg",
+  "spl",
+  "spa",
+  "spd",
+  "spr",
+  "ltg", // leave-announcement: on/off
+  "ltx", // leave-announcement: edit text
+  "lrs", // leave-announcement: reset text to default
+  "atg", // AntiLink: on/off
+  "awl", // AntiLink whitelist: list (paginated)
+  "awa", // AntiLink whitelist: add prompt
+  "awd", // AntiLink whitelist: delete one entry
+]);
 
 interface View {
   text: string;
@@ -1122,25 +1299,39 @@ async function editScreen(ctx: BotContext, view: View): Promise<void> {
 
 function buildModerationView(channel: ChannelRow): View {
   const phrases = resolveSpamPhrases(channel.spam_phrases);
+  const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
   const text =
     `👥 Модерация: ${channel.title ?? channel.telegram_chat_id}\n` +
     "Работает в группах, где бот — администратор (в каналах не применяется).\n\n" +
     `Приветствие новых участников: ${channel.welcome_enabled ? "вкл" : "выкл"}\n` +
-    `Удаление приветствия через: ${formatDeleteAfter(channel.welcome_delete_after_seconds)}\n` +
+    `Уведомление о выходе участника: ${channel.leave_enabled ? "вкл" : "выкл"}\n` +
+    `Удаление приветствия/уведомления о выходе через: ${formatDeleteAfter(channel.welcome_delete_after_seconds)}\n` +
     `Проверка описания профиля на спам: ${channel.spam_filter_enabled ? "вкл" : "выкл"} ` +
-    `(фраз в списке: ${phrases.length}; при совпадении — блокировка на 30 дней)\n\n` +
+    `(фраз в списке: ${phrases.length}; при совпадении — блокировка на 30 дней)\n` +
+    `АнтиСсылка: ${channel.antilink_enabled ? "вкл" : "выкл"} ` +
+    `(в белом списке: ${whitelist.length} доменов; админы группы не фильтруются)\n\n` +
     `Текст приветствия (${channel.welcome_template ? "свой" : "стандартный"}):\n` +
-    resolveWelcomeTemplate(channel.welcome_template);
+    `${resolveWelcomeTemplate(channel.welcome_template)}\n\n` +
+    `Текст уведомления о выходе (${channel.leave_template ? "свой" : "стандартный"}):\n` +
+    resolveLeaveTemplate(channel.leave_template);
   const kb = new InlineKeyboard()
     .text(channel.welcome_enabled ? "Выключить приветствие" : "Включить приветствие", `set:wtg:${channel.id}`)
     .row()
     .text("✏️ Изменить текст приветствия", `set:wtx:${channel.id}`)
     .row()
-    .text("⏱ Время удаления приветствия", `set:wdt:${channel.id}`)
+    .text("⏱ Время удаления приветствия/выхода", `set:wdt:${channel.id}`)
+    .row()
+    .text(channel.leave_enabled ? "Выключить уведомление о выходе" : "Включить уведомление о выходе", `set:ltg:${channel.id}`)
+    .row()
+    .text("✏️ Изменить текст уведомления о выходе", `set:ltx:${channel.id}`)
     .row()
     .text(channel.spam_filter_enabled ? "Выключить проверку спама" : "Включить проверку спама", `set:stg:${channel.id}`)
     .row()
-    .text(`📝 Спам-фразы (${phrases.length})`, `set:spl:${channel.id}`)
+    .text(`📝 Спам-фразы (${phrases.length})`, `set:spl:${channel.id}:0`)
+    .row()
+    .text(channel.antilink_enabled ? "Выключить АнтиСсылку" : "Включить АнтиСсылку", `set:atg:${channel.id}`)
+    .row()
+    .text(`🔗 Белый список ссылок (${whitelist.length})`, `set:awl:${channel.id}:0`)
     .row()
     .text("⬅ Назад", `set:ch:${channel.id}`)
     .row()
@@ -1165,9 +1356,25 @@ function buildWelcomePromptView(channelId: number): View {
   return { text, kb };
 }
 
+function buildLeavePromptView(channelId: number): View {
+  const text =
+    `Отправьте новый текст уведомления о выходе участника (обычный текст, до ${LEAVE_TEMPLATE_MAX_LENGTH} символов).\n\n` +
+    "Показывается и когда участник вышел сам, и когда его исключил администратор.\n\n" +
+    "Подстановки:\n" +
+    "{name} — имя и фамилия\n" +
+    "{username} — ник (@...)\n" +
+    "{chat} — название группы\n\n" +
+    `Стандартный текст:\n${DEFAULT_LEAVE_TEMPLATE}`;
+  const kb = new InlineKeyboard()
+    .text("↩️ Вернуть стандартный текст", `set:lrs:${channelId}`)
+    .row()
+    .text("⬅ Отмена", `set:mod:${channelId}`);
+  return { text, kb };
+}
+
 function buildWelcomeDeletePromptView(channelId: number, currentSeconds: number): View {
   const text =
-    "Через сколько минут после отправки удалять приветствие из группы?\n\n" +
+    "Через сколько минут после отправки удалять приветствие/уведомление о выходе из группы?\n\n" +
     `Сейчас: ${formatDeleteAfter(currentSeconds)}.\n` +
     "Отправьте число минут (например, 10). 0 — не удалять вообще. Максимум — 1440 (24 часа).";
   const kb = new InlineKeyboard()
@@ -1177,22 +1384,66 @@ function buildWelcomeDeletePromptView(channelId: number, currentSeconds: number)
   return { text, kb };
 }
 
-function buildSpamPhraseListView(channel: ChannelRow): View {
+/** One page of a flat, numbered, by-position list with a ❌-delete button
+ * per item plus Prev/Next navigation — the shared rendering shape behind
+ * both buildSpamPhraseListView and buildAntilinkWhitelistView below, so
+ * the two stay visually and behaviorally consistent rather than drifting
+ * apart as separate copies. `page` is clamped into range here (not by the
+ * caller) so a stale "next page" button pressed after items were removed
+ * can never point past the end. */
+function buildPaginatedListKeyboard(params: {
+  items: readonly string[];
+  page: number;
+  pageSize: number;
+  itemLabelLength: number;
+  /** `page` here is the final, already-clamped page being shown — so the
+   * delete button's callback_data carries back the page the owner was
+   * actually looking at, and removing an item keeps them on the same
+   * page afterward instead of jumping back to page 1. */
+  deleteAction: (index: number, page: number) => string;
+  pageAction: (page: number) => string;
+}): { kb: InlineKeyboard; page: number; totalPages: number; pageItems: Array<{ item: string; index: number }> } {
+  const totalPages = Math.max(1, Math.ceil(params.items.length / params.pageSize));
+  const page = Math.min(Math.max(0, params.page), totalPages - 1);
+  const start = page * params.pageSize;
+  const pageItems = params.items
+    .slice(start, start + params.pageSize)
+    .map((item, i) => ({ item, index: start + i }));
+
+  const kb = new InlineKeyboard();
+  pageItems.forEach(({ item, index }) => {
+    kb.text(`❌ ${truncateLabel(item, params.itemLabelLength)}`, params.deleteAction(index, page)).row();
+  });
+  if (totalPages > 1) {
+    if (page > 0) kb.text("⬅️ Пред.", params.pageAction(page - 1));
+    kb.text(`${page + 1}/${totalPages}`, params.pageAction(page)); // неактивная кнопка-индикатор
+    if (page < totalPages - 1) kb.text("След. ➡️", params.pageAction(page + 1));
+    kb.row();
+  }
+  return { kb, page, totalPages, pageItems };
+}
+
+function buildSpamPhraseListView(channel: ChannelRow, page = 0): View {
   const phrases = resolveSpamPhrases(channel.spam_phrases);
-  const body = phrases.length
-    ? phrases.map((p, i) => `${i + 1}. ${p}`).join("\n")
+  const { kb, pageItems, totalPages, page: clampedPage } = buildPaginatedListKeyboard({
+    items: phrases,
+    page,
+    pageSize: SPAM_PHRASE_PAGE_SIZE,
+    itemLabelLength: 28,
+    deleteAction: (i, p) => `set:spd:${channel.id}:${i}:${p}`,
+    pageAction: (p) => `set:spl:${channel.id}:${p}`,
+  });
+  const body = pageItems.length
+    ? pageItems.map(({ item, index }) => `${index + 1}. ${item}`).join("\n")
     : "(список пуст — проверка ничего не ловит)";
   const text =
     `📝 Спам-фразы: ${channel.title ?? channel.telegram_chat_id}\n` +
     "Если в описании (bio) нового участника есть любая из этих фраз, бот блокирует его на 30 дней. " +
-    "Регистр и лишние пробелы не важны.\n\n" +
+    "Регистр и лишние пробелы не важны. Ограничения на количество фраз нет — список показывается страницами.\n\n" +
+    `Всего фраз: ${phrases.length}${totalPages > 1 ? `, страница ${clampedPage + 1} из ${totalPages}` : ""}\n\n` +
     `${body}\n\n` +
     `${channel.spam_phrases === null ? "Список стандартный. " : ""}` +
     "Чтобы изменить фразу — удалите её (❌) и добавьте заново.";
-  const kb = new InlineKeyboard();
-  phrases.forEach((p, i) => {
-    kb.text(`❌ ${truncateLabel(p, 28)}`, `set:spd:${channel.id}:${i}`).row();
-  });
   kb.text("➕ Добавить фразы", `set:spa:${channel.id}`)
     .row()
     .text("↩️ Сбросить к стандартным", `set:spr:${channel.id}`)
@@ -1206,9 +1457,51 @@ function buildSpamPhraseListView(channel: ChannelRow): View {
 function buildSpamAddPromptView(channelId: number): View {
   const text =
     "Отправьте фразы, которые нужно добавить, — по одной на строку.\n" +
-    `Длина фразы — от ${SPAM_PHRASE_MIN_LENGTH} до ${SPAM_PHRASE_MAX_LENGTH} символов, всего в списке не более ${MAX_SPAM_PHRASES} фраз. ` +
+    `Длина фразы — от ${SPAM_PHRASE_MIN_LENGTH} до ${SPAM_PHRASE_MAX_LENGTH} символов. Ограничения на общее количество фраз в списке нет. ` +
     "Слишком короткая фраза совпала бы с описаниями обычных людей и привела бы к ложным блокировкам.";
-  const kb = new InlineKeyboard().text("⬅ Отмена", `set:spl:${channelId}`);
+  const kb = new InlineKeyboard().text("⬅ Отмена", `set:spl:${channelId}:0`);
+  return { text, kb };
+}
+
+// ---------------------------------------------------------------------------
+// AntiLink: on/off toggle + whitelist editor
+// ---------------------------------------------------------------------------
+
+function buildAntilinkWhitelistView(channel: ChannelRow, page = 0): View {
+  const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
+  const { kb, pageItems, totalPages, page: clampedPage } = buildPaginatedListKeyboard({
+    items: whitelist,
+    page,
+    pageSize: ANTILINK_WHITELIST_PAGE_SIZE,
+    itemLabelLength: 32,
+    deleteAction: (i, p) => `set:awd:${channel.id}:${i}:${p}`,
+    pageAction: (p) => `set:awl:${channel.id}:${p}`,
+  });
+  const body = pageItems.length
+    ? pageItems.map(({ item, index }) => `${index + 1}. ${item}`).join("\n")
+    : "(белый список пуст — при включённой АнтиСсылке удаляются вообще все ссылки)";
+  const text =
+    `🔗 Белый список ссылок: ${channel.title ?? channel.telegram_chat_id}\n` +
+    `АнтиСсылка сейчас: ${channel.antilink_enabled ? "включена" : "выключена"}.\n` +
+    "Пока включена — бот удаляет из группы любое сообщение со ссылкой, чей домен не в этом списке " +
+    "(поддомены разрешённого домена тоже разрешены). Администраторов группы фильтр не проверяет.\n\n" +
+    `Всего доменов: ${whitelist.length}${totalPages > 1 ? `, страница ${clampedPage + 1} из ${totalPages}` : ""}\n\n` +
+    `${body}`;
+  kb.text("➕ Добавить домены", `set:awa:${channel.id}`)
+    .row()
+    .text("⬅ Назад", `set:mod:${channel.id}`)
+    .row()
+    .text("🏠 Меню", "set:menu");
+  return { text, kb };
+}
+
+function buildAntilinkWhitelistAddPromptView(channelId: number): View {
+  const text =
+    "Отправьте домены или ссылки, которые нужно разрешить, — по одной на строку.\n" +
+    "Например:\nyoutube.com\nhttps://vk.com/\nt.me\n\n" +
+    "Поддомены указанного домена разрешаются автоматически (youtube.com разрешит и www.youtube.com, и m.youtube.com). " +
+    "Ограничения на количество доменов в списке нет.";
+  const kb = new InlineKeyboard().text("⬅ Отмена", `set:awl:${channelId}:0`);
   return { text, kb };
 }
 
@@ -1229,12 +1522,18 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
       return;
     }
     case "wtg":
-    case "stg": {
-      const updated = await toggleChannelFlag(
-        env,
-        channel.id,
-        action === "wtg" ? "welcome_enabled" : "spam_filter_enabled",
-      );
+    case "stg":
+    case "ltg":
+    case "atg": {
+      const flag =
+        action === "wtg"
+          ? "welcome_enabled"
+          : action === "stg"
+            ? "spam_filter_enabled"
+            : action === "ltg"
+              ? "leave_enabled"
+              : "antilink_enabled";
+      const updated = await toggleChannelFlag(env, channel.id, flag);
       await editScreen(ctx, buildModerationView(updated ?? channel));
       return;
     }
@@ -1245,6 +1544,17 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
     }
     case "wrs": {
       const updated = await updateChannelWelcomeTemplate(env, channel.id, null);
+      await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+      await editScreen(ctx, buildModerationView(updated ?? channel));
+      return;
+    }
+    case "ltx": {
+      await setSession(env, ctx.dbUser.id, { step: "awaiting_leave_template", data: { channel_id: channel.id } });
+      await editScreen(ctx, buildLeavePromptView(channel.id));
+      return;
+    }
+    case "lrs": {
+      const updated = await updateChannelLeaveTemplate(env, channel.id, null);
       await setSession(env, ctx.dbUser.id, IDLE_SESSION);
       await editScreen(ctx, buildModerationView(updated ?? channel));
       return;
@@ -1262,7 +1572,7 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
     }
     case "spl": {
       await setSession(env, ctx.dbUser.id, IDLE_SESSION);
-      await editScreen(ctx, buildSpamPhraseListView(channel));
+      await editScreen(ctx, buildSpamPhraseListView(channel, Number(rest[2] ?? 0)));
       return;
     }
     case "spa": {
@@ -1273,15 +1583,35 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
     case "spd": {
       // Индекс относится к списку в момент показа экрана; если список
       // успел измениться (устаревшая кнопка), removeSpamPhraseAt вернёт null
-      // и ничего не удалится — экран просто обновится.
+      // и ничего не удалится — экран просто обновится. rest[3] несёт номер
+      // страницы, с которой была нажата кнопка удаления, чтобы после
+      // удаления остаться на той же странице, а не перескакивать на первую.
       const next = removeSpamPhraseAt(resolveSpamPhrases(channel.spam_phrases), Number(rest[2]));
       const updated = next ? await updateChannelSpamPhrases(env, channel.id, serializeSpamPhrases(next)) : channel;
-      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel));
+      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel, Number(rest[3] ?? 0)));
       return;
     }
     case "spr": {
       const updated = await updateChannelSpamPhrases(env, channel.id, null);
-      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel));
+      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel, 0));
+      return;
+    }
+    case "awl": {
+      await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+      await editScreen(ctx, buildAntilinkWhitelistView(channel, Number(rest[2] ?? 0)));
+      return;
+    }
+    case "awa": {
+      await setSession(env, ctx.dbUser.id, { step: "awaiting_antilink_whitelist", data: { channel_id: channel.id } });
+      await editScreen(ctx, buildAntilinkWhitelistAddPromptView(channel.id));
+      return;
+    }
+    case "awd": {
+      // Та же логика «устаревшей кнопки», что и у spd выше, и то же
+      // сохранение текущей страницы после удаления.
+      const next = removeWhitelistEntryAt(resolveAntilinkWhitelist(channel.antilink_whitelist), Number(rest[2]));
+      const updated = next ? await updateChannelAntilinkWhitelist(env, channel.id, serializeAntilinkWhitelist(next)) : channel;
+      await editScreen(ctx, buildAntilinkWhitelistView(updated ?? channel, Number(rest[3] ?? 0)));
       return;
     }
   }
@@ -1333,7 +1663,7 @@ async function handleWelcomeDeleteAfterInput(ctx: BotContext, env: Env, data: { 
   await ctx.reply(`✅ Время удаления приветствия обновлено.\n\n${view.text}`, { reply_markup: view.kb });
 }
 
-function describeSkipReason(reason: SpamPhraseSkipReason): string {
+function describeSpamSkipReason(reason: SpamPhraseSkipReason): string {
   switch (reason) {
     case "too_short":
       return `слишком короткая (нужно от ${SPAM_PHRASE_MIN_LENGTH} символов)`;
@@ -1341,8 +1671,15 @@ function describeSkipReason(reason: SpamPhraseSkipReason): string {
       return `слишком длинная (не больше ${SPAM_PHRASE_MAX_LENGTH} символов)`;
     case "duplicate":
       return "уже есть в списке";
-    case "limit_reached":
-      return `в списке уже максимум (${MAX_SPAM_PHRASES}) фраз`;
+  }
+}
+
+function describeWhitelistSkipReason(skip: { reason: WhitelistSkipReason; error?: string }): string {
+  switch (skip.reason) {
+    case "invalid":
+      return skip.error ?? "не похоже на домен или ссылку";
+    case "duplicate":
+      return "уже есть в списке";
   }
 }
 
@@ -1387,12 +1724,71 @@ async function handleSpamPhrasesInput(ctx: BotContext, env: Env, data: { channel
       "",
       "Пропущено:",
       ...bulletLines(
-        result.skipped.map((s) => `«${truncateLabel(s.phrase, 40)}» — ${describeSkipReason(s.reason)}`),
+        result.skipped.map((s) => `«${truncateLabel(s.phrase, 40)}» — ${describeSpamSkipReason(s.reason)}`),
       ),
     );
   }
   await ctx.reply(lines.join("\n"));
 
-  const view = buildSpamPhraseListView(updated);
+  const view = buildSpamPhraseListView(updated, 0);
+  await ctx.reply(view.text, { reply_markup: view.kb });
+}
+
+async function handleLeaveTemplateInput(ctx: BotContext, env: Env, data: { channel_id: number }): Promise<void> {
+  const raw = ctx.message?.text;
+  if (!raw) return;
+
+  const channel = await getOwnedChannel(ctx, env, data.channel_id);
+  if (!channel) {
+    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
+    return;
+  }
+
+  const checked = validateLeaveTemplate(raw);
+  if (!checked.ok) {
+    await ctx.reply(checked.error); // остаёмся в режиме ввода — можно отправить исправленный текст
+    return;
+  }
+
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+  const updated = await updateChannelLeaveTemplate(env, channel.id, checked.template);
+  const view = buildModerationView(updated ?? channel);
+  await ctx.reply(`✅ Текст уведомления о выходе обновлён.\n\n${view.text}`, { reply_markup: view.kb });
+}
+
+async function handleAntilinkWhitelistInput(ctx: BotContext, env: Env, data: { channel_id: number }): Promise<void> {
+  const raw = ctx.message?.text;
+  if (!raw || raw.trim() === "") return;
+
+  const channel = await getOwnedChannel(ctx, env, data.channel_id);
+  if (!channel) {
+    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
+    return;
+  }
+
+  const result = addWhitelistEntries(resolveAntilinkWhitelist(channel.antilink_whitelist), raw);
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+  const updated =
+    result.added.length > 0
+      ? ((await updateChannelAntilinkWhitelist(env, channel.id, serializeAntilinkWhitelist(result.whitelist))) ?? channel)
+      : channel;
+
+  // Та же причина разделения отчёта и полного списка на два отдельных
+  // сообщения, что и в handleSpamPhrasesInput выше — см. её комментарий.
+  const lines: string[] = [];
+  if (result.added.length > 0) lines.push(`✅ Добавлено доменов: ${result.added.length}`, ...bulletLines(result.added));
+  else lines.push("Ничего не добавлено.");
+  if (result.skipped.length > 0) {
+    lines.push(
+      "",
+      "Пропущено:",
+      ...bulletLines(result.skipped.map((s) => `«${truncateLabel(s.input, 40)}» — ${describeWhitelistSkipReason(s)}`)),
+    );
+  }
+  await ctx.reply(lines.join("\n"));
+
+  const view = buildAntilinkWhitelistView(updated, 0);
   await ctx.reply(view.text, { reply_markup: view.kb });
 }
