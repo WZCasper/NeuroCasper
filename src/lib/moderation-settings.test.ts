@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  DEFAULT_LEAVE_TEMPLATE,
   DEFAULT_SPAM_PHRASES,
   DEFAULT_WELCOME_TEMPLATE,
-  MAX_SPAM_PHRASES,
+  LEAVE_TEMPLATE_MAX_LENGTH,
   SPAM_PHRASE_MAX_LENGTH,
   SPAM_PHRASE_MIN_LENGTH,
   WELCOME_DELETE_AFTER_MAX_SECONDS,
@@ -12,10 +13,13 @@ import {
   formatDeleteAfter,
   normalizeSpamPhrase,
   removeSpamPhraseAt,
+  renderLeaveText,
   renderWelcomeText,
+  resolveLeaveTemplate,
   resolveSpamPhrases,
   resolveWelcomeTemplate,
   serializeSpamPhrases,
+  validateLeaveTemplate,
   validateWelcomeDeleteAfterMinutes,
   validateWelcomeTemplate,
 } from "./moderation-settings.js";
@@ -59,6 +63,54 @@ test("an unknown placeholder is left untouched rather than silently removed", ()
 });
 
 // ---------------------------------------------------------------------------
+// resolveLeaveTemplate / renderLeaveText / validateLeaveTemplate
+// ---------------------------------------------------------------------------
+
+test("null, undefined, or whitespace-only stored leave template resolves to the built-in default", () => {
+  assert.equal(resolveLeaveTemplate(null), DEFAULT_LEAVE_TEMPLATE);
+  assert.equal(resolveLeaveTemplate(undefined), DEFAULT_LEAVE_TEMPLATE);
+  assert.equal(resolveLeaveTemplate("   "), DEFAULT_LEAVE_TEMPLATE);
+});
+
+test("a real custom leave template is returned exactly as stored", () => {
+  assert.equal(resolveLeaveTemplate("Пока, {name}!"), "Пока, {name}!");
+});
+
+test("renderLeaveText substitutes every documented placeholder (no {registered}, unlike welcome)", () => {
+  const out = renderLeaveText("{name} / {username} / {chat}", {
+    name: "Иван Иванов",
+    username: "@ivan",
+    chat: "Тестовая группа",
+  });
+  assert.equal(out, "Иван Иванов / @ivan / Тестовая группа");
+});
+
+test("renderLeaveText leaves an unknown placeholder untouched rather than silently removing it", () => {
+  const out = renderLeaveText("{name} — {typo}", { name: "Иван", username: "", chat: "" });
+  assert.equal(out, "Иван — {typo}");
+});
+
+test("validateLeaveTemplate rejects an empty or whitespace-only template", () => {
+  assert.equal(validateLeaveTemplate("").ok, false);
+  assert.equal(validateLeaveTemplate("   \n  ").ok, false);
+});
+
+test("validateLeaveTemplate accepts a normal template and returns it trimmed", () => {
+  const result = validateLeaveTemplate("  Пока, {name}!  ");
+  assert.deepEqual(result, { ok: true, template: "Пока, {name}!" });
+});
+
+test("validateLeaveTemplate accepts a template exactly at the max length, rejects one character over", () => {
+  const atLimit = "a".repeat(LEAVE_TEMPLATE_MAX_LENGTH);
+  assert.equal(validateLeaveTemplate(atLimit).ok, true);
+
+  const overLimit = "a".repeat(LEAVE_TEMPLATE_MAX_LENGTH + 1);
+  const result = validateLeaveTemplate(overLimit);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.ok(result.error.includes(String(LEAVE_TEMPLATE_MAX_LENGTH)));
+});
+
+// ---------------------------------------------------------------------------
 // validateWelcomeTemplate
 // ---------------------------------------------------------------------------
 
@@ -98,6 +150,16 @@ test("lowercases, collapses internal whitespace, and trims", () => {
 test("null or undefined stored phrases resolve to the built-in default list", () => {
   assert.deepEqual(resolveSpamPhrases(null), [...DEFAULT_SPAM_PHRASES]);
   assert.deepEqual(resolveSpamPhrases(undefined), [...DEFAULT_SPAM_PHRASES]);
+});
+
+test("DEFAULT_SPAM_PHRASES has no duplicates and every phrase is already normalized and within bounds", () => {
+  assert.equal(DEFAULT_SPAM_PHRASES.length, 77);
+  assert.equal(new Set(DEFAULT_SPAM_PHRASES).size, DEFAULT_SPAM_PHRASES.length, "no duplicate phrases");
+  for (const phrase of DEFAULT_SPAM_PHRASES) {
+    assert.equal(phrase, normalizeSpamPhrase(phrase), `"${phrase}" must already be in normalized form`);
+    assert.ok(phrase.length >= SPAM_PHRASE_MIN_LENGTH, `"${phrase}" is shorter than SPAM_PHRASE_MIN_LENGTH`);
+    assert.ok(phrase.length <= SPAM_PHRASE_MAX_LENGTH, `"${phrase}" is longer than SPAM_PHRASE_MAX_LENGTH`);
+  }
 });
 
 test("a stored empty array is honored as 'no phrases', distinct from null", () => {
@@ -177,20 +239,12 @@ test("two identical phrases within the SAME input are only added once, the secon
   assert.deepEqual(result.skipped, [{ phrase: "нужна работа", reason: "duplicate" }]);
 });
 
-test("respects MAX_SPAM_PHRASES: once the list is full, further additions are skipped with limit_reached", () => {
-  const full = Array.from({ length: MAX_SPAM_PHRASES }, (_, i) => `фраза номер ${i}`);
-  const result = addSpamPhrases(full, "новая фраза сверху лимита");
-  assert.equal(result.phrases.length, MAX_SPAM_PHRASES);
-  assert.deepEqual(result.added, []);
-  assert.deepEqual(result.skipped, [{ phrase: "новая фраза сверху лимита", reason: "limit_reached" }]);
-});
-
-test("fills exactly up to MAX_SPAM_PHRASES from one batch, then skips the rest as limit_reached", () => {
-  const nearFull = Array.from({ length: MAX_SPAM_PHRASES - 1 }, (_, i) => `фраза номер ${i}`);
-  const result = addSpamPhrases(nearFull, "первая новая фраза\nвторая новая фраза");
-  assert.equal(result.phrases.length, MAX_SPAM_PHRASES);
-  assert.deepEqual(result.added, ["первая новая фраза"]);
-  assert.deepEqual(result.skipped, [{ phrase: "вторая новая фраза", reason: "limit_reached" }]);
+test("never refuses for having too many phrases (no cap -- the list screen paginates instead)", () => {
+  const many = Array.from({ length: 150 }, (_, i) => `фраза номер ${i}`);
+  const result = addSpamPhrases(many, "ещё одна новая фраза");
+  assert.equal(result.phrases.length, 151);
+  assert.deepEqual(result.added, ["ещё одна новая фраза"]);
+  assert.deepEqual(result.skipped, []);
 });
 
 // ---------------------------------------------------------------------------

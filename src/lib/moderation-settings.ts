@@ -80,17 +80,79 @@ export function validateWelcomeTemplate(input: string): WelcomeTemplateValidatio
 }
 
 // ---------------------------------------------------------------------------
+// Leave message -- the mirror of the welcome message above, for the
+// opposite event (a member leaving or being removed). Sent as a plain
+// message only (no profile photo -- there is no equivalent reason to
+// attach one for someone who just left), so it has no caption-length
+// concern the way the welcome message does; it keeps the same
+// WELCOME_TEMPLATE_MAX_LENGTH-style cap purely for a consistent editing
+// experience in /settings, not because of any Telegram API limit here.
+// ---------------------------------------------------------------------------
+
+/** Shown in the group when a member leaves or is removed, and the chat has
+ * no custom leave text. Plain text on purpose (sent without parse_mode),
+ * same reasoning as DEFAULT_WELCOME_TEMPLATE above. No {registered}
+ * placeholder here -- an approximate account-registration date isn't
+ * relevant information about someone who just left. */
+export const DEFAULT_LEAVE_TEMPLATE = "👋 {name} ({username}) покинул(а) чат «{chat}».";
+
+/** Placeholders the leave text may use. Deliberately a subset of
+ * WelcomeVars (no `registered`) rather than reusing that interface
+ * directly, so a future change to one template's placeholder set can't
+ * silently affect the other. */
+export interface LeaveVars {
+  /** First name plus last name, if any. */
+  name: string;
+  /** "@nick", or a "not set" marker when the member has none. */
+  username: string;
+  /** The chat's title. */
+  chat: string;
+}
+
+/** Upper bound for a custom leave text. Same numeric value as
+ * WELCOME_TEMPLATE_MAX_LENGTH, kept as its own named constant (rather than
+ * aliased to it) so the two can be changed independently later without
+ * one silently dragging the other along. */
+export const LEAVE_TEMPLATE_MAX_LENGTH = 900;
+
+export function resolveLeaveTemplate(stored: string | null | undefined): string {
+  return stored !== null && stored !== undefined && stored.trim() !== "" ? stored : DEFAULT_LEAVE_TEMPLATE;
+}
+
+export function renderLeaveText(template: string, vars: LeaveVars): string {
+  return renderPlaceholders(template, { ...vars });
+}
+
+export type LeaveTemplateValidation = { ok: true; template: string } | { ok: false; error: string };
+
+export function validateLeaveTemplate(input: string): LeaveTemplateValidation {
+  const template = input.trim();
+  if (template === "")
+    return { ok: false, error: "Текст не может быть пустым. Отправьте новый текст уведомления о выходе." };
+  if (template.length > LEAVE_TEMPLATE_MAX_LENGTH) {
+    return {
+      ok: false,
+      error: `Слишком длинно: ${template.length} символов, максимум ${LEAVE_TEMPLATE_MAX_LENGTH}. Сократите текст и отправьте снова.`,
+    };
+  }
+  return { ok: true, template };
+}
+
+// ---------------------------------------------------------------------------
 // Spam phrases
 // ---------------------------------------------------------------------------
 
 /** Phrases that, found in a new member's bio, mark the account as spam.
- * Deliberately narrow: they cover the two categories the bot was asked to
- * catch (soliciting loans/debts, and "need any job" touting) rather than a
- * broad keyword blocklist, because a match means an automatic 30-day ban
- * and a false positive hits a real person. Already normalized (see
+ * Covers loan/debt solicitation, "need any job" touting, and (from the
+ * second batch added below) the broader catalog of scam/get-rich-quick,
+ * fake-job, phishing, gambling and crypto-fraud bio patterns the bot was
+ * asked to recognize. A match means an automatic 30-day ban, so this is a
+ * deliberately chosen list rather than a generic keyword blocklist -- a
+ * false positive hits a real person. Already normalized (see
  * normalizeSpamPhrase). The chat's owner extends or trims this list in the
- * bot. */
+ * bot; see addSpamPhrases below for how additions are validated. */
 export const DEFAULT_SPAM_PHRASES: readonly string[] = [
+  // --- original list: loan/debt solicitation, "need any job" touting ---
   "деньги в долг",
   "дам в долг",
   "деньги под расписку",
@@ -105,15 +167,85 @@ export const DEFAULT_SPAM_PHRASES: readonly string[] = [
   "подработка для всех",
   "работа для всех",
   "работа без опыта",
+  // --- scam/get-rich-quick, fake-job, phishing, gambling, crypto-fraud ---
+  "ищу человека в команду",
+  "работа на дому от 2 до 3 часов в день",
+  "заработок без вложений",
+  "доход от",
+  "доходность от",
+  "заработок от",
+  "прибыль от",
+  "пассивный доход от",
+  "выплаты от",
+  "стабильный доход",
+  "гарантированный доход",
+  "высокий доход",
+  "ежедневный доход",
+  "доход без риска",
+  "легкий заработок для студентов и мам в декрете",
+  "ставь плюс в лс и я расскажу подробнее",
+  "подробности в закрепе",
+  "смотри описание профиля",
+  "переходи по ссылке в шапке профиля",
+  "раздача токенов",
+  "бесплатный эйрдроп",
+  "забери свой бонус по ссылке",
+  "сливаю приватную схему заработка",
+  "слив платных курсов бесплатно",
+  "точный счет на сегодняшний матч",
+  "проходимость сигналов 99%",
+  "гарантированный выигрыш в казино",
+  "взлом алгоритмов слотов",
+  "криптоарбитраж с доходностью от 20% в день",
+  "ищем тестировщиков мобильных приложений",
+  "простая работа: ставить лайки и писать отзывы",
+  "набор сотрудников на удаленку",
+  "нужны люди для приема смс и регистрации аккаунтов",
+  "вывод средств без комиссии",
+  "получи свой первый вывод уже сегодня",
+  "инвестиции под высокий процент",
+  "пассивный доход от 100% в месяц",
+  "пиши слово «работа» мне в личку",
+  "жду тебя в своем приватном канале",
+  "подпишись, чтобы не потерять",
+  "только сегодня бесплатно",
+  "осталось всего 3 места",
+  "ты еще здесь? жми на кнопку ниже",
+  "первым 10 человек дарю гайд",
+  "получи чек-лист по заработку",
+  "нужны расклейщики / курьеры (высокая оплата)",
+  "сомнительные вакансии с оплатой на карту ежедневно",
+  "нужен менеджер по работе с клиентами (без опыта)",
+  "уникальная система умножения баланса",
+  "бесплатные сигналы на фьючерсы",
+  "забери промокод на депозит",
+  "оплата сразу после выполнения задачи",
+  "срочный набор в проект",
+  "тебе пришло личное приглашение",
+  "нашел баг в системе, делюсь бесплатно",
+  "выиграй iphone за пару кликов",
+  "подтверди согласие и получи подарок",
+  "твой аккаунт выбран для участия в акции",
+  "слив инсайдерской информации",
+  "принимаем заливы на карты",
+  "работа с депозитами: умножу твой баланс в 5 раз",
+  "помогу закрыть долги и кредиты",
+  "гарантия возврата средств 100%",
 ];
 
-/** At most this many phrases per chat: every phrase is a button on the
- * list screen, and Telegram allows 100 buttons per message. */
-export const MAX_SPAM_PHRASES = 50;
 /** A phrase shorter than this would match a huge share of ordinary bios
  * ("тел", "ищу") and ban real people, so it is refused. */
 export const SPAM_PHRASE_MIN_LENGTH = 4;
 export const SPAM_PHRASE_MAX_LENGTH = 60;
+/** How many phrases buildSpamPhraseListView (src/handlers/telegram.ts)
+ * shows per page. There is deliberately no cap on the total number of
+ * phrases a chat can store (addSpamPhrases below never rejects for being
+ * "too many") -- the list screen paginates instead, which is what actually
+ * keeps it within Telegram's 100-buttons-per-message limit regardless of
+ * how large the list grows, rather than an arbitrary stored-phrase ceiling
+ * that would have had to be picked without knowing how many phrases any
+ * given chat owner actually wants. */
+export const SPAM_PHRASE_PAGE_SIZE = 20;
 
 /** Canonical form used both when storing a phrase and when matching it
  * against a bio: lowercase, runs of whitespace collapsed to one space,
@@ -141,7 +273,7 @@ export function serializeSpamPhrases(phrases: readonly string[]): string {
   return JSON.stringify(phrases);
 }
 
-export type SpamPhraseSkipReason = "too_short" | "too_long" | "duplicate" | "limit_reached";
+export type SpamPhraseSkipReason = "too_short" | "too_long" | "duplicate";
 
 export interface AddSpamPhrasesResult {
   /** The full list after adding. */
@@ -165,7 +297,6 @@ export function addSpamPhrases(current: readonly string[], rawInput: string): Ad
     if (phrase.length < SPAM_PHRASE_MIN_LENGTH) skipped.push({ phrase, reason: "too_short" });
     else if (phrase.length > SPAM_PHRASE_MAX_LENGTH) skipped.push({ phrase, reason: "too_long" });
     else if (phrases.includes(phrase)) skipped.push({ phrase, reason: "duplicate" });
-    else if (phrases.length >= MAX_SPAM_PHRASES) skipped.push({ phrase, reason: "limit_reached" });
     else {
       phrases.push(phrase);
       added.push(phrase);
