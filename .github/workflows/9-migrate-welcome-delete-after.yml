@@ -1,0 +1,78 @@
+# Run once, manually (Actions tab -> this workflow -> "Run workflow"), to
+# apply migrations/007_add_welcome_delete_after.sql to the live D1
+# database -- adds the one column that backs the configurable welcome
+# (and now also leave-announcement, see migrations/008) auto-deletion
+# delay (/settings -> chat -> «👥 Модерация группы»).
+#
+# This workflow didn't exist before migrations/008/009 were added --
+# 007 previously had to be applied by hand with `npx wrangler d1
+# execute ... --file=./migrations/007_add_welcome_delete_after.sql`. This
+# fills that gap with the same check-first approach as the other
+# N-migrate-*.yml workflows (see 7-migrate-leave-message.yml's own
+# comment on why: SQLite has no ADD COLUMN IF NOT EXISTS).
+#
+# Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repo secrets
+# (same ones the other migration workflows already use).
+#
+# Named "9-" (not "6b-" or similar) simply because 0 through 8 were
+# already taken by the time this was written -- the number here is just
+# "when this workflow was added", not the migration file number it
+# applies (006_moderation-settings.yml already set that precedent: it
+# applies migrations/005, not 006 -- see that workflow's own header).
+name: "9) Add welcome-delete-after column to D1"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether the migration is already applied
+        id: check
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --json --command "PRAGMA table_info(channels)"
+
+      - name: Decide whether to apply it
+        id: decide
+        env:
+          # command-output is wrangler-action's own documented output
+          # variable (since v3.4.0) holding the previous step's stdout as a
+          # string -- not a file path. Routed through env here (rather than
+          # interpolated directly into the script) so the JSON content is
+          # never substituted into shell syntax.
+          CHECK_OUTPUT: ${{ steps.check.outputs.command-output }}
+        run: |
+          HAS_COLUMN=$(echo "$CHECK_OUTPUT" | jq -r '.[0].results[] | select(.name == "welcome_delete_after_seconds") | .name')
+          if [ -n "$HAS_COLUMN" ]; then
+            echo "already_applied=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Already applied -- nothing to do
+        if: steps.decide.outputs.already_applied == 'true'
+        run: echo "welcome_delete_after_seconds already exists on channels -- migration 007 was already applied, skipping."
+
+      - name: Apply migrations/007_add_welcome_delete_after.sql
+        if: steps.decide.outputs.already_applied == 'false'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --file=./migrations/007_add_welcome_delete_after.sql
+
+      - name: Confirm the new column is there
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --command "PRAGMA table_info(channels)"
