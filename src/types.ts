@@ -50,6 +50,22 @@ export interface ChannelRow {
   spam_filter_enabled: number;
   /** JSON array of strings; NULL = the built-in default phrase list. */
   spam_phrases: string | null;
+  /** 1/0: announce when a member leaves/is removed from the group (see
+   * src/lib/moderation-settings.ts). */
+  leave_enabled: number;
+  /** NULL = the built-in default leave-announcement text. */
+  leave_template: string | null;
+  /** 1/0: delete any message in the group containing a link whose host
+   * isn't on antilink_whitelist (see src/lib/antilink.ts). Defaults to 0
+   * (off) -- unlike welcome/spam-filter, this deletes ordinary members'
+   * messages, which is disruptive enough that it should be an explicit
+   * opt-in rather than on by default for every existing chat. */
+  antilink_enabled: number;
+  /** JSON array of whitelisted hostnames; NULL/"[]" both mean "nothing
+   * whitelisted" (every link gets deleted while antilink_enabled is on) --
+   * there is no built-in default list the way spam_phrases has one, since
+   * which domains are legitimate is entirely chat-specific. */
+  antilink_whitelist: string | null;
   created_at: string;
 }
 
@@ -137,8 +153,10 @@ export type SessionState =
   | { step: "awaiting_link_url_edit"; data: { streamer_id: number; link_id: number } }
   | { step: "awaiting_template"; data: { channel_id: number } }
   | { step: "awaiting_welcome_template"; data: { channel_id: number } }
+  | { step: "awaiting_leave_template"; data: { channel_id: number } }
   | { step: "awaiting_welcome_delete_after"; data: { channel_id: number } }
-  | { step: "awaiting_spam_phrases"; data: { channel_id: number } };
+  | { step: "awaiting_spam_phrases"; data: { channel_id: number } }
+  | { step: "awaiting_antilink_whitelist"; data: { channel_id: number } };
 
 export const IDLE_SESSION: SessionState = { step: "idle" };
 

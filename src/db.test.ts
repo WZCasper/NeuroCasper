@@ -16,6 +16,8 @@ import {
   listDuePendingMessageDeletions,
   getOrCreateUser,
   toggleChannelFlag,
+  updateChannelAntilinkWhitelist,
+  updateChannelLeaveTemplate,
   updateChannelSpamPhrases,
   updateChannelWelcomeDeleteAfter,
   updateChannelWelcomeTemplate,
@@ -167,13 +169,23 @@ async function createTestChannel(env: Env, telegramChatId: number): Promise<Awai
   return createChannel(env, owner.id, telegramChatId, "Test Chat");
 }
 
-test("a freshly-created channel defaults to welcome and spam-filter both enabled, with no custom text", async () => {
+test("a freshly-created channel defaults to welcome, leave-announcement and spam-filter all enabled, AntiLink OFF, no custom text", async () => {
   const env = createTestEnv();
   const channel = await createTestChannel(env, -2001);
   assert.equal(channel.welcome_enabled, 1);
   assert.equal(channel.spam_filter_enabled, 1);
   assert.equal(channel.welcome_template, null);
   assert.equal(channel.spam_phrases, null);
+  // leave_enabled defaults to 1 (on), same reasoning as welcome_enabled --
+  // see that column's own comment in schema.sql.
+  assert.equal(channel.leave_enabled, 1);
+  assert.equal(channel.leave_template, null);
+  // antilink_enabled defaults to 0 (OFF), deliberately UNLIKE the three
+  // flags above -- see that column's own comment in schema.sql for why
+  // (it deletes ordinary members' own messages, so it must be an explicit
+  // opt-in rather than on by default for every existing chat).
+  assert.equal(channel.antilink_enabled, 0);
+  assert.equal(channel.antilink_whitelist, null);
 });
 
 test("getChannelByTelegramChatId finds a registered chat by its Telegram chat ID", async () => {
@@ -237,6 +249,62 @@ test("updateChannelSpamPhrases stores a custom phrase list as JSON, and null res
   const reset = await updateChannelSpamPhrases(env, channel.id, null);
   assert.ok(reset);
   assert.equal(reset.spam_phrases, null);
+});
+
+test("toggleChannelFlag flips leave_enabled independently of the other flags", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -2007);
+
+  const afterToggle = await toggleChannelFlag(env, channel.id, "leave_enabled");
+  assert.ok(afterToggle);
+  assert.equal(afterToggle.leave_enabled, 0);
+  assert.equal(afterToggle.welcome_enabled, 1); // untouched
+  assert.equal(afterToggle.spam_filter_enabled, 1); // untouched
+
+  const afterSecondToggle = await toggleChannelFlag(env, channel.id, "leave_enabled");
+  assert.ok(afterSecondToggle);
+  assert.equal(afterSecondToggle.leave_enabled, 1); // back to on
+});
+
+test("toggleChannelFlag flips antilink_enabled independently of the other flags", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -2008);
+
+  const afterToggle = await toggleChannelFlag(env, channel.id, "antilink_enabled");
+  assert.ok(afterToggle);
+  assert.equal(afterToggle.antilink_enabled, 1); // was 0 by default, now on
+  assert.equal(afterToggle.welcome_enabled, 1); // untouched
+  assert.equal(afterToggle.leave_enabled, 1); // untouched
+
+  const afterSecondToggle = await toggleChannelFlag(env, channel.id, "antilink_enabled");
+  assert.ok(afterSecondToggle);
+  assert.equal(afterSecondToggle.antilink_enabled, 0); // back to off
+});
+
+test("updateChannelLeaveTemplate stores a custom template, and null resets it back", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -2009);
+
+  const withCustom = await updateChannelLeaveTemplate(env, channel.id, "Пока, {name}!");
+  assert.ok(withCustom);
+  assert.equal(withCustom.leave_template, "Пока, {name}!");
+
+  const reset = await updateChannelLeaveTemplate(env, channel.id, null);
+  assert.ok(reset);
+  assert.equal(reset.leave_template, null);
+});
+
+test("updateChannelAntilinkWhitelist stores a custom hostname list as JSON, and null resets it back", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -2010);
+
+  const withCustom = await updateChannelAntilinkWhitelist(env, channel.id, JSON.stringify(["youtube.com", "vk.com"]));
+  assert.ok(withCustom);
+  assert.equal(withCustom.antilink_whitelist, '["youtube.com","vk.com"]');
+
+  const reset = await updateChannelAntilinkWhitelist(env, channel.id, null);
+  assert.ok(reset);
+  assert.equal(reset.antilink_whitelist, null);
 });
 
 // ---------------------------------------------------------------------------

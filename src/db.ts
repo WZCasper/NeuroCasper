@@ -182,11 +182,45 @@ export async function updateChannelSpamPhrases(
   return getChannelById(env, channelId);
 }
 
+/** Sets the chat's custom leave-announcement text (shown when a member
+ * leaves/is removed); null goes back to the built-in default. Mirrors
+ * updateChannelWelcomeTemplate above for the opposite event. Returns the
+ * updated row. */
+export async function updateChannelLeaveTemplate(
+  env: Env,
+  channelId: number,
+  template: string | null,
+): Promise<ChannelRow | null> {
+  await env.DB.prepare("UPDATE channels SET leave_template = ? WHERE id = ?").bind(template, channelId).run();
+  return getChannelById(env, channelId);
+}
+
+/** Sets the chat's AntiLink whitelist (a JSON array of hostnames, see
+ * serializeAntilinkWhitelist in src/lib/antilink.ts); null/empty-array
+ * behave the same way spam_phrases' "[]" does -- see that column's own
+ * comment in schema.sql. Returns the updated row. */
+export async function updateChannelAntilinkWhitelist(
+  env: Env,
+  channelId: number,
+  whitelistJson: string | null,
+): Promise<ChannelRow | null> {
+  await env.DB.prepare("UPDATE channels SET antilink_whitelist = ? WHERE id = ?")
+    .bind(whitelistJson, channelId)
+    .run();
+  return getChannelById(env, channelId);
+}
+
 export async function updateExtraLinkUrl(env: Env, linkId: number, url: string): Promise<void> {
   await env.DB.prepare("UPDATE extra_links SET url = ? WHERE id = ?").bind(url, linkId).run();
 }
 
-export type ChannelFlag = "auto_pin" | "auto_unpin" | "welcome_enabled" | "spam_filter_enabled";
+export type ChannelFlag =
+  | "auto_pin"
+  | "auto_unpin"
+  | "welcome_enabled"
+  | "spam_filter_enabled"
+  | "leave_enabled"
+  | "antilink_enabled";
 
 // Literal SQL per flag rather than interpolating the column name into the
 // query string — `flag` is always a hardcoded literal from the call sites
@@ -197,6 +231,8 @@ const TOGGLE_CHANNEL_FLAG_SQL: Record<ChannelFlag, string> = {
   auto_unpin: "UPDATE channels SET auto_unpin = 1 - auto_unpin WHERE id = ?",
   welcome_enabled: "UPDATE channels SET welcome_enabled = 1 - welcome_enabled WHERE id = ?",
   spam_filter_enabled: "UPDATE channels SET spam_filter_enabled = 1 - spam_filter_enabled WHERE id = ?",
+  leave_enabled: "UPDATE channels SET leave_enabled = 1 - leave_enabled WHERE id = ?",
+  antilink_enabled: "UPDATE channels SET antilink_enabled = 1 - antilink_enabled WHERE id = ?",
 };
 
 export async function toggleChannelFlag(env: Env, channelId: number, flag: ChannelFlag): Promise<ChannelRow | null> {
