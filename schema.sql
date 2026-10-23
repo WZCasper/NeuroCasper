@@ -58,6 +58,26 @@ CREATE TABLE channels (
   welcome_delete_after_seconds  INTEGER NOT NULL DEFAULT 600,
   spam_filter_enabled  INTEGER NOT NULL DEFAULT 1,
   spam_phrases         TEXT,
+  -- Announce when a member leaves/is removed from the group (the mirror of
+  -- welcome_enabled/welcome_template above, for the opposite event). NULL
+  -- template means "use the built-in default". See
+  -- migrations/008_add_leave_message.sql; shares
+  -- welcome_delete_after_seconds for auto-deletion rather than having its
+  -- own separate delay -- one delay setting for both join/leave
+  -- notifications is simpler and matches what was actually asked for.
+  leave_enabled        INTEGER NOT NULL DEFAULT 1,
+  leave_template       TEXT,
+  -- AntiLink: delete any group message whose link isn't on the whitelist
+  -- below (see src/lib/antilink.ts). migrations/009_add_antilink.sql.
+  -- Default 0 (OFF): unlike welcome/spam_filter, this deletes ordinary
+  -- members' own messages, so every existing chat should keep its current
+  -- behavior until the owner deliberately turns it on in /settings, rather
+  -- than suddenly having links disappear the moment this ships.
+  antilink_enabled     INTEGER NOT NULL DEFAULT 0,
+  -- JSON array of whitelisted hostnames. NULL/"[]" both mean nothing is
+  -- whitelisted -- there's no built-in default here (unlike spam_phrases),
+  -- since which domains are legitimate is entirely chat-specific.
+  antilink_whitelist   TEXT,
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(owner_user_id, telegram_chat_id)
 );

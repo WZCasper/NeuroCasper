@@ -1,0 +1,1347 @@
+diff --git a/README.md b/README.md
+index 5a9f981..416cd90 100644
+--- a/README.md
++++ b/README.md
+@@ -199,20 +199,36 @@ GitHub тоже). Обновлённый `allowed_updates` в этом файл
+ ### 4. Миграции для уже работающей базы
+ 
+ Для **нового** деплоя ничего дополнительно делать не нужно — `schema.sql`
+-уже содержит все таблицы и столбцы, включая систему жалоб и настройки
+-модерации. Для **уже развёрнутого** бота, где база создавалась раньше —
+-примените файлы из `migrations/` по номеру, каждый ровно один раз:
++уже содержит все таблицы и столбцы, включая систему жалоб, настройки
++модерации, уведомление о выходе участника и АнтиСсылку. Для **уже
++развёрнутого** бота, где база создавалась раньше, — примените файлы из
++`migrations/` по номеру, каждый ровно один раз:
+ 
+ ```
+ npx wrangler d1 execute neurocasper-db --remote --file=./migrations/004_add_user_reports.sql
+ npx wrangler d1 execute neurocasper-db --remote --file=./migrations/005_add_moderation_settings.sql
++npx wrangler d1 execute neurocasper-db --remote --file=./migrations/007_add_welcome_delete_after.sql
++npx wrangler d1 execute neurocasper-db --remote --file=./migrations/008_add_leave_message.sql
++npx wrangler d1 execute neurocasper-db --remote --file=./migrations/009_add_antilink.sql
+ ```
+ 
+-(сначала без `--remote` — против локальной базы; `005` использует
++(сначала без `--remote` — против локальной базы; каждая из них использует
+ `ALTER TABLE ADD COLUMN`, у SQLite нет `IF NOT EXISTS` для колонок, так что
+-повторный запуск упадёт с «duplicate column name» — это безопасно, значит
+-уже применено). Более ранние `migrations/001`–`003`, если ещё не
+-применялись, — по тому же принципу и в том же порядке.
++повторный запуск любой из них упадёт с «duplicate column name» — это
++безопасно, значит уже применено). Более ранние `migrations/001`–`003`,
++если ещё не применялись, — по тому же принципу и в том же порядке. Номера
++файлов в `migrations/` не идут подряд без пропусков (нет `006` — это не
++ошибка, просто такой файл никогда не создавался).
++
++Для `005`, `007`, `008` и `009` то же самое можно сделать без терминала,
++прямо со страницы Actions в GitHub (вкладка **Actions** → нужный workflow
++→ **Run workflow**): `6-migrate-moderation-settings.yml` (несмотря на
++номер в своём названии, применяет именно `005_add_moderation_settings.sql`
++— номер в имени workflow-файла отражает порядок их создания, а не номер
++файла миграции, который он запускает), `9-migrate-welcome-delete-after.yml`,
++`7-migrate-leave-message.yml` и `8-migrate-antilink.yml`. Все они сами
++проверяют, применена ли уже соответствующая миграция, и ничего не ломают
++при повторном запуске.
+ 
+ ## Известные ограничения (важно прочитать)
+ 
+@@ -288,7 +304,8 @@ npx wrangler d1 execute neurocasper-db --remote --file=./migrations/005_add_mode
+   и независимым сторонним SDK (см. комментарий в `src/lib/kick.ts`), не
+   вызван по-настоящему. Реальные вызовы Telegram Bot API (`src/bot.ts` и
+   весь `src/handlers/telegram.ts` — отправка сообщений, работа с
+-  клавиатурами, `/report`, приветствие, блокировка участника) и запросы к
++  клавиатурами, `/report`, приветствие и уведомление о выходе участника,
++  блокировка участника, удаление сообщения по АнтиСсылке) и запросы к
+   YouTube/TikTok (`src/lib/youtube.ts`, `src/lib/tiktok.ts`) тестами не
+   покрыты вообще — первое реальное использование после деплоя остаётся
+   первой настоящей проверкой для них. Против реальной локальной D1 (через
+@@ -299,7 +316,12 @@ npx wrangler d1 execute neurocasper-db --remote --file=./migrations/005_add_mode
+   групп считаются верно — и для настроек модерации на чат — переключатели,
+   свой текст приветствия и свой список спам-фраз действительно сохраняются
+   и читаются по столбцам `channels` из `migrations/005`, с возвратом к
+-  стандартным значениям при сбросе. Оценка даты регистрации по ID аккаунта
++  стандартным значениям при сбросе; так же точно проверены (реальная
++  локальная D1, не имитация) и новые столбцы `migrations/008` (текст
++  уведомления о выходе) и `migrations/009` (АнтиСсылка: переключатель и
++  белый список доменов) — переключение, сохранение своего текста/списка,
++  сброс и значения по умолчанию для свежесозданного чата. Оценка даты
++  регистрации по ID аккаунта
+   (Bot API не отдаёт её никак) сверена с независимым пересчётом по тому же
+   открытому набору калибровочных точек и тому же алгоритму, на которых она
+   основана (`src/lib/registration-date-estimate.ts`), но остаётся именно
+@@ -332,6 +354,43 @@ npx wrangler d1 execute neurocasper-db --remote --file=./migrations/005_add_mode
+   `/settings` → «Управлять стримерами» не нажимались настоящими пальцами в
+   настоящем Telegram — при первом использовании стоит внимательно
+   проверить, что тексты и кнопки выглядят так, как ожидается.
++- **Уведомление о выходе участника, спам-фразы без ограничения по
++  количеству и АнтиСсылка** — три функции, добавленные позже остального
++  (`migrations/008` и `migrations/009`), той же рабочей средой без
++  доступа к `api.telegram.org` (см. пункт выше), поэтому тот же вопрос
++  «первое реальное использование после деплоя — первая настоящая
++  проверка» относится и к ним:
++  - **Уведомление о выходе** — та же точка Bot API (`chat_member`), что
++    уже используется для приветствия, просто для противоположного
++    перехода статуса (`isMemberStatus` переходит из «был участником» в
++    «не стал»); сам переход и текст с подстановками проверены юнит- и
++    интеграционными тестами, отправка реального сообщения в реальную
++    группу — нет.
++  - **Список спам-фраз без лимита** — экран теперь листается страницами
++    по 20 фраз вместо одного списка кнопок (так в принципе устроены
++    инлайн-клавиатуры Telegram: у них жёсткий предел в 100 кнопок на
++    сообщение, который без пагинации был бы легко превышен при большом
++    списке). Пагинация и сами фразы по умолчанию (теперь их 77 —
++    добавлены все переданные при доработке, поверх уже бывших в боте)
++    проверены юнит-тестами; как именно выглядит и листается сам экран в
++    настоящем Telegram — нет.
++  - **АнтиСсылка** — удаляет сообщение в группе, если найденная в нём
++    ссылка (включая скрытую за другим текстом — `text_link` в терминах
++    Bot API) не совпадает ни с одним доменом из белого списка этого чата;
++    администраторов группы (включая её создателя) не проверяет. Вся
++    логика поиска ссылок и сравнения с белым списком (`src/lib/
++    antilink.ts`) — чистые функции, без обращения к сети — покрыта
++    юнит-тестами отдельно от Telegram. Не проверено на живых данных: как
++    Telegram на самом деле размечает `entities`/`caption_entities` для
++    разных реальных способов вставить ссылку (обычный текст, ссылка под
++    другим текстом, пересланное сообщение, сообщение с фото и подписью) —
++    тесты используют вручную собранные объекты той же формы, что
++    документирует Bot API, а не настоящие апдейты от Telegram; удаление
++    чужого сообщения (`deleteMessage`) и проверка прав отправителя
++    (`getChatMember`) самой сетью тоже не вызывались ни разу. При первом
++    включении в настоящей группе стоит сначала добавить в белый список
++    всё нужное и последить за логами воркера, прежде чем полагаться на
++    автоматическое удаление без присмотра.
+ 
+ ## Использование бота
+ 
+diff --git a/schema.sql b/schema.sql
+index b242157..a66f3f5 100644
+--- a/schema.sql
++++ b/schema.sql
+@@ -58,6 +58,26 @@ CREATE TABLE channels (
+   welcome_delete_after_seconds  INTEGER NOT NULL DEFAULT 600,
+   spam_filter_enabled  INTEGER NOT NULL DEFAULT 1,
+   spam_phrases         TEXT,
++  -- Announce when a member leaves/is removed from the group (the mirror of
++  -- welcome_enabled/welcome_template above, for the opposite event). NULL
++  -- template means "use the built-in default". See
++  -- migrations/008_add_leave_message.sql; shares
++  -- welcome_delete_after_seconds for auto-deletion rather than having its
++  -- own separate delay -- one delay setting for both join/leave
++  -- notifications is simpler and matches what was actually asked for.
++  leave_enabled        INTEGER NOT NULL DEFAULT 1,
++  leave_template       TEXT,
++  -- AntiLink: delete any group message whose link isn't on the whitelist
++  -- below (see src/lib/antilink.ts). migrations/009_add_antilink.sql.
++  -- Default 0 (OFF): unlike welcome/spam_filter, this deletes ordinary
++  -- members' own messages, so every existing chat should keep its current
++  -- behavior until the owner deliberately turns it on in /settings, rather
++  -- than suddenly having links disappear the moment this ships.
++  antilink_enabled     INTEGER NOT NULL DEFAULT 0,
++  -- JSON array of whitelisted hostnames. NULL/"[]" both mean nothing is
++  -- whitelisted -- there's no built-in default here (unlike spam_phrases),
++  -- since which domains are legitimate is entirely chat-specific.
++  antilink_whitelist   TEXT,
+   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+   UNIQUE(owner_user_id, telegram_chat_id)
+ );
+diff --git a/src/db.test.ts b/src/db.test.ts
+index f701a40..3164628 100644
+--- a/src/db.test.ts
++++ b/src/db.test.ts
+@@ -16,6 +16,8 @@ import {
+   listDuePendingMessageDeletions,
+   getOrCreateUser,
+   toggleChannelFlag,
++  updateChannelAntilinkWhitelist,
++  updateChannelLeaveTemplate,
+   updateChannelSpamPhrases,
+   updateChannelWelcomeDeleteAfter,
+   updateChannelWelcomeTemplate,
+@@ -167,13 +169,23 @@ async function createTestChannel(env: Env, telegramChatId: number): Promise<Awai
+   return createChannel(env, owner.id, telegramChatId, "Test Chat");
+ }
+ 
+-test("a freshly-created channel defaults to welcome and spam-filter both enabled, with no custom text", async () => {
++test("a freshly-created channel defaults to welcome, leave-announcement and spam-filter all enabled, AntiLink OFF, no custom text", async () => {
+   const env = createTestEnv();
+   const channel = await createTestChannel(env, -2001);
+   assert.equal(channel.welcome_enabled, 1);
+   assert.equal(channel.spam_filter_enabled, 1);
+   assert.equal(channel.welcome_template, null);
+   assert.equal(channel.spam_phrases, null);
++  // leave_enabled defaults to 1 (on), same reasoning as welcome_enabled --
++  // see that column's own comment in schema.sql.
++  assert.equal(channel.leave_enabled, 1);
++  assert.equal(channel.leave_template, null);
++  // antilink_enabled defaults to 0 (OFF), deliberately UNLIKE the three
++  // flags above -- see that column's own comment in schema.sql for why
++  // (it deletes ordinary members' own messages, so it must be an explicit
++  // opt-in rather than on by default for every existing chat).
++  assert.equal(channel.antilink_enabled, 0);
++  assert.equal(channel.antilink_whitelist, null);
+ });
+ 
+ test("getChannelByTelegramChatId finds a registered chat by its Telegram chat ID", async () => {
+@@ -239,6 +251,62 @@ test("updateChannelSpamPhrases stores a custom phrase list as JSON, and null res
+   assert.equal(reset.spam_phrases, null);
+ });
+ 
++test("toggleChannelFlag flips leave_enabled independently of the other flags", async () => {
++  const env = createTestEnv();
++  const channel = await createTestChannel(env, -2007);
++
++  const afterToggle = await toggleChannelFlag(env, channel.id, "leave_enabled");
++  assert.ok(afterToggle);
++  assert.equal(afterToggle.leave_enabled, 0);
++  assert.equal(afterToggle.welcome_enabled, 1); // untouched
++  assert.equal(afterToggle.spam_filter_enabled, 1); // untouched
++
++  const afterSecondToggle = await toggleChannelFlag(env, channel.id, "leave_enabled");
++  assert.ok(afterSecondToggle);
++  assert.equal(afterSecondToggle.leave_enabled, 1); // back to on
++});
++
++test("toggleChannelFlag flips antilink_enabled independently of the other flags", async () => {
++  const env = createTestEnv();
++  const channel = await createTestChannel(env, -2008);
++
++  const afterToggle = await toggleChannelFlag(env, channel.id, "antilink_enabled");
++  assert.ok(afterToggle);
++  assert.equal(afterToggle.antilink_enabled, 1); // was 0 by default, now on
++  assert.equal(afterToggle.welcome_enabled, 1); // untouched
++  assert.equal(afterToggle.leave_enabled, 1); // untouched
++
++  const afterSecondToggle = await toggleChannelFlag(env, channel.id, "antilink_enabled");
++  assert.ok(afterSecondToggle);
++  assert.equal(afterSecondToggle.antilink_enabled, 0); // back to off
++});
++
++test("updateChannelLeaveTemplate stores a custom template, and null resets it back", async () => {
++  const env = createTestEnv();
++  const channel = await createTestChannel(env, -2009);
++
++  const withCustom = await updateChannelLeaveTemplate(env, channel.id, "Пока, {name}!");
++  assert.ok(withCustom);
++  assert.equal(withCustom.leave_template, "Пока, {name}!");
++
++  const reset = await updateChannelLeaveTemplate(env, channel.id, null);
++  assert.ok(reset);
++  assert.equal(reset.leave_template, null);
++});
++
++test("updateChannelAntilinkWhitelist stores a custom hostname list as JSON, and null resets it back", async () => {
++  const env = createTestEnv();
++  const channel = await createTestChannel(env, -2010);
++
++  const withCustom = await updateChannelAntilinkWhitelist(env, channel.id, JSON.stringify(["youtube.com", "vk.com"]));
++  assert.ok(withCustom);
++  assert.equal(withCustom.antilink_whitelist, '["youtube.com","vk.com"]');
++
++  const reset = await updateChannelAntilinkWhitelist(env, channel.id, null);
++  assert.ok(reset);
++  assert.equal(reset.antilink_whitelist, null);
++});
++
+ // ---------------------------------------------------------------------------
+ // createPostWithPlatform -- the fix for the orphaned-open-post incident
+ // described on the function itself (src/db.ts). The rollback test is the one
+diff --git a/src/db.ts b/src/db.ts
+index f26459b..9f98a62 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -182,11 +182,45 @@ export async function updateChannelSpamPhrases(
+   return getChannelById(env, channelId);
+ }
+ 
++/** Sets the chat's custom leave-announcement text (shown when a member
++ * leaves/is removed); null goes back to the built-in default. Mirrors
++ * updateChannelWelcomeTemplate above for the opposite event. Returns the
++ * updated row. */
++export async function updateChannelLeaveTemplate(
++  env: Env,
++  channelId: number,
++  template: string | null,
++): Promise<ChannelRow | null> {
++  await env.DB.prepare("UPDATE channels SET leave_template = ? WHERE id = ?").bind(template, channelId).run();
++  return getChannelById(env, channelId);
++}
++
++/** Sets the chat's AntiLink whitelist (a JSON array of hostnames, see
++ * serializeAntilinkWhitelist in src/lib/antilink.ts); null/empty-array
++ * behave the same way spam_phrases' "[]" does -- see that column's own
++ * comment in schema.sql. Returns the updated row. */
++export async function updateChannelAntilinkWhitelist(
++  env: Env,
++  channelId: number,
++  whitelistJson: string | null,
++): Promise<ChannelRow | null> {
++  await env.DB.prepare("UPDATE channels SET antilink_whitelist = ? WHERE id = ?")
++    .bind(whitelistJson, channelId)
++    .run();
++  return getChannelById(env, channelId);
++}
++
+ export async function updateExtraLinkUrl(env: Env, linkId: number, url: string): Promise<void> {
+   await env.DB.prepare("UPDATE extra_links SET url = ? WHERE id = ?").bind(url, linkId).run();
+ }
+ 
+-export type ChannelFlag = "auto_pin" | "auto_unpin" | "welcome_enabled" | "spam_filter_enabled";
++export type ChannelFlag =
++  | "auto_pin"
++  | "auto_unpin"
++  | "welcome_enabled"
++  | "spam_filter_enabled"
++  | "leave_enabled"
++  | "antilink_enabled";
+ 
+ // Literal SQL per flag rather than interpolating the column name into the
+ // query string — `flag` is always a hardcoded literal from the call sites
+@@ -197,6 +231,8 @@ const TOGGLE_CHANNEL_FLAG_SQL: Record<ChannelFlag, string> = {
+   auto_unpin: "UPDATE channels SET auto_unpin = 1 - auto_unpin WHERE id = ?",
+   welcome_enabled: "UPDATE channels SET welcome_enabled = 1 - welcome_enabled WHERE id = ?",
+   spam_filter_enabled: "UPDATE channels SET spam_filter_enabled = 1 - spam_filter_enabled WHERE id = ?",
++  leave_enabled: "UPDATE channels SET leave_enabled = 1 - leave_enabled WHERE id = ?",
++  antilink_enabled: "UPDATE channels SET antilink_enabled = 1 - antilink_enabled WHERE id = ?",
+ };
+ 
+ export async function toggleChannelFlag(env: Env, channelId: number, flag: ChannelFlag): Promise<ChannelRow | null> {
+diff --git a/src/handlers/telegram.ts b/src/handlers/telegram.ts
+index 7cc98d4..13c6424 100644
+--- a/src/handlers/telegram.ts
++++ b/src/handlers/telegram.ts
+@@ -1,4 +1,5 @@
+ import { Bot, Context, GrammyError, InlineKeyboard } from "grammy";
++import type { Message } from "grammy/types";
+ import {
+   countDistinctReportingChats,
+   createChannel,
+@@ -20,6 +21,8 @@ import {
+   listStreamersByChannel,
+   setSession,
+   toggleChannelFlag,
++  updateChannelAntilinkWhitelist,
++  updateChannelLeaveTemplate,
+   updateChannelSpamPhrases,
+   updateChannelTemplate,
+   updateChannelWelcomeDeleteAfter,
+@@ -28,24 +31,38 @@ import {
+ } from "../db.js";
+ import { bioLooksLikeSpam, escapeHtml, isMemberStatus } from "../lib/chat-membership.js";
+ import {
++  DEFAULT_LEAVE_TEMPLATE,
+   DEFAULT_WELCOME_DELETE_AFTER_SECONDS,
+   DEFAULT_WELCOME_TEMPLATE,
+-  MAX_SPAM_PHRASES,
++  LEAVE_TEMPLATE_MAX_LENGTH,
+   SPAM_PHRASE_MAX_LENGTH,
+   SPAM_PHRASE_MIN_LENGTH,
++  SPAM_PHRASE_PAGE_SIZE,
+   TELEGRAM_CAPTION_LIMIT,
+   WELCOME_TEMPLATE_MAX_LENGTH,
+   addSpamPhrases,
+   formatDeleteAfter,
+   removeSpamPhraseAt,
++  renderLeaveText,
+   renderWelcomeText,
++  resolveLeaveTemplate,
+   resolveSpamPhrases,
+   resolveWelcomeTemplate,
+   serializeSpamPhrases,
++  validateLeaveTemplate,
+   validateWelcomeDeleteAfterMinutes,
+   validateWelcomeTemplate,
+   type SpamPhraseSkipReason,
+ } from "../lib/moderation-settings.js";
++import {
++  ANTILINK_WHITELIST_PAGE_SIZE,
++  addWhitelistEntries,
++  messageHasDisallowedLink,
++  removeWhitelistEntryAt,
++  resolveAntilinkWhitelist,
++  serializeAntilinkWhitelist,
++  type WhitelistSkipReason,
++} from "../lib/antilink.js";
+ import { estimateRegistrationDate, formatApproximateRegistrationDate } from "../lib/registration-date-estimate.js";
+ import { buildAuthorizationUrl, generatePkcePair } from "../lib/kick.js";
+ import { DEFAULT_TEMPLATE } from "../lib/message-templates.js";
+@@ -174,9 +191,17 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
+     }
+   });
+ 
+-  // Catch-all for private-chat messages: forwarded channel posts (channel
+-  // registration) and free-text replies for the multi-step flows above.
++  // Catch-all for every incoming message: private-chat messages (forwarded
++  // channel posts for registration, free-text replies for the multi-step
++  // flows below) and, separately, group/supergroup messages (AntiLink).
++  // Channel posts are a different Bot API update type (channel_post,
++  // which this bot doesn't subscribe to), so they never reach this
++  // handler at all -- nothing here applies to channels.
+   bot.on("message", async (ctx) => {
++    if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
++      await handleGroupMessage(ctx, env);
++      return;
++    }
+     if (ctx.chat.type !== "private") return;
+ 
+     if (ctx.message.forward_origin?.type === "channel") {
+@@ -201,12 +226,74 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
+       await handleWelcomeTemplateInput(ctx, env, session.data);
+     } else if (session.step === "awaiting_welcome_delete_after") {
+       await handleWelcomeDeleteAfterInput(ctx, env, session.data);
++    } else if (session.step === "awaiting_leave_template") {
++      await handleLeaveTemplateInput(ctx, env, session.data);
+     } else if (session.step === "awaiting_spam_phrases") {
+       await handleSpamPhrasesInput(ctx, env, session.data);
++    } else if (session.step === "awaiting_antilink_whitelist") {
++      await handleAntilinkWhitelistInput(ctx, env, session.data);
+     }
+   });
+ }
+ 
++// ---------------------------------------------------------------------------
++// AntiLink: проверяет каждое обычное сообщение в группе/супергруппе, пока
++// antilink_enabled включён у этого чата, и удаляет его, если там есть хотя
++// бы одна ссылка не из белого списка (см. src/lib/antilink.ts — там же
++// вся логика извлечения ссылок и сравнения с белым списком).
++// ---------------------------------------------------------------------------
++
++/** Админы и создатель группы не фильтруются -- иначе сам владелец или
++ * любой назначенный им админ не смог бы отправить в своей же группе ни
++ * одной ссылки, не добавив предварительно её домен в белый список. Это
++ * не настраиваемая опция: освобождение администраторов от такого фильтра
++ * — почти универсально ожидаемое поведение для подобных ботов, отдельный
++ * тумблер на этот счёт не запрашивался. */
++async function isExemptFromAntilink(ctx: BotContext, chatId: number, userId: number): Promise<boolean> {
++  const member = await ctx.api.getChatMember(chatId, userId).catch((err) => {
++    console.error(`getChatMember failed while checking AntiLink exemption for user ${userId} in chat ${chatId}:`, err);
++    return null;
++  });
++  // Fails OPEN on purpose, the same reasoning as the report/bio-spam ban
++  // check in handleMemberJoined above: if the status check itself fails
++  // (a transient API error), wrongly deleting a real administrator's
++  // message is worse than occasionally missing one spam link while the
++  // API is having trouble -- and the next offending message from a
++  // genuine non-admin still gets caught normally.
++  if (!member) return true;
++  return member.status === "creator" || member.status === "administrator";
++}
++
++async function handleGroupMessage(ctx: BotContext, env: Env): Promise<void> {
++  const chat = ctx.chat;
++  const message = ctx.message;
++  // bot.on("message", ...) в registerHandlers всегда даёт контекст с
++  // chat/message — тот же случай, что и в handleReportCommand выше:
++  // BotContext сам по себе типизирует их как опциональные.
++  if (!chat || !message) return;
++  if (chat.type !== "group" && chat.type !== "supergroup") return;
++  if (!ctx.from || ctx.from.is_bot) return; // ничьи сообщения от ботов (включая сервисные) не трогаем
++
++  const channel = await getChannelByTelegramChatId(env, chat.id).catch((err) => {
++    console.error(`getChannelByTelegramChatId failed for chat ${chat.id} while checking AntiLink:`, err);
++    return null;
++  });
++  // В отличие от welcome/spam_filter, у antilink_enabled нет предположения
++  // "включено, пока не зарегистрировано иначе" — он выключен по умолчанию
++  // (см. комментарий у channels.antilink_enabled в schema.sql), так что
++  // незарегистрированный чат (channel === null) просто ничего не фильтрует.
++  if (!channel || !channel.antilink_enabled) return;
++
++  const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
++  if (!messageHasDisallowedLink(message, whitelist)) return;
++
++  if (await isExemptFromAntilink(ctx, chat.id, ctx.from.id)) return;
++
++  await ctx.api.deleteMessage(chat.id, message.message_id).catch((err) => {
++    console.error(`deleteMessage (AntiLink) failed for message ${message.message_id} in chat ${chat.id}:`, err);
++  });
++}
++
+ // ---------------------------------------------------------------------------
+ // Присутствие бота в группе/канале: добавление (с проверкой, что добавил
+ // админ), исключение (полная очистка настроек этого чата), назначение
+@@ -394,16 +481,35 @@ async function handleChatMemberUpdate(ctx: BotContext, env: Env): Promise<void>
+   const update = ctx.chatMember;
+   if (!update) return;
+   const chat = update.chat;
+-  // Только группы/супергруппы — у каналов нет привычного «участника
+-  // вступил», а сам bot.on("chat_member") в принципе не срабатывает для
+-  // private-чатов (см. официальную документацию Update.chat_member).
++  // Только группы/супергруппы — у каналов нет привычного «участник
++  // вступил»/«вышел», а сам bot.on("chat_member") в принципе не
++  // срабатывает для private-чатов (см. официальную документацию
++  // Update.chat_member).
+   if (chat.type !== "group" && chat.type !== "supergroup") return;
+ 
+   const wasMember = isMemberStatus(update.old_chat_member);
+   const isNowMember = isMemberStatus(update.new_chat_member);
+-  if (wasMember || !isNowMember) return; // интересует только «вступил впервые»
+ 
+-  const newMember = update.new_chat_member.user;
++  // Ровно два интересующих перехода: «не был участником -> стал» (вступил
++  // впервые) и «был участником -> перестал» (вышел сам или был исключён
++  // администратором — ChatMemberUpdated не различает эти два случая
++  // отдельным полем, оба дают статус "left"/"kicked" у new_chat_member, и
++  // объявление о выходе одинаково уместно в обоих случаях). Любой другой
++  // переход (например, «участник» -> «администратор», или повторная
++  // проверка статуса без реального изменения) этот бот не обрабатывает.
++  if (!wasMember && isNowMember) {
++    await handleMemberJoined(ctx, env, chat, update.new_chat_member.user);
++  } else if (wasMember && !isNowMember) {
++    await handleMemberLeft(ctx, env, chat, update.new_chat_member.user);
++  }
++}
++
++async function handleMemberJoined(
++  ctx: BotContext,
++  env: Env,
++  chat: { id: number; type: "group" | "supergroup"; title: string },
++  newMember: NonNullable<BotContext["chatMember"]>["new_chat_member"]["user"],
++): Promise<void> {
+   if (newMember.is_bot) return; // приветствуем людей, не сервисных ботов (включая самого себя)
+ 
+   // Настройки этого чата, если его кто-то зарегистрировал через /add_channel
+@@ -509,6 +615,58 @@ async function handleChatMemberUpdate(ctx: BotContext, env: Env): Promise<void>
+   }
+ }
+ 
++/** Mirror of handleMemberJoined above, for the opposite transition: a
++ * member left on their own, or was removed by an administrator (both give
++ * the same "left"/"kicked" new_chat_member.status, and ChatMemberUpdated
++ * carries no separate field distinguishing the two — see the comment in
++ * handleChatMemberUpdate above). No bio/report ban checks here: those only
++ * make sense when someone is trying to get IN, not on the way out. Sent as
++ * a plain message with no profile-photo attachment, unlike the welcome
++ * message -- there's no equivalent reason to attach one for someone who
++ * just left, so it also has no TELEGRAM_CAPTION_LIMIT concern the welcome
++ * path has to work around. */
++async function handleMemberLeft(
++  ctx: BotContext,
++  env: Env,
++  chat: { id: number; type: "group" | "supergroup"; title: string },
++  leftMember: NonNullable<BotContext["chatMember"]>["new_chat_member"]["user"],
++): Promise<void> {
++  if (leftMember.is_bot) return; // не объявляем о «выходе» сервисных ботов (включая самого себя)
++
++  const channel = await getChannelByTelegramChatId(env, chat.id).catch((err) => {
++    console.error(`getChannelByTelegramChatId failed for chat ${chat.id}, using default moderation settings:`, err);
++    return null;
++  });
++  const leaveEnabled = channel ? Boolean(channel.leave_enabled) : true;
++  if (!leaveEnabled) return;
++
++  const fullName = leftMember.last_name ? `${leftMember.first_name} ${leftMember.last_name}` : leftMember.first_name;
++  const text = renderLeaveText(resolveLeaveTemplate(channel?.leave_template), {
++    name: fullName,
++    username: leftMember.username ? `@${leftMember.username}` : "— не указан",
++    chat: chat.title,
++  });
++
++  // Обычный текст без parse_mode — по той же причине, что и у приветствия
++  // выше: владелец чата может написать в тексте что угодно, включая «<»
++  // и «&», и это не превратится в разметку.
++  const sentMessage = await ctx.api.sendMessage(chat.id, text).catch((err) => {
++    console.error(`sendMessage (leave) failed in chat ${chat.id}:`, err);
++    return null;
++  });
++
++  // Та же очередь автоудаления и та же задержка, что и у приветствия выше
++  // -- одна общая настройка «через сколько удалять» на оба вида
++  // сообщений, а не отдельная задержка на каждое, см. комментарий у
++  // channels.leave_enabled в schema.sql.
++  const deleteAfterSeconds = channel?.welcome_delete_after_seconds ?? DEFAULT_WELCOME_DELETE_AFTER_SECONDS;
++  if (sentMessage && deleteAfterSeconds > 0) {
++    await createPendingMessageDeletion(env, chat.id, sentMessage.message_id, deleteAfterSeconds).catch((err) =>
++      console.error(`createPendingMessageDeletion failed for message ${sentMessage.message_id} in chat ${chat.id}:`, err),
++    );
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // Регистрация канала через пересланный пост (для broadcast-каналов)
+ // ---------------------------------------------------------------------------
+@@ -1088,7 +1246,26 @@ async function handleTemplateInput(ctx: BotContext, env: Env, data: { channel_id
+ // группы».
+ // ---------------------------------------------------------------------------
+ 
+-const MODERATION_ACTIONS = new Set(["mod", "wtg", "wtx", "wrs", "wdt", "wdr", "stg", "spl", "spa", "spd", "spr"]);
++const MODERATION_ACTIONS = new Set([
++  "mod",
++  "wtg",
++  "wtx",
++  "wrs",
++  "wdt",
++  "wdr",
++  "stg",
++  "spl",
++  "spa",
++  "spd",
++  "spr",
++  "ltg", // leave-announcement: on/off
++  "ltx", // leave-announcement: edit text
++  "lrs", // leave-announcement: reset text to default
++  "atg", // AntiLink: on/off
++  "awl", // AntiLink whitelist: list (paginated)
++  "awa", // AntiLink whitelist: add prompt
++  "awd", // AntiLink whitelist: delete one entry
++]);
+ 
+ interface View {
+   text: string;
+@@ -1122,25 +1299,39 @@ async function editScreen(ctx: BotContext, view: View): Promise<void> {
+ 
+ function buildModerationView(channel: ChannelRow): View {
+   const phrases = resolveSpamPhrases(channel.spam_phrases);
++  const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
+   const text =
+     `👥 Модерация: ${channel.title ?? channel.telegram_chat_id}\n` +
+     "Работает в группах, где бот — администратор (в каналах не применяется).\n\n" +
+     `Приветствие новых участников: ${channel.welcome_enabled ? "вкл" : "выкл"}\n` +
+-    `Удаление приветствия через: ${formatDeleteAfter(channel.welcome_delete_after_seconds)}\n` +
++    `Уведомление о выходе участника: ${channel.leave_enabled ? "вкл" : "выкл"}\n` +
++    `Удаление приветствия/уведомления о выходе через: ${formatDeleteAfter(channel.welcome_delete_after_seconds)}\n` +
+     `Проверка описания профиля на спам: ${channel.spam_filter_enabled ? "вкл" : "выкл"} ` +
+-    `(фраз в списке: ${phrases.length}; при совпадении — блокировка на 30 дней)\n\n` +
++    `(фраз в списке: ${phrases.length}; при совпадении — блокировка на 30 дней)\n` +
++    `АнтиСсылка: ${channel.antilink_enabled ? "вкл" : "выкл"} ` +
++    `(в белом списке: ${whitelist.length} доменов; админы группы не фильтруются)\n\n` +
+     `Текст приветствия (${channel.welcome_template ? "свой" : "стандартный"}):\n` +
+-    resolveWelcomeTemplate(channel.welcome_template);
++    `${resolveWelcomeTemplate(channel.welcome_template)}\n\n` +
++    `Текст уведомления о выходе (${channel.leave_template ? "свой" : "стандартный"}):\n` +
++    resolveLeaveTemplate(channel.leave_template);
+   const kb = new InlineKeyboard()
+     .text(channel.welcome_enabled ? "Выключить приветствие" : "Включить приветствие", `set:wtg:${channel.id}`)
+     .row()
+     .text("✏️ Изменить текст приветствия", `set:wtx:${channel.id}`)
+     .row()
+-    .text("⏱ Время удаления приветствия", `set:wdt:${channel.id}`)
++    .text("⏱ Время удаления приветствия/выхода", `set:wdt:${channel.id}`)
++    .row()
++    .text(channel.leave_enabled ? "Выключить уведомление о выходе" : "Включить уведомление о выходе", `set:ltg:${channel.id}`)
++    .row()
++    .text("✏️ Изменить текст уведомления о выходе", `set:ltx:${channel.id}`)
+     .row()
+     .text(channel.spam_filter_enabled ? "Выключить проверку спама" : "Включить проверку спама", `set:stg:${channel.id}`)
+     .row()
+-    .text(`📝 Спам-фразы (${phrases.length})`, `set:spl:${channel.id}`)
++    .text(`📝 Спам-фразы (${phrases.length})`, `set:spl:${channel.id}:0`)
++    .row()
++    .text(channel.antilink_enabled ? "Выключить АнтиСсылку" : "Включить АнтиСсылку", `set:atg:${channel.id}`)
++    .row()
++    .text(`🔗 Белый список ссылок (${whitelist.length})`, `set:awl:${channel.id}:0`)
+     .row()
+     .text("⬅ Назад", `set:ch:${channel.id}`)
+     .row()
+@@ -1165,9 +1356,25 @@ function buildWelcomePromptView(channelId: number): View {
+   return { text, kb };
+ }
+ 
++function buildLeavePromptView(channelId: number): View {
++  const text =
++    `Отправьте новый текст уведомления о выходе участника (обычный текст, до ${LEAVE_TEMPLATE_MAX_LENGTH} символов).\n\n` +
++    "Показывается и когда участник вышел сам, и когда его исключил администратор.\n\n" +
++    "Подстановки:\n" +
++    "{name} — имя и фамилия\n" +
++    "{username} — ник (@...)\n" +
++    "{chat} — название группы\n\n" +
++    `Стандартный текст:\n${DEFAULT_LEAVE_TEMPLATE}`;
++  const kb = new InlineKeyboard()
++    .text("↩️ Вернуть стандартный текст", `set:lrs:${channelId}`)
++    .row()
++    .text("⬅ Отмена", `set:mod:${channelId}`);
++  return { text, kb };
++}
++
+ function buildWelcomeDeletePromptView(channelId: number, currentSeconds: number): View {
+   const text =
+-    "Через сколько минут после отправки удалять приветствие из группы?\n\n" +
++    "Через сколько минут после отправки удалять приветствие/уведомление о выходе из группы?\n\n" +
+     `Сейчас: ${formatDeleteAfter(currentSeconds)}.\n` +
+     "Отправьте число минут (например, 10). 0 — не удалять вообще. Максимум — 1440 (24 часа).";
+   const kb = new InlineKeyboard()
+@@ -1177,22 +1384,66 @@ function buildWelcomeDeletePromptView(channelId: number, currentSeconds: number)
+   return { text, kb };
+ }
+ 
+-function buildSpamPhraseListView(channel: ChannelRow): View {
++/** One page of a flat, numbered, by-position list with a ❌-delete button
++ * per item plus Prev/Next navigation — the shared rendering shape behind
++ * both buildSpamPhraseListView and buildAntilinkWhitelistView below, so
++ * the two stay visually and behaviorally consistent rather than drifting
++ * apart as separate copies. `page` is clamped into range here (not by the
++ * caller) so a stale "next page" button pressed after items were removed
++ * can never point past the end. */
++function buildPaginatedListKeyboard(params: {
++  items: readonly string[];
++  page: number;
++  pageSize: number;
++  itemLabelLength: number;
++  /** `page` here is the final, already-clamped page being shown — so the
++   * delete button's callback_data carries back the page the owner was
++   * actually looking at, and removing an item keeps them on the same
++   * page afterward instead of jumping back to page 1. */
++  deleteAction: (index: number, page: number) => string;
++  pageAction: (page: number) => string;
++}): { kb: InlineKeyboard; page: number; totalPages: number; pageItems: Array<{ item: string; index: number }> } {
++  const totalPages = Math.max(1, Math.ceil(params.items.length / params.pageSize));
++  const page = Math.min(Math.max(0, params.page), totalPages - 1);
++  const start = page * params.pageSize;
++  const pageItems = params.items
++    .slice(start, start + params.pageSize)
++    .map((item, i) => ({ item, index: start + i }));
++
++  const kb = new InlineKeyboard();
++  pageItems.forEach(({ item, index }) => {
++    kb.text(`❌ ${truncateLabel(item, params.itemLabelLength)}`, params.deleteAction(index, page)).row();
++  });
++  if (totalPages > 1) {
++    if (page > 0) kb.text("⬅️ Пред.", params.pageAction(page - 1));
++    kb.text(`${page + 1}/${totalPages}`, params.pageAction(page)); // неактивная кнопка-индикатор
++    if (page < totalPages - 1) kb.text("След. ➡️", params.pageAction(page + 1));
++    kb.row();
++  }
++  return { kb, page, totalPages, pageItems };
++}
++
++function buildSpamPhraseListView(channel: ChannelRow, page = 0): View {
+   const phrases = resolveSpamPhrases(channel.spam_phrases);
+-  const body = phrases.length
+-    ? phrases.map((p, i) => `${i + 1}. ${p}`).join("\n")
++  const { kb, pageItems, totalPages, page: clampedPage } = buildPaginatedListKeyboard({
++    items: phrases,
++    page,
++    pageSize: SPAM_PHRASE_PAGE_SIZE,
++    itemLabelLength: 28,
++    deleteAction: (i, p) => `set:spd:${channel.id}:${i}:${p}`,
++    pageAction: (p) => `set:spl:${channel.id}:${p}`,
++  });
++  const body = pageItems.length
++    ? pageItems.map(({ item, index }) => `${index + 1}. ${item}`).join("\n")
+     : "(список пуст — проверка ничего не ловит)";
+   const text =
+     `📝 Спам-фразы: ${channel.title ?? channel.telegram_chat_id}\n` +
+     "Если в описании (bio) нового участника есть любая из этих фраз, бот блокирует его на 30 дней. " +
+-    "Регистр и лишние пробелы не важны.\n\n" +
++    "Регистр и лишние пробелы не важны. Ограничения на количество фраз нет — список показывается страницами.\n\n" +
++    `Всего фраз: ${phrases.length}${totalPages > 1 ? `, страница ${clampedPage + 1} из ${totalPages}` : ""}\n\n` +
+     `${body}\n\n` +
+     `${channel.spam_phrases === null ? "Список стандартный. " : ""}` +
+     "Чтобы изменить фразу — удалите её (❌) и добавьте заново.";
+-  const kb = new InlineKeyboard();
+-  phrases.forEach((p, i) => {
+-    kb.text(`❌ ${truncateLabel(p, 28)}`, `set:spd:${channel.id}:${i}`).row();
+-  });
+   kb.text("➕ Добавить фразы", `set:spa:${channel.id}`)
+     .row()
+     .text("↩️ Сбросить к стандартным", `set:spr:${channel.id}`)
+@@ -1206,9 +1457,51 @@ function buildSpamPhraseListView(channel: ChannelRow): View {
+ function buildSpamAddPromptView(channelId: number): View {
+   const text =
+     "Отправьте фразы, которые нужно добавить, — по одной на строку.\n" +
+-    `Длина фразы — от ${SPAM_PHRASE_MIN_LENGTH} до ${SPAM_PHRASE_MAX_LENGTH} символов, всего в списке не более ${MAX_SPAM_PHRASES} фраз. ` +
++    `Длина фразы — от ${SPAM_PHRASE_MIN_LENGTH} до ${SPAM_PHRASE_MAX_LENGTH} символов. Ограничения на общее количество фраз в списке нет. ` +
+     "Слишком короткая фраза совпала бы с описаниями обычных людей и привела бы к ложным блокировкам.";
+-  const kb = new InlineKeyboard().text("⬅ Отмена", `set:spl:${channelId}`);
++  const kb = new InlineKeyboard().text("⬅ Отмена", `set:spl:${channelId}:0`);
++  return { text, kb };
++}
++
++// ---------------------------------------------------------------------------
++// AntiLink: on/off toggle + whitelist editor
++// ---------------------------------------------------------------------------
++
++function buildAntilinkWhitelistView(channel: ChannelRow, page = 0): View {
++  const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
++  const { kb, pageItems, totalPages, page: clampedPage } = buildPaginatedListKeyboard({
++    items: whitelist,
++    page,
++    pageSize: ANTILINK_WHITELIST_PAGE_SIZE,
++    itemLabelLength: 32,
++    deleteAction: (i, p) => `set:awd:${channel.id}:${i}:${p}`,
++    pageAction: (p) => `set:awl:${channel.id}:${p}`,
++  });
++  const body = pageItems.length
++    ? pageItems.map(({ item, index }) => `${index + 1}. ${item}`).join("\n")
++    : "(белый список пуст — при включённой АнтиСсылке удаляются вообще все ссылки)";
++  const text =
++    `🔗 Белый список ссылок: ${channel.title ?? channel.telegram_chat_id}\n` +
++    `АнтиСсылка сейчас: ${channel.antilink_enabled ? "включена" : "выключена"}.\n` +
++    "Пока включена — бот удаляет из группы любое сообщение со ссылкой, чей домен не в этом списке " +
++    "(поддомены разрешённого домена тоже разрешены). Администраторов группы фильтр не проверяет.\n\n" +
++    `Всего доменов: ${whitelist.length}${totalPages > 1 ? `, страница ${clampedPage + 1} из ${totalPages}` : ""}\n\n` +
++    `${body}`;
++  kb.text("➕ Добавить домены", `set:awa:${channel.id}`)
++    .row()
++    .text("⬅ Назад", `set:mod:${channel.id}`)
++    .row()
++    .text("🏠 Меню", "set:menu");
++  return { text, kb };
++}
++
++function buildAntilinkWhitelistAddPromptView(channelId: number): View {
++  const text =
++    "Отправьте домены или ссылки, которые нужно разрешить, — по одной на строку.\n" +
++    "Например:\nyoutube.com\nhttps://vk.com/\nt.me\n\n" +
++    "Поддомены указанного домена разрешаются автоматически (youtube.com разрешит и www.youtube.com, и m.youtube.com). " +
++    "Ограничения на количество доменов в списке нет.";
++  const kb = new InlineKeyboard().text("⬅ Отмена", `set:awl:${channelId}:0`);
+   return { text, kb };
+ }
+ 
+@@ -1229,12 +1522,18 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
+       return;
+     }
+     case "wtg":
+-    case "stg": {
+-      const updated = await toggleChannelFlag(
+-        env,
+-        channel.id,
+-        action === "wtg" ? "welcome_enabled" : "spam_filter_enabled",
+-      );
++    case "stg":
++    case "ltg":
++    case "atg": {
++      const flag =
++        action === "wtg"
++          ? "welcome_enabled"
++          : action === "stg"
++            ? "spam_filter_enabled"
++            : action === "ltg"
++              ? "leave_enabled"
++              : "antilink_enabled";
++      const updated = await toggleChannelFlag(env, channel.id, flag);
+       await editScreen(ctx, buildModerationView(updated ?? channel));
+       return;
+     }
+@@ -1249,6 +1548,17 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
+       await editScreen(ctx, buildModerationView(updated ?? channel));
+       return;
+     }
++    case "ltx": {
++      await setSession(env, ctx.dbUser.id, { step: "awaiting_leave_template", data: { channel_id: channel.id } });
++      await editScreen(ctx, buildLeavePromptView(channel.id));
++      return;
++    }
++    case "lrs": {
++      const updated = await updateChannelLeaveTemplate(env, channel.id, null);
++      await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++      await editScreen(ctx, buildModerationView(updated ?? channel));
++      return;
++    }
+     case "wdt": {
+       await setSession(env, ctx.dbUser.id, { step: "awaiting_welcome_delete_after", data: { channel_id: channel.id } });
+       await editScreen(ctx, buildWelcomeDeletePromptView(channel.id, channel.welcome_delete_after_seconds));
+@@ -1262,7 +1572,7 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
+     }
+     case "spl": {
+       await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+-      await editScreen(ctx, buildSpamPhraseListView(channel));
++      await editScreen(ctx, buildSpamPhraseListView(channel, Number(rest[2] ?? 0)));
+       return;
+     }
+     case "spa": {
+@@ -1273,15 +1583,35 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
+     case "spd": {
+       // Индекс относится к списку в момент показа экрана; если список
+       // успел измениться (устаревшая кнопка), removeSpamPhraseAt вернёт null
+-      // и ничего не удалится — экран просто обновится.
++      // и ничего не удалится — экран просто обновится. rest[3] несёт номер
++      // страницы, с которой была нажата кнопка удаления, чтобы после
++      // удаления остаться на той же странице, а не перескакивать на первую.
+       const next = removeSpamPhraseAt(resolveSpamPhrases(channel.spam_phrases), Number(rest[2]));
+       const updated = next ? await updateChannelSpamPhrases(env, channel.id, serializeSpamPhrases(next)) : channel;
+-      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel));
++      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel, Number(rest[3] ?? 0)));
+       return;
+     }
+     case "spr": {
+       const updated = await updateChannelSpamPhrases(env, channel.id, null);
+-      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel));
++      await editScreen(ctx, buildSpamPhraseListView(updated ?? channel, 0));
++      return;
++    }
++    case "awl": {
++      await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++      await editScreen(ctx, buildAntilinkWhitelistView(channel, Number(rest[2] ?? 0)));
++      return;
++    }
++    case "awa": {
++      await setSession(env, ctx.dbUser.id, { step: "awaiting_antilink_whitelist", data: { channel_id: channel.id } });
++      await editScreen(ctx, buildAntilinkWhitelistAddPromptView(channel.id));
++      return;
++    }
++    case "awd": {
++      // Та же логика «устаревшей кнопки», что и у spd выше, и то же
++      // сохранение текущей страницы после удаления.
++      const next = removeWhitelistEntryAt(resolveAntilinkWhitelist(channel.antilink_whitelist), Number(rest[2]));
++      const updated = next ? await updateChannelAntilinkWhitelist(env, channel.id, serializeAntilinkWhitelist(next)) : channel;
++      await editScreen(ctx, buildAntilinkWhitelistView(updated ?? channel, Number(rest[3] ?? 0)));
+       return;
+     }
+   }
+@@ -1333,7 +1663,7 @@ async function handleWelcomeDeleteAfterInput(ctx: BotContext, env: Env, data: {
+   await ctx.reply(`✅ Время удаления приветствия обновлено.\n\n${view.text}`, { reply_markup: view.kb });
+ }
+ 
+-function describeSkipReason(reason: SpamPhraseSkipReason): string {
++function describeSpamSkipReason(reason: SpamPhraseSkipReason): string {
+   switch (reason) {
+     case "too_short":
+       return `слишком короткая (нужно от ${SPAM_PHRASE_MIN_LENGTH} символов)`;
+@@ -1341,8 +1671,15 @@ function describeSkipReason(reason: SpamPhraseSkipReason): string {
+       return `слишком длинная (не больше ${SPAM_PHRASE_MAX_LENGTH} символов)`;
+     case "duplicate":
+       return "уже есть в списке";
+-    case "limit_reached":
+-      return `в списке уже максимум (${MAX_SPAM_PHRASES}) фраз`;
++  }
++}
++
++function describeWhitelistSkipReason(skip: { reason: WhitelistSkipReason; error?: string }): string {
++  switch (skip.reason) {
++    case "invalid":
++      return skip.error ?? "не похоже на домен или ссылку";
++    case "duplicate":
++      return "уже есть в списке";
+   }
+ }
+ 
+@@ -1387,12 +1724,71 @@ async function handleSpamPhrasesInput(ctx: BotContext, env: Env, data: { channel
+       "",
+       "Пропущено:",
+       ...bulletLines(
+-        result.skipped.map((s) => `«${truncateLabel(s.phrase, 40)}» — ${describeSkipReason(s.reason)}`),
++        result.skipped.map((s) => `«${truncateLabel(s.phrase, 40)}» — ${describeSpamSkipReason(s.reason)}`),
+       ),
+     );
+   }
+   await ctx.reply(lines.join("\n"));
+ 
+-  const view = buildSpamPhraseListView(updated);
++  const view = buildSpamPhraseListView(updated, 0);
++  await ctx.reply(view.text, { reply_markup: view.kb });
++}
++
++async function handleLeaveTemplateInput(ctx: BotContext, env: Env, data: { channel_id: number }): Promise<void> {
++  const raw = ctx.message?.text;
++  if (!raw) return;
++
++  const channel = await getOwnedChannel(ctx, env, data.channel_id);
++  if (!channel) {
++    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
++    return;
++  }
++
++  const checked = validateLeaveTemplate(raw);
++  if (!checked.ok) {
++    await ctx.reply(checked.error); // остаёмся в режиме ввода — можно отправить исправленный текст
++    return;
++  }
++
++  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++  const updated = await updateChannelLeaveTemplate(env, channel.id, checked.template);
++  const view = buildModerationView(updated ?? channel);
++  await ctx.reply(`✅ Текст уведомления о выходе обновлён.\n\n${view.text}`, { reply_markup: view.kb });
++}
++
++async function handleAntilinkWhitelistInput(ctx: BotContext, env: Env, data: { channel_id: number }): Promise<void> {
++  const raw = ctx.message?.text;
++  if (!raw || raw.trim() === "") return;
++
++  const channel = await getOwnedChannel(ctx, env, data.channel_id);
++  if (!channel) {
++    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
++    return;
++  }
++
++  const result = addWhitelistEntries(resolveAntilinkWhitelist(channel.antilink_whitelist), raw);
++  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
++  const updated =
++    result.added.length > 0
++      ? ((await updateChannelAntilinkWhitelist(env, channel.id, serializeAntilinkWhitelist(result.whitelist))) ?? channel)
++      : channel;
++
++  // Та же причина разделения отчёта и полного списка на два отдельных
++  // сообщения, что и в handleSpamPhrasesInput выше — см. её комментарий.
++  const lines: string[] = [];
++  if (result.added.length > 0) lines.push(`✅ Добавлено доменов: ${result.added.length}`, ...bulletLines(result.added));
++  else lines.push("Ничего не добавлено.");
++  if (result.skipped.length > 0) {
++    lines.push(
++      "",
++      "Пропущено:",
++      ...bulletLines(result.skipped.map((s) => `«${truncateLabel(s.input, 40)}» — ${describeWhitelistSkipReason(s)}`)),
++    );
++  }
++  await ctx.reply(lines.join("\n"));
++
++  const view = buildAntilinkWhitelistView(updated, 0);
+   await ctx.reply(view.text, { reply_markup: view.kb });
+ }
+diff --git a/src/lib/moderation-settings.test.ts b/src/lib/moderation-settings.test.ts
+index 8b103dd..934f7e7 100644
+--- a/src/lib/moderation-settings.test.ts
++++ b/src/lib/moderation-settings.test.ts
+@@ -1,9 +1,10 @@
+ import { test } from "node:test";
+ import assert from "node:assert/strict";
+ import {
++  DEFAULT_LEAVE_TEMPLATE,
+   DEFAULT_SPAM_PHRASES,
+   DEFAULT_WELCOME_TEMPLATE,
+-  MAX_SPAM_PHRASES,
++  LEAVE_TEMPLATE_MAX_LENGTH,
+   SPAM_PHRASE_MAX_LENGTH,
+   SPAM_PHRASE_MIN_LENGTH,
+   WELCOME_DELETE_AFTER_MAX_SECONDS,
+@@ -12,10 +13,13 @@ import {
+   formatDeleteAfter,
+   normalizeSpamPhrase,
+   removeSpamPhraseAt,
++  renderLeaveText,
+   renderWelcomeText,
++  resolveLeaveTemplate,
+   resolveSpamPhrases,
+   resolveWelcomeTemplate,
+   serializeSpamPhrases,
++  validateLeaveTemplate,
+   validateWelcomeDeleteAfterMinutes,
+   validateWelcomeTemplate,
+ } from "./moderation-settings.js";
+@@ -58,6 +62,54 @@ test("an unknown placeholder is left untouched rather than silently removed", ()
+   assert.equal(out, "Иван — {typo}");
+ });
+ 
++// ---------------------------------------------------------------------------
++// resolveLeaveTemplate / renderLeaveText / validateLeaveTemplate
++// ---------------------------------------------------------------------------
++
++test("null, undefined, or whitespace-only stored leave template resolves to the built-in default", () => {
++  assert.equal(resolveLeaveTemplate(null), DEFAULT_LEAVE_TEMPLATE);
++  assert.equal(resolveLeaveTemplate(undefined), DEFAULT_LEAVE_TEMPLATE);
++  assert.equal(resolveLeaveTemplate("   "), DEFAULT_LEAVE_TEMPLATE);
++});
++
++test("a real custom leave template is returned exactly as stored", () => {
++  assert.equal(resolveLeaveTemplate("Пока, {name}!"), "Пока, {name}!");
++});
++
++test("renderLeaveText substitutes every documented placeholder (no {registered}, unlike welcome)", () => {
++  const out = renderLeaveText("{name} / {username} / {chat}", {
++    name: "Иван Иванов",
++    username: "@ivan",
++    chat: "Тестовая группа",
++  });
++  assert.equal(out, "Иван Иванов / @ivan / Тестовая группа");
++});
++
++test("renderLeaveText leaves an unknown placeholder untouched rather than silently removing it", () => {
++  const out = renderLeaveText("{name} — {typo}", { name: "Иван", username: "", chat: "" });
++  assert.equal(out, "Иван — {typo}");
++});
++
++test("validateLeaveTemplate rejects an empty or whitespace-only template", () => {
++  assert.equal(validateLeaveTemplate("").ok, false);
++  assert.equal(validateLeaveTemplate("   \n  ").ok, false);
++});
++
++test("validateLeaveTemplate accepts a normal template and returns it trimmed", () => {
++  const result = validateLeaveTemplate("  Пока, {name}!  ");
++  assert.deepEqual(result, { ok: true, template: "Пока, {name}!" });
++});
++
++test("validateLeaveTemplate accepts a template exactly at the max length, rejects one character over", () => {
++  const atLimit = "a".repeat(LEAVE_TEMPLATE_MAX_LENGTH);
++  assert.equal(validateLeaveTemplate(atLimit).ok, true);
++
++  const overLimit = "a".repeat(LEAVE_TEMPLATE_MAX_LENGTH + 1);
++  const result = validateLeaveTemplate(overLimit);
++  assert.equal(result.ok, false);
++  if (!result.ok) assert.ok(result.error.includes(String(LEAVE_TEMPLATE_MAX_LENGTH)));
++});
++
+ // ---------------------------------------------------------------------------
+ // validateWelcomeTemplate
+ // ---------------------------------------------------------------------------
+@@ -100,6 +152,16 @@ test("null or undefined stored phrases resolve to the built-in default list", ()
+   assert.deepEqual(resolveSpamPhrases(undefined), [...DEFAULT_SPAM_PHRASES]);
+ });
+ 
++test("DEFAULT_SPAM_PHRASES has no duplicates and every phrase is already normalized and within bounds", () => {
++  assert.equal(DEFAULT_SPAM_PHRASES.length, 77);
++  assert.equal(new Set(DEFAULT_SPAM_PHRASES).size, DEFAULT_SPAM_PHRASES.length, "no duplicate phrases");
++  for (const phrase of DEFAULT_SPAM_PHRASES) {
++    assert.equal(phrase, normalizeSpamPhrase(phrase), `"${phrase}" must already be in normalized form`);
++    assert.ok(phrase.length >= SPAM_PHRASE_MIN_LENGTH, `"${phrase}" is shorter than SPAM_PHRASE_MIN_LENGTH`);
++    assert.ok(phrase.length <= SPAM_PHRASE_MAX_LENGTH, `"${phrase}" is longer than SPAM_PHRASE_MAX_LENGTH`);
++  }
++});
++
+ test("a stored empty array is honored as 'no phrases', distinct from null", () => {
+   assert.deepEqual(resolveSpamPhrases("[]"), []);
+ });
+@@ -177,20 +239,12 @@ test("two identical phrases within the SAME input are only added once, the secon
+   assert.deepEqual(result.skipped, [{ phrase: "нужна работа", reason: "duplicate" }]);
+ });
+ 
+-test("respects MAX_SPAM_PHRASES: once the list is full, further additions are skipped with limit_reached", () => {
+-  const full = Array.from({ length: MAX_SPAM_PHRASES }, (_, i) => `фраза номер ${i}`);
+-  const result = addSpamPhrases(full, "новая фраза сверху лимита");
+-  assert.equal(result.phrases.length, MAX_SPAM_PHRASES);
+-  assert.deepEqual(result.added, []);
+-  assert.deepEqual(result.skipped, [{ phrase: "новая фраза сверху лимита", reason: "limit_reached" }]);
+-});
+-
+-test("fills exactly up to MAX_SPAM_PHRASES from one batch, then skips the rest as limit_reached", () => {
+-  const nearFull = Array.from({ length: MAX_SPAM_PHRASES - 1 }, (_, i) => `фраза номер ${i}`);
+-  const result = addSpamPhrases(nearFull, "первая новая фраза\nвторая новая фраза");
+-  assert.equal(result.phrases.length, MAX_SPAM_PHRASES);
+-  assert.deepEqual(result.added, ["первая новая фраза"]);
+-  assert.deepEqual(result.skipped, [{ phrase: "вторая новая фраза", reason: "limit_reached" }]);
++test("never refuses for having too many phrases (no cap -- the list screen paginates instead)", () => {
++  const many = Array.from({ length: 150 }, (_, i) => `фраза номер ${i}`);
++  const result = addSpamPhrases(many, "ещё одна новая фраза");
++  assert.equal(result.phrases.length, 151);
++  assert.deepEqual(result.added, ["ещё одна новая фраза"]);
++  assert.deepEqual(result.skipped, []);
+ });
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src/lib/moderation-settings.ts b/src/lib/moderation-settings.ts
+index 49dc24d..341fa08 100644
+--- a/src/lib/moderation-settings.ts
++++ b/src/lib/moderation-settings.ts
+@@ -79,18 +79,80 @@ export function validateWelcomeTemplate(input: string): WelcomeTemplateValidatio
+   return { ok: true, template };
+ }
+ 
++// ---------------------------------------------------------------------------
++// Leave message -- the mirror of the welcome message above, for the
++// opposite event (a member leaving or being removed). Sent as a plain
++// message only (no profile photo -- there is no equivalent reason to
++// attach one for someone who just left), so it has no caption-length
++// concern the way the welcome message does; it keeps the same
++// WELCOME_TEMPLATE_MAX_LENGTH-style cap purely for a consistent editing
++// experience in /settings, not because of any Telegram API limit here.
++// ---------------------------------------------------------------------------
++
++/** Shown in the group when a member leaves or is removed, and the chat has
++ * no custom leave text. Plain text on purpose (sent without parse_mode),
++ * same reasoning as DEFAULT_WELCOME_TEMPLATE above. No {registered}
++ * placeholder here -- an approximate account-registration date isn't
++ * relevant information about someone who just left. */
++export const DEFAULT_LEAVE_TEMPLATE = "👋 {name} ({username}) покинул(а) чат «{chat}».";
++
++/** Placeholders the leave text may use. Deliberately a subset of
++ * WelcomeVars (no `registered`) rather than reusing that interface
++ * directly, so a future change to one template's placeholder set can't
++ * silently affect the other. */
++export interface LeaveVars {
++  /** First name plus last name, if any. */
++  name: string;
++  /** "@nick", or a "not set" marker when the member has none. */
++  username: string;
++  /** The chat's title. */
++  chat: string;
++}
++
++/** Upper bound for a custom leave text. Same numeric value as
++ * WELCOME_TEMPLATE_MAX_LENGTH, kept as its own named constant (rather than
++ * aliased to it) so the two can be changed independently later without
++ * one silently dragging the other along. */
++export const LEAVE_TEMPLATE_MAX_LENGTH = 900;
++
++export function resolveLeaveTemplate(stored: string | null | undefined): string {
++  return stored !== null && stored !== undefined && stored.trim() !== "" ? stored : DEFAULT_LEAVE_TEMPLATE;
++}
++
++export function renderLeaveText(template: string, vars: LeaveVars): string {
++  return renderPlaceholders(template, { ...vars });
++}
++
++export type LeaveTemplateValidation = { ok: true; template: string } | { ok: false; error: string };
++
++export function validateLeaveTemplate(input: string): LeaveTemplateValidation {
++  const template = input.trim();
++  if (template === "")
++    return { ok: false, error: "Текст не может быть пустым. Отправьте новый текст уведомления о выходе." };
++  if (template.length > LEAVE_TEMPLATE_MAX_LENGTH) {
++    return {
++      ok: false,
++      error: `Слишком длинно: ${template.length} символов, максимум ${LEAVE_TEMPLATE_MAX_LENGTH}. Сократите текст и отправьте снова.`,
++    };
++  }
++  return { ok: true, template };
++}
++
+ // ---------------------------------------------------------------------------
+ // Spam phrases
+ // ---------------------------------------------------------------------------
+ 
+ /** Phrases that, found in a new member's bio, mark the account as spam.
+- * Deliberately narrow: they cover the two categories the bot was asked to
+- * catch (soliciting loans/debts, and "need any job" touting) rather than a
+- * broad keyword blocklist, because a match means an automatic 30-day ban
+- * and a false positive hits a real person. Already normalized (see
++ * Covers loan/debt solicitation, "need any job" touting, and (from the
++ * second batch added below) the broader catalog of scam/get-rich-quick,
++ * fake-job, phishing, gambling and crypto-fraud bio patterns the bot was
++ * asked to recognize. A match means an automatic 30-day ban, so this is a
++ * deliberately chosen list rather than a generic keyword blocklist -- a
++ * false positive hits a real person. Already normalized (see
+  * normalizeSpamPhrase). The chat's owner extends or trims this list in the
+- * bot. */
++ * bot; see addSpamPhrases below for how additions are validated. */
+ export const DEFAULT_SPAM_PHRASES: readonly string[] = [
++  // --- original list: loan/debt solicitation, "need any job" touting ---
+   "деньги в долг",
+   "дам в долг",
+   "деньги под расписку",
+@@ -105,15 +167,85 @@ export const DEFAULT_SPAM_PHRASES: readonly string[] = [
+   "подработка для всех",
+   "работа для всех",
+   "работа без опыта",
++  // --- scam/get-rich-quick, fake-job, phishing, gambling, crypto-fraud ---
++  "ищу человека в команду",
++  "работа на дому от 2 до 3 часов в день",
++  "заработок без вложений",
++  "доход от",
++  "доходность от",
++  "заработок от",
++  "прибыль от",
++  "пассивный доход от",
++  "выплаты от",
++  "стабильный доход",
++  "гарантированный доход",
++  "высокий доход",
++  "ежедневный доход",
++  "доход без риска",
++  "легкий заработок для студентов и мам в декрете",
++  "ставь плюс в лс и я расскажу подробнее",
++  "подробности в закрепе",
++  "смотри описание профиля",
++  "переходи по ссылке в шапке профиля",
++  "раздача токенов",
++  "бесплатный эйрдроп",
++  "забери свой бонус по ссылке",
++  "сливаю приватную схему заработка",
++  "слив платных курсов бесплатно",
++  "точный счет на сегодняшний матч",
++  "проходимость сигналов 99%",
++  "гарантированный выигрыш в казино",
++  "взлом алгоритмов слотов",
++  "криптоарбитраж с доходностью от 20% в день",
++  "ищем тестировщиков мобильных приложений",
++  "простая работа: ставить лайки и писать отзывы",
++  "набор сотрудников на удаленку",
++  "нужны люди для приема смс и регистрации аккаунтов",
++  "вывод средств без комиссии",
++  "получи свой первый вывод уже сегодня",
++  "инвестиции под высокий процент",
++  "пассивный доход от 100% в месяц",
++  "пиши слово «работа» мне в личку",
++  "жду тебя в своем приватном канале",
++  "подпишись, чтобы не потерять",
++  "только сегодня бесплатно",
++  "осталось всего 3 места",
++  "ты еще здесь? жми на кнопку ниже",
++  "первым 10 человек дарю гайд",
++  "получи чек-лист по заработку",
++  "нужны расклейщики / курьеры (высокая оплата)",
++  "сомнительные вакансии с оплатой на карту ежедневно",
++  "нужен менеджер по работе с клиентами (без опыта)",
++  "уникальная система умножения баланса",
++  "бесплатные сигналы на фьючерсы",
++  "забери промокод на депозит",
++  "оплата сразу после выполнения задачи",
++  "срочный набор в проект",
++  "тебе пришло личное приглашение",
++  "нашел баг в системе, делюсь бесплатно",
++  "выиграй iphone за пару кликов",
++  "подтверди согласие и получи подарок",
++  "твой аккаунт выбран для участия в акции",
++  "слив инсайдерской информации",
++  "принимаем заливы на карты",
++  "работа с депозитами: умножу твой баланс в 5 раз",
++  "помогу закрыть долги и кредиты",
++  "гарантия возврата средств 100%",
+ ];
+ 
+-/** At most this many phrases per chat: every phrase is a button on the
+- * list screen, and Telegram allows 100 buttons per message. */
+-export const MAX_SPAM_PHRASES = 50;
+ /** A phrase shorter than this would match a huge share of ordinary bios
+  * ("тел", "ищу") and ban real people, so it is refused. */
+ export const SPAM_PHRASE_MIN_LENGTH = 4;
+ export const SPAM_PHRASE_MAX_LENGTH = 60;
++/** How many phrases buildSpamPhraseListView (src/handlers/telegram.ts)
++ * shows per page. There is deliberately no cap on the total number of
++ * phrases a chat can store (addSpamPhrases below never rejects for being
++ * "too many") -- the list screen paginates instead, which is what actually
++ * keeps it within Telegram's 100-buttons-per-message limit regardless of
++ * how large the list grows, rather than an arbitrary stored-phrase ceiling
++ * that would have had to be picked without knowing how many phrases any
++ * given chat owner actually wants. */
++export const SPAM_PHRASE_PAGE_SIZE = 20;
+ 
+ /** Canonical form used both when storing a phrase and when matching it
+  * against a bio: lowercase, runs of whitespace collapsed to one space,
+@@ -141,7 +273,7 @@ export function serializeSpamPhrases(phrases: readonly string[]): string {
+   return JSON.stringify(phrases);
+ }
+ 
+-export type SpamPhraseSkipReason = "too_short" | "too_long" | "duplicate" | "limit_reached";
++export type SpamPhraseSkipReason = "too_short" | "too_long" | "duplicate";
+ 
+ export interface AddSpamPhrasesResult {
+   /** The full list after adding. */
+@@ -165,7 +297,6 @@ export function addSpamPhrases(current: readonly string[], rawInput: string): Ad
+     if (phrase.length < SPAM_PHRASE_MIN_LENGTH) skipped.push({ phrase, reason: "too_short" });
+     else if (phrase.length > SPAM_PHRASE_MAX_LENGTH) skipped.push({ phrase, reason: "too_long" });
+     else if (phrases.includes(phrase)) skipped.push({ phrase, reason: "duplicate" });
+-    else if (phrases.length >= MAX_SPAM_PHRASES) skipped.push({ phrase, reason: "limit_reached" });
+     else {
+       phrases.push(phrase);
+       added.push(phrase);
+diff --git a/src/types.ts b/src/types.ts
+index c63377c..983f29a 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -50,6 +50,22 @@ export interface ChannelRow {
+   spam_filter_enabled: number;
+   /** JSON array of strings; NULL = the built-in default phrase list. */
+   spam_phrases: string | null;
++  /** 1/0: announce when a member leaves/is removed from the group (see
++   * src/lib/moderation-settings.ts). */
++  leave_enabled: number;
++  /** NULL = the built-in default leave-announcement text. */
++  leave_template: string | null;
++  /** 1/0: delete any message in the group containing a link whose host
++   * isn't on antilink_whitelist (see src/lib/antilink.ts). Defaults to 0
++   * (off) -- unlike welcome/spam-filter, this deletes ordinary members'
++   * messages, which is disruptive enough that it should be an explicit
++   * opt-in rather than on by default for every existing chat. */
++  antilink_enabled: number;
++  /** JSON array of whitelisted hostnames; NULL/"[]" both mean "nothing
++   * whitelisted" (every link gets deleted while antilink_enabled is on) --
++   * there is no built-in default list the way spam_phrases has one, since
++   * which domains are legitimate is entirely chat-specific. */
++  antilink_whitelist: string | null;
+   created_at: string;
+ }
+ 
+@@ -137,8 +153,10 @@ export type SessionState =
+   | { step: "awaiting_link_url_edit"; data: { streamer_id: number; link_id: number } }
+   | { step: "awaiting_template"; data: { channel_id: number } }
+   | { step: "awaiting_welcome_template"; data: { channel_id: number } }
++  | { step: "awaiting_leave_template"; data: { channel_id: number } }
+   | { step: "awaiting_welcome_delete_after"; data: { channel_id: number } }
+-  | { step: "awaiting_spam_phrases"; data: { channel_id: number } };
++  | { step: "awaiting_spam_phrases"; data: { channel_id: number } }
++  | { step: "awaiting_antilink_whitelist"; data: { channel_id: number } };
+ 
+ export const IDLE_SESSION: SessionState = { step: "idle" };
+ 
