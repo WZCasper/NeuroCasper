@@ -150,6 +150,46 @@ export async function refreshAccessToken(input: {
   return res.json() as Promise<KickTokenResponse>;
 }
 
+/** Looks up the thumbnail for a broadcaster's CURRENT livestream, via
+ * Kick's own GET /public/v2/livestreams -- the "went live" webhook this
+ * bot already receives (livestream.status.updated, parsed by
+ * parseLivestreamStatusEvent below) carries no thumbnail field itself, so
+ * this is a second call, right after that webhook arrives, to get one.
+ * v2 (not v1 -- v1 /livestreams is documented as deprecated) and requires
+ * the channel:read scope, already in REQUIRED_SCOPES above, so every
+ * already-connected Kick account can use this without re-authorizing.
+ *
+ * Response shape confirmed by cross-referencing several independent
+ * third-party Kick API client libraries' own request/response code
+ * (api.kick.com's /public/v2/livestreams, thumbnail as a plain URL
+ * string keyed "thumbnail"), since docs.kick.com's own livestreams
+ * reference page could not be fetched directly while writing this --
+ * unlike the files this module cites elsewhere (see the top-of-file
+ * comment), this one specific detail was NOT confirmed field-for-field
+ * against Kick's own documentation page. Treat a persistent, unexpected
+ * shape mismatch here as a signal to check that page directly rather
+ * than as this function being broken outright: it fails closed (returns
+ * null, logs, never throws) exactly so a wrong guess here costs nothing
+ * worse than "no real thumbnail this time," the same as a thumbnail
+ * simply not being available. */
+export async function fetchLivestreamThumbnail(accessToken: string, broadcasterUserId: number): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `${KICK_API_BASE_URL}/public/v2/livestreams?broadcaster_user_id=${encodeURIComponent(String(broadcasterUserId))}`,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    if (!res.ok) {
+      console.error(`Kick livestreams lookup failed (${res.status}) for broadcaster ${broadcasterUserId}`);
+      return null;
+    }
+    const json = (await res.json()) as { data?: Array<{ thumbnail?: string | null }> };
+    return json.data?.[0]?.thumbnail ?? null;
+  } catch (err) {
+    console.error(`Kick livestreams lookup threw for broadcaster ${broadcasterUserId}`, err);
+    return null;
+  }
+}
+
 /** Looks up the authenticated user's own channel -- used right after
  * exchangeCodeForToken to learn their broadcaster_user_id and current
  * slug/stream title, since the OAuth token alone doesn't carry those. */

@@ -1,8 +1,16 @@
-// YouTube has no free push notification for "went live" specifically — only
-// the RSS/Atom feed (new video entries, including live broadcasts, since
-// YouTube creates the video resource the moment a broadcast starts) and,
-// optionally, the Data API v3 for a reliable live/not-live flag. Both paths
-// are implemented; the Data API is used only if YOUTUBE_API_KEY is set.
+// YouTube has no free push notification for "went live" specifically.
+// Three detection paths are implemented here:
+//   - checkChannelLiveNow: "is this channel live RIGHT NOW" -- tries the
+//     official Data API v3 (search.list) first when YOUTUBE_API_KEY is
+//     set, since that's reliable and gives a real thumbnail; falls back
+//     to scraping the /channel/{id}/live redirect otherwise.
+//   - fetchLatestVideo: the RSS/Atom feed, for catching new *videos*
+//     (including live broadcasts, since YouTube creates the video
+//     resource the moment a broadcast starts), with real thumbnails of
+//     its own (from the feed itself, no API key needed).
+//   - checkIsCurrentlyLive / checkIsCurrentlyLiveForNewContent: "is this
+//     ALREADY-KNOWN videoId live" -- the official Data API v3
+//     (videos.list) when a key is set, else a page-scraping heuristic.
 import { XMLParser } from "fast-xml-parser";
 
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
@@ -48,20 +56,84 @@ export async function fetchLatestVideo(channelId: string): Promise<YoutubeLatest
 export interface YoutubeLiveNow {
   videoId: string;
   title: string;
+  /** Real thumbnail URL, or null when this came from the no-API-key HTML
+   * fallback (checkChannelLiveNowViaScraping below), which never has one. */
+  thumbnailUrl: string | null;
 }
 
-/** Checks whether a channel is live RIGHT NOW, bypassing the RSS feed
- * entirely. Every YouTube channel has a permanent redirect at
+interface YoutubeSearchItem {
+  id?: { videoId?: string };
+  snippet?: {
+    title?: string;
+    liveBroadcastContent?: string;
+    thumbnails?: { high?: { url?: string }; medium?: { url?: string }; default?: { url?: string } };
+  };
+}
+
+/** The reliable half of checkChannelLiveNow below: one official Data API
+ * v3 search.list call (part=snippet, eventType=live, type=video), which
+ * asks YouTube directly "is this channel live right now" and gets back
+ * videoId, title AND a real thumbnail in the same response -- no HTML
+ * parsing, nothing that depends on page markup staying the same, and
+ * (this is the part that actually matters for a server running on
+ * Cloudflare Workers) no exposure to YouTube's anti-bot gate: that gate
+ * applies to its ordinary web PAGES, not to api.googleapis.com,
+ * because this is the access path Google wants server-side callers to
+ * use, not one they're trying to keep server-side callers off of. See
+ * checkChannelLiveNow's own comment for why that gate is the reason this
+ * function exists at all rather than always scraping the /live redirect.
+ *
+ * Costs 100 quota units per call (search.list's documented cost -- most
+ * other YouTube Data API calls, videos.list included, cost only 1), out of
+ * a free default daily allowance of 10,000 units shared across a whole
+ * API key. checkChannelLiveNow only calls this once per cron tick for a
+ * channel that doesn't already have an open live post (see
+ * src/scheduled.ts), so normal use stays affordable; a key shared with
+ * many other call volumes, or watching a very large number of channels on
+ * a short cron interval, could still exhaust it -- a thrown/non-OK
+ * response here is caught by the caller and treated as "couldn't confirm
+ * via the API", falling through to the scraping heuristic for that cycle
+ * rather than failing the whole check. */
+async function checkChannelLiveViaApi(channelId: string, apiKey: string): Promise<YoutubeLiveNow | null> {
+  const url =
+    `https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=${encodeURIComponent(channelId)}` +
+    `&eventType=live&type=video&maxResults=1&key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`YouTube search.list (live check) failed: ${res.status}`);
+
+  const json = (await res.json()) as { items?: YoutubeSearchItem[] };
+  const item = json.items?.[0];
+  const videoId = item?.id?.videoId;
+  if (!videoId) return null; // an empty items[] IS the documented "not live" answer, not an error
+
+  const thumbnails = item?.snippet?.thumbnails;
+  return {
+    videoId,
+    title: item?.snippet?.title ?? "",
+    thumbnailUrl: thumbnails?.high?.url ?? thumbnails?.medium?.url ?? thumbnails?.default?.url ?? null,
+  };
+}
+
+/** The no-API-key fallback: YouTube channel has a permanent redirect at
  * /channel/{id}/live that goes straight to the current broadcast's watch
  * page while one is active (this is the same URL YouTube itself uses for
  * the "Watch live" links on a channel page), or to the channel's streams
- * tab otherwise. The RSS feed used by fetchLatestVideo() is fine for
- * catching new *videos*, but YouTube can take anywhere from a few minutes
- * up to roughly half an hour to list a just-started broadcast there --
- * this redirect reflects the live status immediately, so calling this
- * first is what actually gets a "went live" notification out quickly.
- * Costs no API quota and needs no YOUTUBE_API_KEY. */
-export async function checkChannelLiveNow(channelId: string): Promise<YoutubeLiveNow | null> {
+ * tab otherwise.
+ *
+ * In principle this reflects live status immediately, with none of the
+ * RSS feed's publishing lag -- but in practice, as of late 2025, YouTube
+ * serves requests from datacenter/cloud IP ranges (which is what a
+ * Cloudflare Workers fetch() always originates from) an interstitial
+ * "Sign in to confirm you're not a bot" page instead of the real one,
+ * HTTP 200 but with none of the markup this function looks for. This is
+ * a widely documented anti-bot measure, not something specific to this
+ * project or something a different regex could work around -- see this
+ * project's README for sources. The practical effect: WITHOUT
+ * YOUTUBE_API_KEY configured, this heuristic will often fail to detect a
+ * stream that is genuinely live, which is why checkChannelLiveNow tries
+ * the official API first whenever a key is available, and this is only
+ * the fallback for when one isn't. */
+async function checkChannelLiveNowViaScraping(channelId: string): Promise<YoutubeLiveNow | null> {
   let res: Response;
   try {
     res = await fetch(`https://www.youtube.com/channel/${encodeURIComponent(channelId)}/live`, {
@@ -94,7 +166,39 @@ export async function checkChannelLiveNow(channelId: string): Promise<YoutubeLiv
     .replace(/&#39;/g, "'")
     .replace(/&quot;/g, '"');
 
-  return { videoId, title };
+  // This path never has a real thumbnail: the page is already downloaded
+  // here, but unlike the official API's response it doesn't carry a
+  // ready-made thumbnail URL in a stable, documented field -- only the
+  // same kind of embedded, undocumented JSON blob the isLiveNow check
+  // above already depends on, and guessing a thumbnail field out of that
+  // would be exactly one more unverifiable scraping assumption stacked on
+  // the ones this function already has to make. generateFallbackPreview
+  // (src/lib/publish.ts) covers this case.
+  return { videoId, title, thumbnailUrl: null };
+}
+
+/** Checks whether a channel is live RIGHT NOW, bypassing the RSS feed
+ * entirely (the RSS feed used by fetchLatestVideo() is fine for catching
+ * new *videos*, but YouTube can take anywhere from a few minutes up to
+ * roughly half an hour to list a just-started broadcast there -- calling
+ * this first is what actually gets a "went live" notification out
+ * quickly). Tries the official, reliable Data API path
+ * (checkChannelLiveViaApi) whenever YOUTUBE_API_KEY is configured, and
+ * only falls back to the HTML-scraping heuristic
+ * (checkChannelLiveNowViaScraping) if no key is set, or if the API call
+ * itself fails for any reason (network error, quota exhausted, YouTube
+ * API outage) -- see checkChannelLiveViaApi's own comment on why a
+ * failure there should degrade gracefully rather than abort the whole
+ * check. */
+export async function checkChannelLiveNow(channelId: string, apiKey: string | undefined): Promise<YoutubeLiveNow | null> {
+  if (apiKey) {
+    try {
+      return await checkChannelLiveViaApi(channelId, apiKey);
+    } catch (err) {
+      console.error(`YouTube search.list live check failed for channel ${channelId}, falling back to scraping:`, err);
+    }
+  }
+  return checkChannelLiveNowViaScraping(channelId);
 }
 
 /** With YOUTUBE_API_KEY set: one videos.list call, reading the official

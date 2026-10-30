@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildAuthorizationUrl,
   extractWebhookHeaders,
+  fetchLivestreamThumbnail,
   generatePkcePair,
   parseLivestreamStatusEvent,
   verifyWebhookSignature,
@@ -219,6 +220,70 @@ test("verifyWebhookSignature rejects a malformed (non-base64) signature", async 
     "{}",
   );
   assert.equal(valid, false);
+});
+
+// ---------------------------------------------------------------------------
+// fetchLivestreamThumbnail
+// ---------------------------------------------------------------------------
+
+test("fetchLivestreamThumbnail returns the thumbnail URL for the given broadcaster", async (t) => {
+  const fetchedUrls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    fetchedUrls.push(url);
+    return new Response(
+      JSON.stringify({ data: [{ broadcaster_user_id: 42, thumbnail: "https://files.kick.com/thumb/abc.jpg" }] }),
+      { status: 200 },
+    );
+  });
+
+  const result = await fetchLivestreamThumbnail("test-access-token", 42);
+
+  assert.equal(result, "https://files.kick.com/thumb/abc.jpg");
+  assert.equal(fetchedUrls.length, 1);
+  assert.match(fetchedUrls[0] ?? "", /\/public\/v2\/livestreams\?broadcaster_user_id=42/);
+});
+
+test("fetchLivestreamThumbnail sends the access token as a Bearer header", async (t) => {
+  let capturedAuth: string | null = null;
+  t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+    const headers = init?.headers as Record<string, string> | undefined;
+    capturedAuth = headers?.Authorization ?? null;
+    return new Response(JSON.stringify({ data: [{ thumbnail: "x" }] }), { status: 200 });
+  });
+
+  await fetchLivestreamThumbnail("my-secret-token", 42);
+
+  assert.equal(capturedAuth, "Bearer my-secret-token");
+});
+
+test("fetchLivestreamThumbnail returns null, not a thrown error, when the API responds non-OK (e.g. expired token)", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response("unauthorized", { status: 401 }));
+
+  const result = await fetchLivestreamThumbnail("stale-token", 42);
+  assert.equal(result, null);
+});
+
+test("fetchLivestreamThumbnail returns null, not a thrown error, on a network failure", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => {
+    throw new Error("simulated network failure");
+  });
+
+  const result = await fetchLivestreamThumbnail("test-access-token", 42);
+  assert.equal(result, null);
+});
+
+test("fetchLivestreamThumbnail returns null when the stream has no thumbnail field at all", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ data: [{ broadcaster_user_id: 42 }] }), { status: 200 }));
+
+  const result = await fetchLivestreamThumbnail("test-access-token", 42);
+  assert.equal(result, null);
+});
+
+test("fetchLivestreamThumbnail returns null when data[] is empty (broadcaster not currently live)", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ data: [] }), { status: 200 }));
+
+  const result = await fetchLivestreamThumbnail("test-access-token", 42);
+  assert.equal(result, null);
 });
 
 function base64UrlFromBytes(bytes: Uint8Array): string {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { checkIsCurrentlyLiveForNewContent, LIVE_FLAG_RECHECK_DELAY_MS } from "./youtube.js";
+import { checkChannelLiveNow, checkIsCurrentlyLiveForNewContent, LIVE_FLAG_RECHECK_DELAY_MS } from "./youtube.js";
 
 // ---------------------------------------------------------------------------
 // checkIsCurrentlyLiveForNewContent
@@ -97,4 +97,147 @@ test("returns false without any fetch when videoId is null", async (t) => {
 
   const result = await checkIsCurrentlyLiveForNewContent(null, undefined);
   assert.equal(result, false);
+});
+
+// ---------------------------------------------------------------------------
+// checkChannelLiveNow
+//
+// With an API key, this must go through the official search.list endpoint
+// (googleapis.com) and never touch the HTML-scraping fallback at all --
+// that's the whole point of having the official path. Without a key, or
+// when the official call itself fails, it must fall back to the scraping
+// heuristic exactly as before this function grew the API-first path.
+// ---------------------------------------------------------------------------
+
+function searchListResponse(items: unknown[]): Response {
+  return new Response(JSON.stringify({ items }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+function liveSearchItem(overrides: { videoId?: string; title?: string; thumbUrl?: string } = {}) {
+  return {
+    id: { videoId: overrides.videoId ?? "yt-video-1" },
+    snippet: {
+      title: overrides.title ?? "Live now",
+      liveBroadcastContent: "live",
+      thumbnails: { high: { url: overrides.thumbUrl ?? "https://i.ytimg.com/vi/yt-video-1/hqdefault_live.jpg" } },
+    },
+  };
+}
+
+test("with an API key: a live channel is found via search.list, with no fetch to youtube.com at all", async (t) => {
+  const fetchedUrls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    fetchedUrls.push(url);
+    return searchListResponse([liveSearchItem()]);
+  });
+
+  const result = await checkChannelLiveNow("UC123", "test-api-key");
+
+  assert.deepEqual(result, {
+    videoId: "yt-video-1",
+    title: "Live now",
+    thumbnailUrl: "https://i.ytimg.com/vi/yt-video-1/hqdefault_live.jpg",
+  });
+  assert.equal(fetchedUrls.length, 1);
+  assert.match(fetchedUrls[0] ?? "", /googleapis\.com\/youtube\/v3\/search/);
+  assert.match(fetchedUrls[0] ?? "", /channelId=UC123/);
+  assert.match(fetchedUrls[0] ?? "", /eventType=live/);
+});
+
+test("with an API key: an empty items[] is the documented not-live answer, not an error -- no scraping fallback triggered", async (t) => {
+  let fetchCalls = 0;
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    fetchCalls++;
+    assert.match(url, /googleapis\.com/, "must not fall through to scraping when the API itself says not-live");
+    return searchListResponse([]);
+  });
+
+  const result = await checkChannelLiveNow("UC123", "test-api-key");
+
+  assert.equal(result, null);
+  assert.equal(fetchCalls, 1);
+});
+
+test("prefers the high-resolution thumbnail, falling back to medium then default when high is absent", async (t) => {
+  t.mock.method(globalThis, "fetch", async () =>
+    searchListResponse([
+      {
+        id: { videoId: "v1" },
+        snippet: {
+          title: "x",
+          liveBroadcastContent: "live",
+          thumbnails: { medium: { url: "https://i.ytimg.com/medium.jpg" }, default: { url: "https://i.ytimg.com/default.jpg" } },
+        },
+      },
+    ]),
+  );
+
+  const result = await checkChannelLiveNow("UC123", "test-api-key");
+  assert.equal(result?.thumbnailUrl, "https://i.ytimg.com/medium.jpg");
+});
+
+test("falls back to HTML scraping when the search.list call itself fails (network error)", async (t) => {
+  const fetchedUrls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    fetchedUrls.push(url);
+    if (url.includes("googleapis.com")) throw new Error("simulated network failure");
+    // The scraping fallback's very first fetch is the /live redirect check;
+    // responding with a non-ok status here is enough to prove the fallback
+    // path was actually reached, without needing to fake YouTube's full
+    // HTML/redirect behavior.
+    return new Response("", { status: 503 });
+  });
+
+  const result = await checkChannelLiveNow("UC123", "test-api-key");
+
+  assert.equal(result, null);
+  assert.equal(fetchedUrls.length, 2, "exactly one API attempt, then exactly one scraping attempt");
+  assert.match(fetchedUrls[0] ?? "", /googleapis\.com/);
+  assert.match(fetchedUrls[1] ?? "", /youtube\.com\/channel\/UC123\/live/);
+});
+
+test("falls back to HTML scraping when the search.list call returns a non-OK response", async (t) => {
+  const fetchedUrls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    fetchedUrls.push(url);
+    if (url.includes("googleapis.com")) return new Response("quota exceeded", { status: 403 });
+    return new Response("", { status: 503 });
+  });
+
+  const result = await checkChannelLiveNow("UC123", "test-api-key");
+
+  assert.equal(result, null);
+  assert.equal(fetchedUrls.length, 2);
+});
+
+test("without an API key: goes straight to HTML scraping, never attempting the official API", async (t) => {
+  const fetchedUrls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string) => {
+    fetchedUrls.push(url);
+    return new Response("", { status: 503 });
+  });
+
+  const result = await checkChannelLiveNow("UC123", undefined);
+
+  assert.equal(result, null);
+  assert.equal(fetchedUrls.length, 1);
+  assert.match(fetchedUrls[0] ?? "", /youtube\.com\/channel\/UC123\/live/);
+});
+
+test("HTML scraping fallback: a live channel is detected from the /live redirect landing on /watch", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => {
+    const html = '<title>My Stream - YouTube</title>"isLiveNow": true';
+    // The redirect's final URL is read from Response.url; the Response
+    // constructor doesn't let that be set directly from a plain string
+    // body, so this mirrors it the same way the implementation reads it
+    // (via `res.url`) by constructing a Response and assigning `url`,
+    // which Node's fetch-compatible Response allows.
+    const res = new Response(html, { status: 200 });
+    Object.defineProperty(res, "url", { value: "https://www.youtube.com/watch?v=scraped-video-1" });
+    return res;
+  });
+
+  const result = await checkChannelLiveNow("UC123", undefined);
+
+  assert.deepEqual(result, { videoId: "scraped-video-1", title: "My Stream", thumbnailUrl: null });
 });
