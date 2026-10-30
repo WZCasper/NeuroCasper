@@ -13,9 +13,11 @@ import {
   createUserReport,
   deletePendingMessageDeletion,
   getChannelByTelegramChatId,
+  getKickTokenBySocialAccount,
   listDuePendingMessageDeletions,
   getOrCreateUser,
   toggleChannelFlag,
+  upsertKickToken,
   updateChannelAntilinkWhitelist,
   updateChannelLeaveTemplate,
   updateChannelSpamPhrases,
@@ -305,6 +307,79 @@ test("updateChannelAntilinkWhitelist stores a custom hostname list as JSON, and 
   const reset = await updateChannelAntilinkWhitelist(env, channel.id, null);
   assert.ok(reset);
   assert.equal(reset.antilink_whitelist, null);
+});
+
+test("getKickTokenBySocialAccount returns null when no token has been stored yet", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -2011);
+  const streamer = await createStreamer(env, channel.id, "TestStreamer");
+  const socialAccount = await createSocialAccount(env, streamer.id, "kick", "teststreamer", "kick-broadcaster-1");
+
+  const result = await getKickTokenBySocialAccount(env, socialAccount.id);
+  assert.equal(result, null);
+});
+
+test("upsertKickToken stores a new token, readable back by social_account_id", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -2012);
+  const streamer = await createStreamer(env, channel.id, "TestStreamer");
+  const socialAccount = await createSocialAccount(env, streamer.id, "kick", "teststreamer", "kick-broadcaster-1");
+
+  await upsertKickToken(env, socialAccount.id, {
+    broadcasterUserId: 123456,
+    accessToken: "access-token-1",
+    refreshToken: "refresh-token-1",
+    expiresAt: "2026-01-01T00:00:00.000Z",
+    eventSubscriptionId: "sub-1",
+  });
+
+  const stored = await getKickTokenBySocialAccount(env, socialAccount.id);
+  assert.ok(stored);
+  assert.equal(stored.broadcaster_user_id, 123456);
+  assert.equal(stored.access_token, "access-token-1");
+  assert.equal(stored.refresh_token, "refresh-token-1");
+  assert.equal(stored.expires_at, "2026-01-01T00:00:00.000Z");
+  assert.equal(stored.event_subscription_id, "sub-1");
+});
+
+test("upsertKickToken called again for the same social account REPLACES the token rather than duplicating it", async () => {
+  // This is exactly the path getValidKickAccessToken (src/handlers/kick.ts)
+  // relies on after a refresh: the UNIQUE(social_account_id) + ON CONFLICT
+  // DO UPDATE in the real schema (not reproduced here -- this runs the
+  // real schema.sql, see createTestEnv above) is what makes this an
+  // update rather than a second row.
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -2013);
+  const streamer = await createStreamer(env, channel.id, "TestStreamer");
+  const socialAccount = await createSocialAccount(env, streamer.id, "kick", "teststreamer", "kick-broadcaster-1");
+
+  await upsertKickToken(env, socialAccount.id, {
+    broadcasterUserId: 123456,
+    accessToken: "old-access-token",
+    refreshToken: "old-refresh-token",
+    expiresAt: "2026-01-01T00:00:00.000Z",
+    eventSubscriptionId: "sub-1",
+  });
+  await upsertKickToken(env, socialAccount.id, {
+    broadcasterUserId: 123456,
+    accessToken: "new-access-token",
+    refreshToken: "new-refresh-token",
+    expiresAt: "2026-06-01T00:00:00.000Z",
+    eventSubscriptionId: "sub-1",
+  });
+
+  const stored = await getKickTokenBySocialAccount(env, socialAccount.id);
+  assert.ok(stored);
+  assert.equal(stored.access_token, "new-access-token");
+  assert.equal(stored.refresh_token, "new-refresh-token");
+  assert.equal(stored.expires_at, "2026-06-01T00:00:00.000Z");
+
+  const { results: allTokenRows } = await env.DB.prepare(
+    "SELECT * FROM kick_tokens WHERE social_account_id = ?",
+  )
+    .bind(socialAccount.id)
+    .all();
+  assert.equal(allTokenRows.length, 1, "must still be exactly one row, not two");
 });
 
 // ---------------------------------------------------------------------------

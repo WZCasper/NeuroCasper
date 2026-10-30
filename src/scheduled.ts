@@ -53,7 +53,7 @@ async function checkYoutubeAccount(
   // so a row found here is always this same YouTube account's own live
   // post, never some other platform's).
   if (!openPlatformRow) {
-    const liveNow = await checkChannelLiveNow(account.platform_user_id);
+    const liveNow = await checkChannelLiveNow(account.platform_user_id, env.YOUTUBE_API_KEY);
     if (liveNow && !(await contentAlreadyPosted(env, account.id, liveNow.videoId))) {
       const channel = await getChannelById(env, account.streamer_channel_id);
       if (channel) {
@@ -69,7 +69,7 @@ async function checkYoutubeAccount(
           url: `https://www.youtube.com/watch?v=${liveNow.videoId}`,
           contentId: liveNow.videoId,
           title: liveNow.title,
-          thumbnailUrl: null,
+          thumbnailUrl: liveNow.thumbnailUrl,
         });
         await updateLastVideoId(env, account.id, liveNow.videoId);
         // Already posted this run via the fast path -- skip the RSS check
@@ -145,7 +145,11 @@ async function checkTiktokAccount(env: Env, api: Api, account: SocialAccountWith
       url: `https://www.tiktok.com/@${account.platform_username}/live`,
       contentId: status.roomId,
       title: "",
-      thumbnailUrl: null,
+      // Best-effort: see extractLiveCoverUrl (src/lib/tiktok.ts) for how
+      // reliable this is expected to be in practice -- often null, in
+      // which case createNewPost (src/lib/publish.ts) renders the
+      // generated fallback card exactly as it did before this existed.
+      thumbnailUrl: status.coverUrl,
     });
   }
 
