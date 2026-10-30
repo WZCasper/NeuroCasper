@@ -7,6 +7,7 @@ import {
   consumeKickOAuthState,
   createSocialAccount,
   getChannelById,
+  getKickTokenBySocialAccount,
   getSocialAccountByKickBroadcasterId,
   getStreamerById,
   getUserById,
@@ -17,12 +18,58 @@ import { closeLivePlatform, publishOrMerge } from "../lib/publish.js";
 import {
   exchangeCodeForToken,
   extractWebhookHeaders,
+  fetchLivestreamThumbnail,
   fetchOwnChannel,
   parseLivestreamStatusEvent,
+  refreshAccessToken,
   subscribeToLivestreamEvents,
   verifyWebhookSignature,
 } from "../lib/kick.js";
 import type { Env } from "../types.js";
+
+/** Returns an access token good for calling Kick's API right now for this
+ * social account, refreshing and persisting a new one first if the stored
+ * token has expired -- the exact check-then-refresh sequence
+ * src/lib/kick.ts's own top-of-file comment calls for (see the "NOTE on
+ * token refresh" paragraph there), now that fetchLivestreamThumbnail
+ * below is a function that DOES get called repeatedly, long after the
+ * original OAuth grant, unlike the ones that comment was written against.
+ * Null when there's no stored token at all, or refreshing one that has
+ * expired fails (expired refresh token, revoked grant, Kick API outage)
+ * -- the caller treats that as "no thumbnail available this time", not
+ * as a reason to fail the webhook. A 60-second safety margin avoids a
+ * token that's valid when checked but expires mid-request. */
+async function getValidKickAccessToken(env: Env, socialAccountId: number): Promise<string | null> {
+  const stored = await getKickTokenBySocialAccount(env, socialAccountId);
+  if (!stored) return null;
+
+  const expiresInMs = new Date(stored.expires_at).getTime() - Date.now();
+  if (expiresInMs > 60_000) return stored.access_token;
+
+  if (!env.KICK_CLIENT_ID || !env.KICK_CLIENT_SECRET) {
+    console.error(`Kick token for social_account ${socialAccountId} is expired, but Kick OAuth isn't configured to refresh it`);
+    return null;
+  }
+
+  try {
+    const refreshed = await refreshAccessToken({
+      clientId: env.KICK_CLIENT_ID,
+      clientSecret: env.KICK_CLIENT_SECRET,
+      refreshToken: stored.refresh_token,
+    });
+    await upsertKickToken(env, socialAccountId, {
+      broadcasterUserId: stored.broadcaster_user_id,
+      accessToken: refreshed.access_token,
+      refreshToken: refreshed.refresh_token,
+      expiresAt: new Date(Date.now() + refreshed.expires_in * 1000).toISOString(),
+      eventSubscriptionId: stored.event_subscription_id,
+    });
+    return refreshed.access_token;
+  } catch (err) {
+    console.error(`Kick token refresh failed for social_account ${socialAccountId}`, err);
+    return null;
+  }
+}
 
 export async function handleKickOAuthCallback(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -150,6 +197,16 @@ export async function handleKickWebhook(request: Request, env: Env): Promise<Res
   const channel = await getChannelById(env, streamer.channel_id);
   if (!channel) return new Response("OK (channel not found)", { status: 200 });
 
+  // Best-effort: the webhook payload itself carries no thumbnail (see
+  // fetchLivestreamThumbnail's own comment), so this is a second call
+  // right after the webhook arrives. A missing/expired/unrefreshable
+  // token, or the Kick API call itself failing, all degrade to null here
+  // rather than ever failing the webhook -- createNewPost
+  // (src/lib/publish.ts) renders the generated fallback card for a null
+  // thumbnailUrl exactly as it always has.
+  const accessToken = await getValidKickAccessToken(env, socialAccount.id);
+  const thumbnailUrl = accessToken ? await fetchLivestreamThumbnail(accessToken, event.broadcasterUserId) : null;
+
   await publishOrMerge({
     env,
     api,
@@ -162,7 +219,7 @@ export async function handleKickWebhook(request: Request, env: Env): Promise<Res
     url: `https://kick.com/${socialAccount.platform_username}`,
     contentId: `kick-live-${event.broadcasterUserId}`,
     title: event.title,
-    thumbnailUrl: null,
+    thumbnailUrl,
   });
 
   return new Response("OK", { status: 200 });

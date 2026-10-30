@@ -183,12 +183,24 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
 
   bot.on("callback_query:data", async (ctx) => {
     const [scope, ...rest] = ctx.callbackQuery.data.split(":");
-    try {
-      if (scope === "soc") await handleAddSocialCallback(ctx, env, rest);
-      else if (scope === "set") await handleSettingsCallback(ctx, env, rest);
-    } finally {
-      await ctx.answerCallbackQuery().catch(() => undefined);
-    }
+    // No try/finally here on purpose: Telegram only honors the FIRST
+    // answerCallbackQuery call for a given callback_query_id -- a second
+    // call still reports {ok: true}, but has no visible effect for the
+    // user (confirmed by multiple independent real-world bot-framework
+    // bug reports hitting exactly this). If a handler below throws, this
+    // line is simply never reached, which leaves that one answer
+    // opportunity free for bot.catch (src/bot.ts) to actually use -- to
+    // show the user a real error alert instead of nothing happening. If
+    // this line answered unconditionally (as it used to, in a finally
+    // block) it would "use up" that one answer with an empty, silent one
+    // moments before the error even reached bot.catch, which is exactly
+    // what made a thrown error here look to the user like the button
+    // simply doing nothing: see bot.catch's own comment for the concrete
+    // case (a moderation toggle on a column a pending migration hadn't
+    // added yet) that this was traced to.
+    if (scope === "soc") await handleAddSocialCallback(ctx, env, rest);
+    else if (scope === "set") await handleSettingsCallback(ctx, env, rest);
+    await ctx.answerCallbackQuery().catch(() => undefined);
   });
 
   // Catch-all for every incoming message: private-chat messages (forwarded
@@ -707,10 +719,16 @@ async function registerChannelFromForward(ctx: BotContext, env: Env): Promise<vo
 // ---------------------------------------------------------------------------
 
 async function promptChannelChoice(ctx: BotContext, channels: ChannelRow[], prefix: "soc" | "set"): Promise<void> {
+  // .row() is only called BETWEEN buttons (never after the last one) --
+  // see buildKeyboard's own comment (src/lib/buttons.ts) on why calling
+  // it after every single button, including the last, always leaves a
+  // trailing empty row in inline_keyboard (harmless to how Telegram
+  // renders it, but still a real defect, confirmed the same way there).
   const kb = new InlineKeyboard();
-  for (const ch of channels) {
-    kb.text(ch.title ?? String(ch.telegram_chat_id), `${prefix}:ch:${ch.id}`).row();
-  }
+  channels.forEach((ch, i) => {
+    if (i > 0) kb.row();
+    kb.text(ch.title ?? String(ch.telegram_chat_id), `${prefix}:ch:${ch.id}`);
+  });
   await ctx.reply("Какой канал/группа?", { reply_markup: kb });
 }
 
@@ -721,9 +739,12 @@ async function promptStreamerChoice(
   edit: boolean,
 ): Promise<void> {
   const streamers = await listStreamersByChannel(env, channel.id);
+  // Same trailing-empty-row defect and the same fix as promptChannelChoice
+  // above -- .row() goes BETWEEN buttons only, never after the very last
+  // one ("➕ Новый стример" here).
   const kb = new InlineKeyboard();
   for (const s of streamers) kb.text(s.display_name, `soc:str:${s.id}`).row();
-  kb.text("➕ Новый стример", `soc:newstr:${channel.id}`).row();
+  kb.text("➕ Новый стример", `soc:newstr:${channel.id}`);
   const text = `Стример для «${channel.title ?? channel.telegram_chat_id}»:`;
   if (edit) await ctx.editMessageText(text, { reply_markup: kb });
   else await ctx.reply(text, { reply_markup: kb });
@@ -744,9 +765,12 @@ async function promptPlatformChoice(
   const taken = new Set(existing.map((a) => a.platform));
   const remaining = ALL_PLATFORMS.filter((p) => !taken.has(p));
 
+  // Same trailing-empty-row defect and the same fix as promptChannelChoice
+  // above -- .row() goes BETWEEN buttons only, never after the very last
+  // one ("Добавить ссылку" here).
   const kb = new InlineKeyboard();
   for (const p of remaining) kb.text(PLATFORM_DISPLAY[p], `soc:pl:${streamerId}:${p}`).row();
-  kb.text("\u{1F517} Добавить ссылку (Twitch, Discord, ...)", `soc:link:${streamerId}`).row();
+  kb.text("\u{1F517} Добавить ссылку (Twitch, Discord, ...)", `soc:link:${streamerId}`);
 
   const text =
     remaining.length > 0
@@ -782,8 +806,9 @@ async function promptKickAuthorization(ctx: BotContext, env: Env, streamerId: nu
     codeChallenge,
   });
 
-  const kb = new InlineKeyboard().url("\u{1F7E2} Авторизовать на Kick", url).row();
-  kb.text("\u{2B05} Назад", `soc:str:${streamerId}`).row();
+  // Same fix as buildKeyboard's own comment (src/lib/buttons.ts) --
+  // .row() goes BETWEEN buttons only, never after the very last one.
+  const kb = new InlineKeyboard().url("\u{1F7E2} Авторизовать на Kick", url).row().text("\u{2B05} Назад", `soc:str:${streamerId}`);
   await ctx.editMessageText(
     "Откройте ссылку и разрешите доступ своим аккаунтом Kick — стример должен сделать это сам, " +
       "это подтверждает его канал. Ссылка действительна 10 минут.",
@@ -960,8 +985,14 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
 
   if (action === "menu") {
     const channels = await listChannelsByOwner(env, ctx.dbUser.id);
+    // Same trailing-empty-row defect and the same fix as buildKeyboard
+    // (src/lib/buttons.ts) and promptChannelChoice above -- .row() goes
+    // BETWEEN buttons only, never after the very last one.
     const kb = new InlineKeyboard();
-    for (const ch of channels) kb.text(ch.title ?? String(ch.telegram_chat_id), `set:ch:${ch.id}`).row();
+    channels.forEach((ch, i) => {
+      if (i > 0) kb.row();
+      kb.text(ch.title ?? String(ch.telegram_chat_id), `set:ch:${ch.id}`);
+    });
     await ctx.editMessageText("Какой канал/группа?", { reply_markup: kb });
     return;
   }
@@ -1070,8 +1101,12 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
 
   if (action === "back") {
     const channels = await listChannelsByOwner(env, ctx.dbUser.id);
+    // Same fix as the "menu" case just above.
     const kb = new InlineKeyboard();
-    for (const ch of channels) kb.text(ch.title ?? String(ch.telegram_chat_id), `set:ch:${ch.id}`).row();
+    channels.forEach((ch, i) => {
+      if (i > 0) kb.row();
+      kb.text(ch.title ?? String(ch.telegram_chat_id), `set:ch:${ch.id}`);
+    });
     await ctx.editMessageText("Какой канал/группа?", { reply_markup: kb });
   }
 }
