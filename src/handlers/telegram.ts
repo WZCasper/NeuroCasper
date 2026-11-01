@@ -21,10 +21,12 @@ import {
   listStreamersByChannel,
   setSession,
   toggleChannelFlag,
+  type ChannelFlag,
   updateChannelAntilinkWhitelist,
   updateChannelLeaveTemplate,
   updateChannelSpamPhrases,
   updateChannelTemplate,
+  updateChannelUrlBlacklist,
   updateChannelWelcomeDeleteAfter,
   updateChannelWelcomeTemplate,
   updateExtraLinkUrl,
@@ -56,11 +58,17 @@ import {
 } from "../lib/moderation-settings.js";
 import {
   ANTILINK_WHITELIST_PAGE_SIZE,
+  URL_BLACKLIST_PAGE_SIZE,
+  addBlacklistEntries,
   addWhitelistEntries,
+  messageHasBlacklistedLink,
   messageHasDisallowedLink,
+  removeBlacklistEntryAt,
   removeWhitelistEntryAt,
   resolveAntilinkWhitelist,
+  resolveUrlBlacklist,
   serializeAntilinkWhitelist,
+  serializeUrlBlacklist,
   type WhitelistSkipReason,
 } from "../lib/antilink.js";
 import { estimateRegistrationDate, formatApproximateRegistrationDate } from "../lib/registration-date-estimate.js";
@@ -244,6 +252,8 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
       await handleSpamPhrasesInput(ctx, env, session.data);
     } else if (session.step === "awaiting_antilink_whitelist") {
       await handleAntilinkWhitelistInput(ctx, env, session.data);
+    } else if (session.step === "awaiting_url_blacklist") {
+      await handleUrlBlacklistInput(ctx, env, session.data);
     }
   });
 }
@@ -287,22 +297,36 @@ async function handleGroupMessage(ctx: BotContext, env: Env): Promise<void> {
   if (!ctx.from || ctx.from.is_bot) return; // ничьи сообщения от ботов (включая сервисные) не трогаем
 
   const channel = await getChannelByTelegramChatId(env, chat.id).catch((err) => {
-    console.error(`getChannelByTelegramChatId failed for chat ${chat.id} while checking AntiLink:`, err);
+    console.error(`getChannelByTelegramChatId failed for chat ${chat.id} while checking AntiLink/blacklist:`, err);
     return null;
   });
-  // В отличие от welcome/spam_filter, у antilink_enabled нет предположения
-  // "включено, пока не зарегистрировано иначе" — он выключен по умолчанию
-  // (см. комментарий у channels.antilink_enabled в schema.sql), так что
-  // незарегистрированный чат (channel === null) просто ничего не фильтрует.
-  if (!channel || !channel.antilink_enabled) return;
+  // Ни у antilink_enabled, ни у url_blacklist_enabled нет предположения
+  // "включено, пока не зарегистрировано иначе" — оба выключены по
+  // умолчанию (см. комментарии у этих колонок в schema.sql), так что
+  // незарегистрированный чат (channel === null) просто ничего не
+  // фильтрует.
+  if (!channel) return;
 
-  const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
-  if (!messageHasDisallowedLink(message, whitelist)) return;
+  // Две независимые причины удалить сообщение — АнтиСсылка (вайтлист,
+  // домен целиком) и чёрный список (конкретная ссылка/канал), каждая со
+  // своим собственным тумблером. Проверка чёрного списка пропускается,
+  // если АнтиСсылка уже решила удалить — нет смысла проверять оба, раз
+  // результат (удаление) один и тот же в любом случае.
+  let shouldDelete = false;
+  if (channel.antilink_enabled) {
+    const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
+    shouldDelete = messageHasDisallowedLink(message, whitelist);
+  }
+  if (!shouldDelete && channel.url_blacklist_enabled) {
+    const blacklist = resolveUrlBlacklist(channel.url_blacklist);
+    shouldDelete = messageHasBlacklistedLink(message, blacklist);
+  }
+  if (!shouldDelete) return;
 
   if (await isExemptFromAntilink(ctx, chat.id, ctx.from.id)) return;
 
   await ctx.api.deleteMessage(chat.id, message.message_id).catch((err) => {
-    console.error(`deleteMessage (AntiLink) failed for message ${message.message_id} in chat ${chat.id}:`, err);
+    console.error(`deleteMessage (AntiLink/blacklist) failed for message ${message.message_id} in chat ${chat.id}:`, err);
   });
 }
 
@@ -1300,6 +1324,10 @@ const MODERATION_ACTIONS = new Set([
   "awl", // AntiLink whitelist: list (paginated)
   "awa", // AntiLink whitelist: add prompt
   "awd", // AntiLink whitelist: delete one entry
+  "btg", // URL blacklist: on/off
+  "bwl", // URL blacklist: list (paginated)
+  "bwa", // URL blacklist: add prompt
+  "bwd", // URL blacklist: delete one entry
 ]);
 
 interface View {
@@ -1335,6 +1363,7 @@ async function editScreen(ctx: BotContext, view: View): Promise<void> {
 function buildModerationView(channel: ChannelRow): View {
   const phrases = resolveSpamPhrases(channel.spam_phrases);
   const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
+  const blacklist = resolveUrlBlacklist(channel.url_blacklist);
   const text =
     `👥 Модерация: ${channel.title ?? channel.telegram_chat_id}\n` +
     "Работает в группах, где бот — администратор (в каналах не применяется).\n\n" +
@@ -1344,7 +1373,9 @@ function buildModerationView(channel: ChannelRow): View {
     `Проверка описания профиля на спам: ${channel.spam_filter_enabled ? "вкл" : "выкл"} ` +
     `(фраз в списке: ${phrases.length}; при совпадении — блокировка на 30 дней)\n` +
     `АнтиСсылка: ${channel.antilink_enabled ? "вкл" : "выкл"} ` +
-    `(в белом списке: ${whitelist.length} доменов; админы группы не фильтруются)\n\n` +
+    `(в белом списке: ${whitelist.length} доменов; админы группы не фильтруются)\n` +
+    `Чёрный список ссылок: ${channel.url_blacklist_enabled ? "вкл" : "выкл"} ` +
+    `(в списке: ${blacklist.length} ссылок; работает независимо от АнтиСсылки; админы не фильтруются)\n\n` +
     `Текст приветствия (${channel.welcome_template ? "свой" : "стандартный"}):\n` +
     `${resolveWelcomeTemplate(channel.welcome_template)}\n\n` +
     `Текст уведомления о выходе (${channel.leave_template ? "свой" : "стандартный"}):\n` +
@@ -1367,6 +1398,10 @@ function buildModerationView(channel: ChannelRow): View {
     .text(channel.antilink_enabled ? "Выключить АнтиСсылку" : "Включить АнтиСсылку", `set:atg:${channel.id}`)
     .row()
     .text(`🔗 Белый список ссылок (${whitelist.length})`, `set:awl:${channel.id}:0`)
+    .row()
+    .text(channel.url_blacklist_enabled ? "Выключить чёрный список" : "Включить чёрный список", `set:btg:${channel.id}`)
+    .row()
+    .text(`⛔ Чёрный список ссылок (${blacklist.length})`, `set:bwl:${channel.id}:0`)
     .row()
     .text("⬅ Назад", `set:ch:${channel.id}`)
     .row()
@@ -1540,6 +1575,60 @@ function buildAntilinkWhitelistAddPromptView(channelId: number): View {
   return { text, kb };
 }
 
+// ---------------------------------------------------------------------------
+// URL blacklist: on/off toggle + list editor. Independent of AntiLink's
+// whitelist above -- works even with AntiLink itself off. See
+// src/lib/antilink.ts's own top-of-file comment on why this matches the
+// FULL link (channel/page), not just the domain the way the whitelist
+// does.
+// ---------------------------------------------------------------------------
+
+function buildUrlBlacklistView(channel: ChannelRow, page = 0): View {
+  const blacklist = resolveUrlBlacklist(channel.url_blacklist);
+  // buildPaginatedListKeyboard works on plain strings; .display is what
+  // the owner actually typed (see normalizeBlacklistEntry's own comment
+  // on why that's what's shown, not the normalized {hostname, path}), and
+  // the index into this mapped array is still the right index into
+  // `blacklist` itself since .map() preserves order/position.
+  const displayed = blacklist.map((e) => e.display);
+  const { kb, pageItems, totalPages, page: clampedPage } = buildPaginatedListKeyboard({
+    items: displayed,
+    page,
+    pageSize: URL_BLACKLIST_PAGE_SIZE,
+    itemLabelLength: 32,
+    deleteAction: (i, p) => `set:bwd:${channel.id}:${i}:${p}`,
+    pageAction: (p) => `set:bwl:${channel.id}:${p}`,
+  });
+  const body = pageItems.length
+    ? pageItems.map(({ item, index }) => `${index + 1}. ${item}`).join("\n")
+    : "(чёрный список пуст)";
+  const text =
+    `⛔ Чёрный список ссылок: ${channel.title ?? channel.telegram_chat_id}\n` +
+    `Сейчас: ${channel.url_blacklist_enabled ? "включён" : "выключен"}. Работает независимо от АнтиСсылки.\n` +
+    "Пока включён — бот удаляет из группы сообщение с ссылкой на конкретный канал/страницу из этого списка " +
+    "(ссылки глубже тоже блокируются: если в списке t.me/канал, заблокируется и t.me/канал/123). " +
+    "Вся остальная платформа не блокируется — только то, что указано здесь. Администраторов группы фильтр не проверяет.\n\n" +
+    `Всего ссылок: ${blacklist.length}${totalPages > 1 ? `, страница ${clampedPage + 1} из ${totalPages}` : ""}\n\n` +
+    `${body}`;
+  kb.text("➕ Добавить ссылки", `set:bwa:${channel.id}`)
+    .row()
+    .text("⬅ Назад", `set:mod:${channel.id}`)
+    .row()
+    .text("🏠 Меню", "set:menu");
+  return { text, kb };
+}
+
+function buildUrlBlacklistAddPromptView(channelId: number): View {
+  const text =
+    "Отправьте полные ссылки на конкретные каналы/страницы, которые нужно заблокировать, — по одной на строку.\n" +
+    "Например:\nt.me/спам_канал\nhttps://www.youtube.com/@спам_канал\n\n" +
+    "Важно: укажите именно ссылку на конкретный канал/страницу, а не домен целиком — " +
+    "«t.me» или «youtube.com» без ничего после не примутся, это заблокировало бы всю платформу, " +
+    "а не один канал. Ограничения на количество ссылок в списке нет.";
+  const kb = new InlineKeyboard().text("⬅ Отмена", `set:bwl:${channelId}:0`);
+  return { text, kb };
+}
+
 async function handleModerationCallback(ctx: BotContext, env: Env, action: string, rest: string[]): Promise<void> {
   const channel = await getOwnedChannel(ctx, env, Number(rest[1]));
   if (!channel) {
@@ -1559,16 +1648,19 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
     case "wtg":
     case "stg":
     case "ltg":
-    case "atg": {
-      const flag =
-        action === "wtg"
-          ? "welcome_enabled"
-          : action === "stg"
-            ? "spam_filter_enabled"
-            : action === "ltg"
-              ? "leave_enabled"
-              : "antilink_enabled";
-      const updated = await toggleChannelFlag(env, channel.id, flag);
+    case "atg":
+    case "btg": {
+      // A Record (rather than a growing chain of ternaries) so adding a
+      // sixth toggle later is one more line here, not one more branch to
+      // thread through an already-long conditional.
+      const TOGGLE_ACTION_TO_FLAG: Record<"wtg" | "stg" | "ltg" | "atg" | "btg", ChannelFlag> = {
+        wtg: "welcome_enabled",
+        stg: "spam_filter_enabled",
+        ltg: "leave_enabled",
+        atg: "antilink_enabled",
+        btg: "url_blacklist_enabled",
+      };
+      const updated = await toggleChannelFlag(env, channel.id, TOGGLE_ACTION_TO_FLAG[action as keyof typeof TOGGLE_ACTION_TO_FLAG]);
       await editScreen(ctx, buildModerationView(updated ?? channel));
       return;
     }
@@ -1647,6 +1739,24 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
       const next = removeWhitelistEntryAt(resolveAntilinkWhitelist(channel.antilink_whitelist), Number(rest[2]));
       const updated = next ? await updateChannelAntilinkWhitelist(env, channel.id, serializeAntilinkWhitelist(next)) : channel;
       await editScreen(ctx, buildAntilinkWhitelistView(updated ?? channel, Number(rest[3] ?? 0)));
+      return;
+    }
+    case "bwl": {
+      await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+      await editScreen(ctx, buildUrlBlacklistView(channel, Number(rest[2] ?? 0)));
+      return;
+    }
+    case "bwa": {
+      await setSession(env, ctx.dbUser.id, { step: "awaiting_url_blacklist", data: { channel_id: channel.id } });
+      await editScreen(ctx, buildUrlBlacklistAddPromptView(channel.id));
+      return;
+    }
+    case "bwd": {
+      // Та же логика «устаревшей кнопки» и сохранения текущей страницы
+      // после удаления, что и у awd выше.
+      const next = removeBlacklistEntryAt(resolveUrlBlacklist(channel.url_blacklist), Number(rest[2]));
+      const updated = next ? await updateChannelUrlBlacklist(env, channel.id, serializeUrlBlacklist(next)) : channel;
+      await editScreen(ctx, buildUrlBlacklistView(updated ?? channel, Number(rest[3] ?? 0)));
       return;
     }
   }
@@ -1825,5 +1935,44 @@ async function handleAntilinkWhitelistInput(ctx: BotContext, env: Env, data: { c
   await ctx.reply(lines.join("\n"));
 
   const view = buildAntilinkWhitelistView(updated, 0);
+  await ctx.reply(view.text, { reply_markup: view.kb });
+}
+
+async function handleUrlBlacklistInput(ctx: BotContext, env: Env, data: { channel_id: number }): Promise<void> {
+  const raw = ctx.message?.text;
+  if (!raw || raw.trim() === "") return;
+
+  const channel = await getOwnedChannel(ctx, env, data.channel_id);
+  if (!channel) {
+    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
+    return;
+  }
+
+  const result = addBlacklistEntries(resolveUrlBlacklist(channel.url_blacklist), raw);
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+  const updated =
+    result.added.length > 0
+      ? ((await updateChannelUrlBlacklist(env, channel.id, serializeUrlBlacklist(result.blacklist))) ?? channel)
+      : channel;
+
+  // Та же причина разделения отчёта и полного списка на два отдельных
+  // сообщения, что и в handleAntilinkWhitelistInput выше — см. её
+  // комментарий. describeWhitelistSkipReason переиспользуется напрямую:
+  // причины отказа (invalid/duplicate) те же самые по смыслу, что и у
+  // белого списка, своей отдельной функции-описания они не требуют.
+  const lines: string[] = [];
+  if (result.added.length > 0) lines.push(`✅ Добавлено ссылок: ${result.added.length}`, ...bulletLines(result.added));
+  else lines.push("Ничего не добавлено.");
+  if (result.skipped.length > 0) {
+    lines.push(
+      "",
+      "Пропущено:",
+      ...bulletLines(result.skipped.map((s) => `«${truncateLabel(s.input, 40)}» — ${describeWhitelistSkipReason(s)}`)),
+    );
+  }
+  await ctx.reply(lines.join("\n"));
+
+  const view = buildUrlBlacklistView(updated, 0);
   await ctx.reply(view.text, { reply_markup: view.kb });
 }
