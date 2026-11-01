@@ -21,6 +21,7 @@ import {
   updateChannelAntilinkWhitelist,
   updateChannelLeaveTemplate,
   updateChannelSpamPhrases,
+  updateChannelUrlBlacklist,
   updateChannelWelcomeDeleteAfter,
   updateChannelWelcomeTemplate,
 } from "./db.js";
@@ -188,6 +189,10 @@ test("a freshly-created channel defaults to welcome, leave-announcement and spam
   // opt-in rather than on by default for every existing chat).
   assert.equal(channel.antilink_enabled, 0);
   assert.equal(channel.antilink_whitelist, null);
+  // url_blacklist_enabled defaults to 0 (OFF), same reasoning as
+  // antilink_enabled -- see that column's own comment in schema.sql.
+  assert.equal(channel.url_blacklist_enabled, 0);
+  assert.equal(channel.url_blacklist, null);
 });
 
 test("getChannelByTelegramChatId finds a registered chat by its Telegram chat ID", async () => {
@@ -307,6 +312,35 @@ test("updateChannelAntilinkWhitelist stores a custom hostname list as JSON, and 
   const reset = await updateChannelAntilinkWhitelist(env, channel.id, null);
   assert.ok(reset);
   assert.equal(reset.antilink_whitelist, null);
+});
+
+test("toggleChannelFlag flips url_blacklist_enabled independently of the other flags, including antilink_enabled", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -2014);
+
+  const afterToggle = await toggleChannelFlag(env, channel.id, "url_blacklist_enabled");
+  assert.ok(afterToggle);
+  assert.equal(afterToggle.url_blacklist_enabled, 1); // was 0 by default, now on
+  assert.equal(afterToggle.antilink_enabled, 0); // untouched -- the whole point is this works independently of AntiLink
+  assert.equal(afterToggle.welcome_enabled, 1); // untouched
+
+  const afterSecondToggle = await toggleChannelFlag(env, channel.id, "url_blacklist_enabled");
+  assert.ok(afterSecondToggle);
+  assert.equal(afterSecondToggle.url_blacklist_enabled, 0); // back to off
+});
+
+test("updateChannelUrlBlacklist stores a custom entry list as JSON, and null resets it back", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -2015);
+
+  const entries = JSON.stringify([{ hostname: "t.me", path: "/badchannel", display: "t.me/badchannel" }]);
+  const withCustom = await updateChannelUrlBlacklist(env, channel.id, entries);
+  assert.ok(withCustom);
+  assert.equal(withCustom.url_blacklist, entries);
+
+  const reset = await updateChannelUrlBlacklist(env, channel.id, null);
+  assert.ok(reset);
+  assert.equal(reset.url_blacklist, null);
 });
 
 test("getKickTokenBySocialAccount returns null when no token has been stored yet", async () => {

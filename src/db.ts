@@ -210,6 +210,20 @@ export async function updateChannelAntilinkWhitelist(
   return getChannelById(env, channelId);
 }
 
+/** Sets the chat's URL blacklist (a JSON array of entries, see
+ * serializeUrlBlacklist in src/lib/antilink.ts); null/empty-array behave
+ * the same way antilink_whitelist's does. Returns the updated row. */
+export async function updateChannelUrlBlacklist(
+  env: Env,
+  channelId: number,
+  blacklistJson: string | null,
+): Promise<ChannelRow | null> {
+  await env.DB.prepare("UPDATE channels SET url_blacklist = ? WHERE id = ?")
+    .bind(blacklistJson, channelId)
+    .run();
+  return getChannelById(env, channelId);
+}
+
 export async function updateExtraLinkUrl(env: Env, linkId: number, url: string): Promise<void> {
   await env.DB.prepare("UPDATE extra_links SET url = ? WHERE id = ?").bind(url, linkId).run();
 }
@@ -220,7 +234,8 @@ export type ChannelFlag =
   | "welcome_enabled"
   | "spam_filter_enabled"
   | "leave_enabled"
-  | "antilink_enabled";
+  | "antilink_enabled"
+  | "url_blacklist_enabled";
 
 // Literal SQL per flag rather than interpolating the column name into the
 // query string — `flag` is always a hardcoded literal from the call sites
@@ -233,6 +248,7 @@ const TOGGLE_CHANNEL_FLAG_SQL: Record<ChannelFlag, string> = {
   spam_filter_enabled: "UPDATE channels SET spam_filter_enabled = 1 - spam_filter_enabled WHERE id = ?",
   leave_enabled: "UPDATE channels SET leave_enabled = 1 - leave_enabled WHERE id = ?",
   antilink_enabled: "UPDATE channels SET antilink_enabled = 1 - antilink_enabled WHERE id = ?",
+  url_blacklist_enabled: "UPDATE channels SET url_blacklist_enabled = 1 - url_blacklist_enabled WHERE id = ?",
 };
 
 export async function toggleChannelFlag(env: Env, channelId: number, flag: ChannelFlag): Promise<ChannelRow | null> {

@@ -66,6 +66,14 @@ export interface ChannelRow {
    * there is no built-in default list the way spam_phrases has one, since
    * which domains are legitimate is entirely chat-specific. */
   antilink_whitelist: string | null;
+  /** 1/0: delete any group message linking to a specific blacklisted
+   * channel/page (see src/lib/antilink.ts). Independent of
+   * antilink_enabled above -- works even with AntiLink itself off.
+   * Defaults to 0 (off), same reasoning as antilink_enabled. */
+  url_blacklist_enabled: number;
+  /** JSON array of {hostname, path, display} entries; NULL/"[]" both
+   * mean nothing is blacklisted yet. No built-in default here either. */
+  url_blacklist: string | null;
   created_at: string;
 }
 
@@ -156,7 +164,8 @@ export type SessionState =
   | { step: "awaiting_leave_template"; data: { channel_id: number } }
   | { step: "awaiting_welcome_delete_after"; data: { channel_id: number } }
   | { step: "awaiting_spam_phrases"; data: { channel_id: number } }
-  | { step: "awaiting_antilink_whitelist"; data: { channel_id: number } };
+  | { step: "awaiting_antilink_whitelist"; data: { channel_id: number } }
+  | { step: "awaiting_url_blacklist"; data: { channel_id: number } };
 
 export const IDLE_SESSION: SessionState = { step: "idle" };
 
