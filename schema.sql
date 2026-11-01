@@ -78,6 +78,16 @@ CREATE TABLE channels (
   -- whitelisted -- there's no built-in default here (unlike spam_phrases),
   -- since which domains are legitimate is entirely chat-specific.
   antilink_whitelist   TEXT,
+  -- URL blacklist: delete any group message linking to a specific
+  -- blacklisted channel/page (see src/lib/antilink.ts) -- independent of
+  -- antilink_enabled above, so it works even with AntiLink itself off.
+  -- migrations/010_add_url_blacklist.sql. Default 0 (OFF), for the same
+  -- reason antilink_enabled defaults to 0 -- this also deletes ordinary
+  -- members' own messages.
+  url_blacklist_enabled INTEGER NOT NULL DEFAULT 0,
+  -- JSON array of {hostname, path, display} entries. NULL/"[]" both mean
+  -- nothing is blacklisted -- no built-in default here either.
+  url_blacklist         TEXT,
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(owner_user_id, telegram_chat_id)
 );
