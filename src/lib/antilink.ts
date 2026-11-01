@@ -1,12 +1,34 @@
-// AntiLink: delete group messages whose links aren't on the chat's own
-// whitelist. This file holds the pure logic only -- link extraction from
-// Telegram message entities, hostname normalization/matching, and parsing
-// the owner's free-text whitelist input. src/handlers/telegram.ts owns
-// everything that needs the live Bot API or the database: checking
-// whether the sender is an admin (exempt from the filter), the actual
-// deleteMessage call, reading/writing the whitelist column, and all UI.
+// Two related, but independent, link-moderation features live here:
 //
-// Scope, matching exactly what was asked: AntiLink applies to GROUPS and
+//   - AntiLink: delete group messages whose links aren't on the chat's own
+//     WHITELIST, while AntiLink itself is on (channels.antilink_enabled).
+//     Matches by HOSTNAME only -- whitelisting "youtube.com" allows every
+//     page on that whole domain. See hostnameIsWhitelisted, isLinkAllowed,
+//     messageHasDisallowedLink and the whitelist-storage section below.
+//
+//   - URL blacklist: delete group messages linking to a specific
+//     BLACKLISTED resource (a particular channel, a particular video),
+//     always, independent of whether AntiLink/the whitelist is on at all
+//     (channels.url_blacklist_enabled). Matches the FULL path, not just
+//     the hostname -- blacklisting "t.me/somechannel" blocks links into
+//     that one Telegram channel, never every t.me link in existence. This
+//     is deliberately the opposite granularity from the whitelist above:
+//     the whitelist's job is "allow this whole site", the blacklist's job
+//     is "block this one specific channel/page", and conflating the two
+//     into one hostname-only mechanism would make the blacklist unable to
+//     do the one thing it was asked for -- blocking one bad channel
+//     without blocking its entire platform for everyone. See
+//     normalizePathForBlacklist, urlMatchesBlacklistEntry,
+//     messageHasBlacklistedLink and the blacklist-storage section below.
+//
+// This file holds the pure logic only for both -- link extraction from
+// Telegram message entities, hostname/path normalization and matching, and
+// parsing the owner's free-text list input. src/handlers/telegram.ts owns
+// everything that needs the live Bot API or the database: checking
+// whether the sender is an admin (exempt from both filters), the actual
+// deleteMessage call, reading/writing these columns, and all UI.
+//
+// Scope, matching exactly what was asked: both apply to GROUPS and
 // SUPERGROUPS only ("удалять ссылки только из группы"), not channels.
 // Channel posts arrive as a different Bot API update type (channel_post),
 // which this bot doesn't listen for at all, so there's nothing to extend
@@ -145,6 +167,229 @@ export function messageHasDisallowedLink(
   whitelist: readonly string[],
 ): boolean {
   return extractMessageLinks(message).some((url) => !isLinkAllowed(url, whitelist));
+}
+
+// ---------------------------------------------------------------------------
+// URL blacklist -- matches the FULL path, not just the hostname. See the
+// top-of-file comment for why this is a separate mechanism from the
+// whitelist above rather than the same one reused.
+// ---------------------------------------------------------------------------
+
+/** A blacklisted resource, as both stored and matched against: a
+ * normalized hostname (same normalizeHostname as the whitelist uses, so
+ * "the same site" means the same thing in both features) plus a
+ * normalized path. `path` is never empty -- see normalizeBlacklistEntry's
+ * own comment on why a bare domain with no path is refused outright
+ * rather than being allowed to mean "the whole site", which is exactly
+ * what this feature was asked NOT to do. */
+export interface BlacklistEntry {
+  hostname: string;
+  path: string;
+}
+
+/** Lowercase, with a trailing slash stripped (so "/channel" and
+ * "/channel/" are the same entry) and collapsed to "/" if the result
+ * would otherwise be empty. Lowercased deliberately, unlike how a URL
+ * path is treated by the spec by default (paths are case-sensitive in
+ * general): Telegram usernames and YouTube's @handles -- the two
+ * platforms this feature was specifically asked to cover -- are both
+ * case-insensitive on the platforms themselves, so matching them
+ * case-insensitively here is what actually tracks "is this the same
+ * channel", not the generic URL-spec default. A path that happens to be
+ * case-sensitive on some other site is a much smaller risk than silently
+ * failing to block a channel link pasted in different capitalization. */
+function normalizePathForBlacklist(path: string): string {
+  const lower = path.toLowerCase();
+  const trimmed = lower.length > 1 && lower.endsWith("/") ? lower.slice(0, -1) : lower;
+  return trimmed === "" ? "/" : trimmed;
+}
+
+/** True if `url` identifies the same resource as `entry`, or something
+ * "underneath" it: same normalized hostname, and the path either equals
+ * entry.path exactly or continues on from it at a "/" boundary (so
+ * blacklisting "t.me/badchannel" also blocks "t.me/badchannel/123", a
+ * link to one specific post inside that channel, while "t.me/badchannel2"
+ * -- a different channel whose name merely starts with the same
+ * characters -- correctly does NOT match: this is the same
+ * exact-or-"dot"-boundary pattern hostnameIsWhitelisted above uses for
+ * subdomains, applied to path segments with "/" as the separator
+ * instead). Query strings and fragments are deliberately ignored on both
+ * sides -- a tracking parameter appended to an otherwise-identical link
+ * (e.g. "?utm_source=...") doesn't change which channel/page it points
+ * at, so it must not be able to defeat a block by accident. */
+export function urlMatchesBlacklistEntry(url: string, entry: BlacklistEntry): boolean {
+  const parsed = safeParseUrl(url);
+  if (!parsed || !parsed.hostname) return false;
+  const host = normalizeHostname(parsed.hostname);
+  if (host !== entry.hostname) return false;
+  const path = normalizePathForBlacklist(parsed.pathname);
+  return path === entry.path || path.startsWith(`${entry.path === "/" ? "" : entry.path}/`);
+}
+
+/** True if the message contains at least one link matching any entry on
+ * the blacklist -- the one check src/handlers/telegram.ts needs for this
+ * feature, mirroring messageHasDisallowedLink above but for the opposite
+ * list shape (block-if-matches rather than block-unless-matches). A
+ * message with no links, or whose links match nothing on the blacklist,
+ * returns false. Whether the SENDER is exempt is, as with the whitelist
+ * feature, not this function's concern. */
+export function messageHasBlacklistedLink(
+  message: Pick<Message, "text" | "entities" | "caption" | "caption_entities">,
+  blacklist: readonly BlacklistEntry[],
+): boolean {
+  const links = extractMessageLinks(message);
+  return links.some((url) => blacklist.some((entry) => urlMatchesBlacklistEntry(url, entry)));
+}
+
+/** Same bound as WHITELIST_HOSTNAME_MAX_LENGTH -- a real DNS hostname is
+ * at most 253 characters -- plus generous room for the path itself. */
+const BLACKLIST_ENTRY_MAX_LENGTH = 253 + 1024;
+
+export type BlacklistEntryValidation = { ok: true; entry: BlacklistEntry; display: string } | { ok: false; error: string };
+
+/** Parses one line of owner input -- "https://t.me/somechannel",
+ * "youtube.com/@BadChannel", "vk.com/badgroup/" -- into the
+ * BlacklistEntry it will be matched against (see urlMatchesBlacklistEntry).
+ * Runs the input through the same parsing (safeParseUrl) and hostname
+ * normalization (normalizeHostname) the whitelist uses, so "the same
+ * site" means the same thing across both features, then additionally
+ * requires and normalizes a path.
+ *
+ * A bare domain with no path (or only "/") is REFUSED, not silently
+ * accepted as "block the whole domain" -- that would make this feature
+ * do exactly what it was explicitly asked not to do (block a whole
+ * platform rather than one specific channel/page on it); someone who
+ * actually wants an entire domain gone has AntiLink's whitelist for that
+ * (by simply never whitelisting it), which is what that mechanism is
+ * for. `display` is the original full URL the owner typed (with the
+ * scheme/host case they used), trimmed but otherwise unmodified -- shown
+ * back to them on the list screen, since "t.me / /somechannel" read from
+ * the normalized {hostname, path} alone would be far less recognizable
+ * than the link they actually pasted. */
+export function normalizeBlacklistEntry(input: string): BlacklistEntryValidation {
+  const trimmed = input.trim();
+  if (trimmed === "") return { ok: false, error: "пустая строка" };
+  if (trimmed.length > BLACKLIST_ENTRY_MAX_LENGTH) {
+    return { ok: false, error: `слишком длинная ссылка (максимум ${BLACKLIST_ENTRY_MAX_LENGTH} символов)` };
+  }
+  const parsed = safeParseUrl(trimmed);
+  if (!parsed || !parsed.hostname) return { ok: false, error: "не похоже на ссылку" };
+  const path = normalizePathForBlacklist(parsed.pathname);
+  if (path === "/") {
+    return {
+      ok: false,
+      error:
+        "это похоже на домен целиком, а не на ссылку на конкретный канал/страницу — " +
+        "укажите полную ссылку, например t.me/канал или youtube.com/@канал",
+    };
+  }
+  return { ok: true, entry: { hostname: normalizeHostname(parsed.hostname), path }, display: trimmed };
+}
+
+// ---------------------------------------------------------------------------
+// URL blacklist storage
+// ---------------------------------------------------------------------------
+
+/** What's actually stored per entry: the normalized {hostname, path} used
+ * for matching, plus the original text the owner typed, so the list
+ * screen can show back something recognizable (see
+ * normalizeBlacklistEntry's own comment on `display`). */
+export interface StoredBlacklistEntry extends BlacklistEntry {
+  display: string;
+}
+
+/** Reads the stored blacklist. NULL/undefined, or anything that isn't a
+ * JSON array of well-formed entries (corrupted, hand-edited), both
+ * resolve to an empty list -- same reasoning as resolveAntilinkWhitelist
+ * above: there is no built-in default here either, since which links are
+ * unwanted is entirely specific to each chat. */
+export function resolveUrlBlacklist(stored: string | null | undefined): StoredBlacklistEntry[] {
+  if (stored === null || stored === undefined) return [];
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (p): p is StoredBlacklistEntry =>
+        typeof p === "object" &&
+        p !== null &&
+        typeof (p as StoredBlacklistEntry).hostname === "string" &&
+        typeof (p as StoredBlacklistEntry).path === "string" &&
+        typeof (p as StoredBlacklistEntry).display === "string",
+    );
+  } catch {
+    // fall through to empty
+  }
+  return [];
+}
+
+export function serializeUrlBlacklist(entries: readonly StoredBlacklistEntry[]): string {
+  return JSON.stringify(entries);
+}
+
+/** Same page size and the same reasoning as ANTILINK_WHITELIST_PAGE_SIZE
+ * above: no cap on the total number of entries (addBlacklistEntries below
+ * never refuses for "too many"), paginated instead to stay within
+ * Telegram's 100-buttons-per-message limit regardless of how large the
+ * list grows. */
+export const URL_BLACKLIST_PAGE_SIZE = 20;
+
+export interface AddBlacklistEntriesResult {
+  /** The full blacklist after adding. */
+  blacklist: StoredBlacklistEntry[];
+  /** Entries actually added, for display (their original typed form). */
+  added: string[];
+  /** Lines that were refused, with why. Blank lines are ignored, not
+   * listed -- same convention as the whitelist and as addSpamPhrases in
+   * moderation-settings.ts. */
+  skipped: Array<{ input: string; reason: WhitelistSkipReason; error?: string }>;
+}
+
+/** Adds blacklist entries from free text, one per line -- same
+ * one-line-per-entry convention as addWhitelistEntries above. Each line
+ * is parsed and checked independently, so one bad line (including the
+ * "that's a whole domain, not a specific link" case) doesn't reject the
+ * rest. Duplicate check compares the normalized {hostname, path}, not
+ * the original typed text, so "t.me/x" and "https://t.me/x/" are
+ * correctly recognized as the same entry even though they're typed
+ * differently. */
+export function addBlacklistEntries(
+  current: readonly StoredBlacklistEntry[],
+  rawInput: string,
+): AddBlacklistEntriesResult {
+  const blacklist = [...current];
+  const added: string[] = [];
+  const skipped: AddBlacklistEntriesResult["skipped"] = [];
+
+  for (const line of rawInput.split(/\r?\n/)) {
+    if (line.trim() === "") continue;
+    const checked = normalizeBlacklistEntry(line);
+    if (!checked.ok) {
+      skipped.push({ input: line.trim(), reason: "invalid", error: checked.error });
+      continue;
+    }
+    const isDuplicate = blacklist.some(
+      (e) => e.hostname === checked.entry.hostname && e.path === checked.entry.path,
+    );
+    if (isDuplicate) {
+      skipped.push({ input: checked.display, reason: "duplicate" });
+      continue;
+    }
+    const stored: StoredBlacklistEntry = { ...checked.entry, display: checked.display };
+    blacklist.push(stored);
+    added.push(checked.display);
+  }
+  return { blacklist, added, skipped };
+}
+
+/** Returns the blacklist without the entry at `index`, or null if `index`
+ * isn't a valid position -- same reasoning (and the same risk window) as
+ * removeWhitelistEntryAt above. */
+export function removeBlacklistEntryAt(
+  current: readonly StoredBlacklistEntry[],
+  index: number,
+): StoredBlacklistEntry[] | null {
+  if (!Number.isInteger(index) || index < 0 || index >= current.length) return null;
+  return current.filter((_, i) => i !== index);
 }
 
 // ---------------------------------------------------------------------------

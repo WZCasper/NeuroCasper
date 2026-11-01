@@ -2,17 +2,25 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { MessageEntity } from "grammy/types";
 import {
+  addBlacklistEntries,
   addWhitelistEntries,
   extractMessageLinks,
   hostnameIsWhitelisted,
   isLinkAllowed,
+  messageHasBlacklistedLink,
   messageHasDisallowedLink,
+  normalizeBlacklistEntry,
   normalizeHostname,
   normalizeWhitelistEntry,
+  removeBlacklistEntryAt,
   removeWhitelistEntryAt,
   resolveAntilinkWhitelist,
+  resolveUrlBlacklist,
   safeParseUrl,
   serializeAntilinkWhitelist,
+  serializeUrlBlacklist,
+  urlMatchesBlacklistEntry,
+  type StoredBlacklistEntry,
 } from "./antilink.js";
 
 // ---------------------------------------------------------------------------
@@ -276,4 +284,209 @@ test("removeWhitelistEntryAt returns null for an out-of-range index (stale butto
   assert.equal(removeWhitelistEntryAt(["a.com"], 5), null);
   assert.equal(removeWhitelistEntryAt(["a.com"], -1), null);
   assert.equal(removeWhitelistEntryAt([], 0), null);
+});
+
+// ---------------------------------------------------------------------------
+// normalizeBlacklistEntry
+// ---------------------------------------------------------------------------
+
+test("normalizeBlacklistEntry accepts a full link and normalizes hostname + path", () => {
+  const result = normalizeBlacklistEntry("https://t.me/somechannel");
+  assert.deepEqual(result, {
+    ok: true,
+    entry: { hostname: "t.me", path: "/somechannel" },
+    display: "https://t.me/somechannel",
+  });
+});
+
+test("normalizeBlacklistEntry accepts a bare domain+path with no scheme", () => {
+  const result = normalizeBlacklistEntry("youtube.com/@BadChannel");
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.entry.hostname, "youtube.com");
+    assert.equal(result.entry.path, "/@badchannel"); // lowercased -- see normalizePathForBlacklist's own comment
+  }
+});
+
+test("normalizeBlacklistEntry strips a trailing slash from the path", () => {
+  const result = normalizeBlacklistEntry("https://t.me/somechannel/");
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.entry.path, "/somechannel");
+});
+
+test("normalizeBlacklistEntry REFUSES a bare domain with no path -- must not be able to blacklist a whole platform", () => {
+  assert.equal(normalizeBlacklistEntry("youtube.com").ok, false);
+  assert.equal(normalizeBlacklistEntry("https://t.me").ok, false);
+  assert.equal(normalizeBlacklistEntry("https://t.me/").ok, false);
+});
+
+test("normalizeBlacklistEntry rejects an empty/blank line", () => {
+  assert.equal(normalizeBlacklistEntry("").ok, false);
+  assert.equal(normalizeBlacklistEntry("   ").ok, false);
+});
+
+test("normalizeBlacklistEntry keeps `display` as the original typed text, only trimmed", () => {
+  const result = normalizeBlacklistEntry("  https://t.me/SomeChannel  ");
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.display, "https://t.me/SomeChannel"); // case preserved here, unlike entry.path
+});
+
+// ---------------------------------------------------------------------------
+// urlMatchesBlacklistEntry
+// ---------------------------------------------------------------------------
+
+test("urlMatchesBlacklistEntry matches the exact blacklisted link", () => {
+  const entry = { hostname: "t.me", path: "/somechannel" };
+  assert.equal(urlMatchesBlacklistEntry("https://t.me/somechannel", entry), true);
+});
+
+test("urlMatchesBlacklistEntry matches a deeper path under the blacklisted channel (e.g. a specific post)", () => {
+  const entry = { hostname: "t.me", path: "/somechannel" };
+  assert.equal(urlMatchesBlacklistEntry("https://t.me/somechannel/123", entry), true);
+});
+
+test("urlMatchesBlacklistEntry does NOT match a different channel whose name merely starts with the same text", () => {
+  // The exact bug a naive string-prefix check (rather than a "/"-boundary
+  // check) would have: "/somechannel" must not match "/somechannel2".
+  const entry = { hostname: "t.me", path: "/somechannel" };
+  assert.equal(urlMatchesBlacklistEntry("https://t.me/somechannel2", entry), false);
+});
+
+test("urlMatchesBlacklistEntry does NOT match the same path on a different host", () => {
+  const entry = { hostname: "t.me", path: "/somechannel" };
+  assert.equal(urlMatchesBlacklistEntry("https://example.com/somechannel", entry), false);
+});
+
+test("urlMatchesBlacklistEntry is case-insensitive on the path (Telegram/YouTube identifiers are case-insensitive on the platform itself)", () => {
+  const entry = { hostname: "t.me", path: "/somechannel" };
+  assert.equal(urlMatchesBlacklistEntry("https://t.me/SomeChannel", entry), true);
+});
+
+test("urlMatchesBlacklistEntry treats www. as an alias on the hostname side too", () => {
+  const entry = { hostname: "youtube.com", path: "/@badchannel" };
+  assert.equal(urlMatchesBlacklistEntry("https://www.youtube.com/@badchannel", entry), true);
+});
+
+test("urlMatchesBlacklistEntry ignores a query string/fragment appended to an otherwise-matching link", () => {
+  const entry = { hostname: "t.me", path: "/somechannel" };
+  assert.equal(urlMatchesBlacklistEntry("https://t.me/somechannel?utm_source=spam", entry), true);
+  assert.equal(urlMatchesBlacklistEntry("https://t.me/somechannel#section", entry), true);
+});
+
+test("urlMatchesBlacklistEntry returns false for a link it cannot parse into any hostname", () => {
+  const entry = { hostname: "t.me", path: "/somechannel" };
+  assert.equal(urlMatchesBlacklistEntry("tg://resolve?domain=somechannel", entry), false);
+});
+
+// ---------------------------------------------------------------------------
+// messageHasBlacklistedLink
+// ---------------------------------------------------------------------------
+
+function urlEntityAt(offset: number, length: number): MessageEntity {
+  return { type: "url", offset, length };
+}
+
+test("messageHasBlacklistedLink is true when a link in the message matches a blacklist entry", () => {
+  const text = "Загляни сюда: https://t.me/somechannel";
+  const linkStart = text.indexOf("https://t.me/somechannel");
+  const message = { text, entities: [urlEntityAt(linkStart, "https://t.me/somechannel".length)] };
+  const blacklist: StoredBlacklistEntry[] = [{ hostname: "t.me", path: "/somechannel", display: "t.me/somechannel" }];
+  assert.equal(messageHasBlacklistedLink(message, blacklist), true);
+});
+
+test("messageHasBlacklistedLink is false when the message's link is a DIFFERENT channel on the same platform", () => {
+  const text = "https://t.me/anotherchannel";
+  const message = { text, entities: [urlEntityAt(0, text.length)] };
+  const blacklist: StoredBlacklistEntry[] = [{ hostname: "t.me", path: "/somechannel", display: "t.me/somechannel" }];
+  assert.equal(messageHasBlacklistedLink(message, blacklist), false);
+});
+
+test("messageHasBlacklistedLink is false for a message with no links, or an empty blacklist", () => {
+  assert.equal(messageHasBlacklistedLink({ text: "привет, как дела?" }, []), false);
+  const text = "https://t.me/somechannel";
+  const message = { text, entities: [urlEntityAt(0, text.length)] };
+  assert.equal(messageHasBlacklistedLink(message, []), false);
+});
+
+// ---------------------------------------------------------------------------
+// resolveUrlBlacklist / serializeUrlBlacklist
+// ---------------------------------------------------------------------------
+
+test("resolveUrlBlacklist returns an empty list for null/undefined", () => {
+  assert.deepEqual(resolveUrlBlacklist(null), []);
+  assert.deepEqual(resolveUrlBlacklist(undefined), []);
+});
+
+test("resolveUrlBlacklist parses a stored JSON array of entries", () => {
+  const stored = '[{"hostname":"t.me","path":"/x","display":"t.me/x"}]';
+  assert.deepEqual(resolveUrlBlacklist(stored), [{ hostname: "t.me", path: "/x", display: "t.me/x" }]);
+});
+
+test("resolveUrlBlacklist falls back to an empty list for corrupted JSON or malformed entries", () => {
+  assert.deepEqual(resolveUrlBlacklist("not json"), []);
+  assert.deepEqual(resolveUrlBlacklist('[{"hostname":"t.me"}]'), []); // missing path/display
+  assert.deepEqual(resolveUrlBlacklist('["just a string, not an entry object"]'), []);
+});
+
+test("serializeUrlBlacklist round-trips through resolveUrlBlacklist", () => {
+  const entries: StoredBlacklistEntry[] = [
+    { hostname: "t.me", path: "/x", display: "t.me/x" },
+    { hostname: "youtube.com", path: "/@bad", display: "youtube.com/@bad" },
+  ];
+  assert.deepEqual(resolveUrlBlacklist(serializeUrlBlacklist(entries)), entries);
+});
+
+// ---------------------------------------------------------------------------
+// addBlacklistEntries
+// ---------------------------------------------------------------------------
+
+test("addBlacklistEntries adds several valid entries from one multi-line batch", () => {
+  const result = addBlacklistEntries([], "t.me/badchannel\nyoutube.com/@spammer");
+  assert.deepEqual(result.added, ["t.me/badchannel", "youtube.com/@spammer"]);
+  assert.equal(result.blacklist.length, 2);
+  assert.deepEqual(result.skipped, []);
+});
+
+test("addBlacklistEntries refuses a bare-domain line without rejecting the rest of the batch", () => {
+  const result = addBlacklistEntries([], "youtube.com\nt.me/badchannel");
+  assert.deepEqual(result.added, ["t.me/badchannel"]);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0]?.reason, "invalid");
+});
+
+test("addBlacklistEntries skips a duplicate of an existing entry, comparing the NORMALIZED form", () => {
+  const existing: StoredBlacklistEntry[] = [{ hostname: "t.me", path: "/badchannel", display: "t.me/badchannel" }];
+  // Typed differently (scheme + trailing slash) but the same normalized entry.
+  const result = addBlacklistEntries(existing, "https://t.me/badchannel/");
+  assert.deepEqual(result.added, []);
+  assert.equal(result.skipped.length, 1);
+  assert.equal(result.skipped[0]?.reason, "duplicate");
+});
+
+test("addBlacklistEntries never refuses for having too many entries", () => {
+  const many = Array.from({ length: 150 }, (_, i) => `example${i}.com/channel${i}`).join("\n");
+  const result = addBlacklistEntries([], many);
+  assert.equal(result.added.length, 150);
+  assert.equal(result.skipped.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// removeBlacklistEntryAt
+// ---------------------------------------------------------------------------
+
+test("removeBlacklistEntryAt removes exactly the entry at the given position", () => {
+  const entries: StoredBlacklistEntry[] = [
+    { hostname: "a.com", path: "/1", display: "a.com/1" },
+    { hostname: "b.com", path: "/2", display: "b.com/2" },
+    { hostname: "c.com", path: "/3", display: "c.com/3" },
+  ];
+  const result = removeBlacklistEntryAt(entries, 1);
+  assert.deepEqual(result, [entries[0], entries[2]]);
+});
+
+test("removeBlacklistEntryAt returns null for an out-of-range index", () => {
+  const entries: StoredBlacklistEntry[] = [{ hostname: "a.com", path: "/1", display: "a.com/1" }];
+  assert.equal(removeBlacklistEntryAt(entries, 5), null);
+  assert.equal(removeBlacklistEntryAt(entries, -1), null);
+  assert.equal(removeBlacklistEntryAt([], 0), null);
 });
