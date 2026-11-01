@@ -1,0 +1,24 @@
+-- Migration: per-chat URL blacklist -- delete any group message linking
+-- to a specific blacklisted channel/page (see src/lib/antilink.ts).
+-- Independent of channels.antilink_enabled (migrations/009): works even
+-- with AntiLink itself off, since blocking one specific bad channel
+-- shouldn't require turning on "delete every link unless whitelisted".
+--   * channels.url_blacklist_enabled: configurable in the bot
+--     (/settings -> chat -> «👥 Модерация группы»), default 0 (OFF).
+--   * channels.url_blacklist: JSON array of {hostname, path, display}
+--     entries; NULL/"[]" both mean nothing is blacklisted yet.
+--
+-- Run once, manually, against a live database:
+--   npx wrangler d1 execute neurocasper-db --remote --file=./migrations/010_add_url_blacklist.sql
+--
+-- The ALTER TABLE statements have no IF NOT EXISTS (SQLite doesn't support
+-- it for ADD COLUMN): running this twice fails on "duplicate column name"
+-- for those two statements -- harmless, it just means it was already
+-- applied.
+--
+-- Additive, safe with real data: url_blacklist_enabled defaults to 0
+-- (off) for every existing chat, so nothing changes for any chat until
+-- its owner deliberately turns it on in /settings and adds at least one
+-- entry -- same reasoning as migrations/009's antilink_enabled default.
+ALTER TABLE channels ADD COLUMN url_blacklist_enabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE channels ADD COLUMN url_blacklist         TEXT;
