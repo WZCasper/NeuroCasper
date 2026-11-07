@@ -1,0 +1,73 @@
+# Run once, manually (Actions tab -> this workflow -> "Run workflow"), to
+# apply migrations/012_add_cod_integration.sql to the live D1 database --
+# adds the Call of Duty / Activision daily-stats integration: the
+# cod_authorizations, activision_session and cod_onboarding_progress
+# tables, plus channels.cod_summary_enabled/cod_title_code
+# (/settings -> chat -> «🎮 Call of Duty»).
+#
+# Safe to re-run: same pattern as 10-migrate-url-blacklist.yml -- checks
+# via PRAGMA table_info(channels) for cod_summary_enabled and skips the
+# whole file if it's already there. The migration file's own CREATE
+# TABLE IF NOT EXISTS statements are harmless to re-run on their own, but
+# the ALTER TABLE ADD COLUMN statements are not (SQLite has no IF NOT
+# EXISTS for columns), so the check still guards the file as a whole.
+#
+# Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repo secrets
+# (same ones the other migration workflows already use).
+name: "12) Add Call of Duty integration tables/columns to D1"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether the migration is already applied
+        id: check
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --json --command "PRAGMA table_info(channels)"
+
+      - name: Decide whether to apply it
+        id: decide
+        env:
+          # command-output is wrangler-action's own documented output
+          # variable (since v3.4.0) holding the previous step's stdout as a
+          # string -- not a file path. Routed through env here (rather than
+          # interpolated directly into the script) so the JSON content is
+          # never substituted into shell syntax.
+          CHECK_OUTPUT: ${{ steps.check.outputs.command-output }}
+        run: |
+          HAS_COLUMN=$(echo "$CHECK_OUTPUT" | jq -r '.[0].results[] | select(.name == "cod_summary_enabled") | .name')
+          if [ -n "$HAS_COLUMN" ]; then
+            echo "already_applied=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Already applied -- nothing to do
+        if: steps.decide.outputs.already_applied == 'true'
+        run: echo "cod_summary_enabled already exists on channels -- migration 012 was already applied, skipping."
+
+      - name: Apply migrations/012_add_cod_integration.sql
+        if: steps.decide.outputs.already_applied == 'false'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --file=./migrations/012_add_cod_integration.sql
+
+      - name: Confirm the new columns and tables are there
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --command "PRAGMA table_info(channels)"
