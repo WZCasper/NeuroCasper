@@ -1,6 +1,7 @@
-import { Bot, Context, GrammyError, InlineKeyboard } from "grammy";
+import { Bot, Context, GrammyError, InlineKeyboard, Keyboard } from "grammy";
 import type { Message } from "grammy/types";
 import {
+  advanceCodOnboardingToTag,
   countDistinctReportingChats,
   createChannel,
   createExtraLink,
@@ -10,19 +11,25 @@ import {
   createStreamer,
   createUserReport,
   deleteChannelsByTelegramChatId,
+  deleteCodOnboardingProgress,
   deleteExtraLink,
+  getActivisionSession,
   getChannelById,
   getChannelByOwnerAndChatId,
   getChannelByTelegramChatId,
+  getCodOnboardingProgress,
   getStreamerById,
   listChannelsByOwner,
+  listCodAuthorizationsByChannel,
   listExtraLinksByStreamer,
   listSocialAccountsByStreamer,
   listStreamersByChannel,
   setSession,
+  startCodOnboarding,
   toggleChannelFlag,
   type ChannelFlag,
   updateChannelAntilinkWhitelist,
+  updateChannelCodTitleCode,
   updateChannelLeaveTemplate,
   updateChannelSpamPhrases,
   updateChannelTemplate,
@@ -30,8 +37,26 @@ import {
   updateChannelWelcomeDeleteAfter,
   updateChannelWelcomeTemplate,
   updateExtraLinkUrl,
+  upsertActivisionSession,
+  upsertCodAuthorization,
 } from "../db.js";
 import { bioLooksLikeSpam, escapeHtml, isMemberStatus } from "../lib/chat-membership.js";
+import { isJoinOrLeaveServiceMessage } from "../lib/service-messages.js";
+import { resolveCodTitleCode } from "../lib/cod-client.js";
+import {
+  formatOnboardingComplete,
+  INVALID_TAG_FORMAT_MESSAGE,
+  isValidAnswerText,
+  looksLikeActivisionTag,
+  QUESTION_1_NAME,
+  QUESTION_2_ACTIVISION_TAG,
+} from "../lib/cod-onboarding.js";
+import {
+  formatHomeButtonLabel,
+  HOME_MENU_BUTTON_LABEL,
+  parseHomeKeyboardPress,
+  type HomeKeyboardPress,
+} from "../lib/home-keyboard.js";
 import {
   DEFAULT_LEAVE_TEMPLATE,
   DEFAULT_WELCOME_DELETE_AFTER_SECONDS,
@@ -61,6 +86,7 @@ import {
   URL_BLACKLIST_PAGE_SIZE,
   addBlacklistEntries,
   addWhitelistEntries,
+  formatDeletionReasonMessage,
   messageHasBlacklistedLink,
   messageHasDisallowedLink,
   removeBlacklistEntryAt,
@@ -69,6 +95,7 @@ import {
   resolveUrlBlacklist,
   serializeAntilinkWhitelist,
   serializeUrlBlacklist,
+  type DeletionReason,
   type WhitelistSkipReason,
 } from "../lib/antilink.js";
 import { estimateRegistrationDate, formatApproximateRegistrationDate } from "../lib/registration-date-estimate.js";
@@ -229,6 +256,19 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
       return;
     }
 
+    // Нажатие кнопки ReplyKeyboard снизу (см. HOME_SECTION_BUTTONS/
+    // handleHomeKeyboardPress ниже) — Telegram прислал её текст как
+    // обычное текстовое сообщение. Проверяется РАНЬШЕ цепочки
+    // session.step: нажатие такой кнопки — явное намерение сменить
+    // раздел, даже если пользователь был посреди ввода чего-то другого
+    // (ровно как «Отмена» у инлайн-экранов ввода уже сбрасывает сессию —
+    // см. комментарий у case "mod" в handleModerationCallback).
+    const pressedButton = ctx.message.text ? parseHomeKeyboardPress(ctx.message.text) : null;
+    if (pressedButton) {
+      await handleHomeKeyboardPress(ctx, env, pressedButton);
+      return;
+    }
+
     const session = ctx.session;
     if (session.step === "awaiting_streamer_name") {
       await handleStreamerNameInput(ctx, env, session.data);
@@ -254,6 +294,10 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
       await handleAntilinkWhitelistInput(ctx, env, session.data);
     } else if (session.step === "awaiting_url_blacklist") {
       await handleUrlBlacklistInput(ctx, env, session.data);
+    } else if (session.step === "awaiting_cod_cookie") {
+      await handleCodCookieInput(ctx, env, session.data);
+    } else if (session.step === "awaiting_cod_title_code") {
+      await handleCodTitleCodeInput(ctx, env, session.data);
     }
   });
 }
@@ -286,6 +330,54 @@ async function isExemptFromAntilink(ctx: BotContext, chatId: number, userId: num
   return member.status === "creator" || member.status === "administrator";
 }
 
+/** Обрабатывает одно сообщение как возможный ответ на onboarding-диалог
+ * Activision (см. startCodOnboarding в handleMemberJoined выше) для
+ * конкретного (channelId, telegramUserId). Возвращает true, если
+ * сообщение действительно было таким ответом и обработано -- вызывающий
+ * код (handleGroupMessage) в этом случае не должен давать сообщению дойти
+ * до дальнейшей обработки (АнтиСсылка и т.д.). Возвращает false, если для
+ * этого пользователя сейчас нет активного диалога -- сообщение самое
+ * обычное, никак не связанное с онбордингом. */
+async function handleCodOnboardingAnswer(
+  ctx: BotContext,
+  env: Env,
+  channelId: number,
+  telegramUserId: number,
+  text: string,
+): Promise<boolean> {
+  const progress = await getCodOnboardingProgress(env, channelId, telegramUserId).catch((err) => {
+    console.error(`getCodOnboardingProgress failed for user ${telegramUserId} in channel ${channelId}:`, err);
+    return null;
+  });
+  if (!progress) return false;
+
+  if (progress.step === "awaiting_name") {
+    if (!isValidAnswerText(text)) {
+      await ctx.reply("Имя не должно быть пустым и не длиннее 100 символов. Попробуйте ещё раз.");
+      return true;
+    }
+    await advanceCodOnboardingToTag(env, channelId, telegramUserId, text.trim());
+    await ctx.reply(QUESTION_2_ACTIVISION_TAG);
+    return true;
+  }
+
+  // progress.step === "awaiting_tag" (единственный другой вариант по
+  // типу CodOnboardingProgressRow.step).
+  if (!isValidAnswerText(text) || !looksLikeActivisionTag(text)) {
+    await ctx.reply(INVALID_TAG_FORMAT_MESSAGE);
+    return true;
+  }
+  // display_name гарантированно не null на шаге "awaiting_tag" --
+  // advanceCodOnboardingToTag выше всегда заполняет его при переходе на
+  // этот шаг, и это единственное место, которое его туда ставит.
+  const displayName = progress.display_name ?? "";
+  const activisionTag = text.trim();
+  await upsertCodAuthorization(env, channelId, telegramUserId, displayName, activisionTag);
+  await deleteCodOnboardingProgress(env, channelId, telegramUserId);
+  await ctx.reply(formatOnboardingComplete(displayName, activisionTag));
+  return true;
+}
+
 async function handleGroupMessage(ctx: BotContext, env: Env): Promise<void> {
   const chat = ctx.chat;
   const message = ctx.message;
@@ -300,33 +392,77 @@ async function handleGroupMessage(ctx: BotContext, env: Env): Promise<void> {
     console.error(`getChannelByTelegramChatId failed for chat ${chat.id} while checking AntiLink/blacklist:`, err);
     return null;
   });
-  // Ни у antilink_enabled, ни у url_blacklist_enabled нет предположения
-  // "включено, пока не зарегистрировано иначе" — оба выключены по
-  // умолчанию (см. комментарии у этих колонок в schema.sql), так что
-  // незарегистрированный чат (channel === null) просто ничего не
-  // фильтрует.
+  // Ни у antilink_enabled, ни у url_blacklist_enabled, ни у
+  // hide_service_messages нет предположения "включено, пока не
+  // зарегистрировано иначе" — все трое выключены по умолчанию (см.
+  // комментарии у этих колонок в schema.sql), так что незарегистрированный
+  // чат (channel === null) просто ничего не фильтрует.
   if (!channel) return;
+
+  // Ответ на вопрос онбординга Activision (см. startCodOnboarding в
+  // handleMemberJoined выше) -- проверяется РАНЬШЕ АнтиСсылки/чёрного
+  // списка ниже: ответ на вопрос 2 (сам тег) почти всегда содержит "#",
+  // но это не ссылка, так что конфликта с ними по сути нет, однако если
+  // участник сейчас в этом диалоге, его сообщение должно обрабатываться
+  // именно как ответ, а не попадать под случайную последующую фильтрацию.
+  if (message.text) {
+    const handled = await handleCodOnboardingAnswer(ctx, env, channel.id, ctx.from.id, message.text);
+    if (handled) return;
+  }
+
+  // Скрытие служебного сообщения Telegram «X вступил(а) в группу» / «X
+  // покинул(а) группу» — не текст самого бота (см. welcome_enabled/
+  // leave_enabled выше, они независимы от этого тумблера), а системная
+  // строка, которую вставляет сама платформа. Проверяется и обрабатывается
+  // раньше АнтиСсылки/чёрного списка ниже: у такого сообщения всё равно
+  // нет текста/ссылок, так что раньше выйти из функции здесь не меняет их
+  // результат, но избавляет от лишней работы.
+  if (channel.hide_service_messages && isJoinOrLeaveServiceMessage(message)) {
+    await ctx.api.deleteMessage(chat.id, message.message_id).catch((err) => {
+      console.error(`deleteMessage (service message) failed for message ${message.message_id} in chat ${chat.id}:`, err);
+    });
+    return;
+  }
 
   // Две независимые причины удалить сообщение — АнтиСсылка (вайтлист,
   // домен целиком) и чёрный список (конкретная ссылка/канал), каждая со
-  // своим собственным тумблером. Проверка чёрного списка пропускается,
-  // если АнтиСсылка уже решила удалить — нет смысла проверять оба, раз
-  // результат (удаление) один и тот же в любом случае.
-  let shouldDelete = false;
+  // своим собственным тумблером. `deletionReason` (а не просто boolean)
+  // запоминает, КАКАЯ именно из двух сработала, чтобы можно было
+  // сообщить точную причину в группе ниже. Проверка чёрного списка
+  // пропускается, если АнтиСсылка уже решила удалить — нет смысла
+  // проверять оба, раз результат (удаление) один и тот же в любом случае.
+  let deletionReason: DeletionReason | null = null;
   if (channel.antilink_enabled) {
     const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
-    shouldDelete = messageHasDisallowedLink(message, whitelist);
+    if (messageHasDisallowedLink(message, whitelist)) deletionReason = "antilink";
   }
-  if (!shouldDelete && channel.url_blacklist_enabled) {
+  if (!deletionReason && channel.url_blacklist_enabled) {
     const blacklist = resolveUrlBlacklist(channel.url_blacklist);
-    shouldDelete = messageHasBlacklistedLink(message, blacklist);
+    if (messageHasBlacklistedLink(message, blacklist)) deletionReason = "blacklist";
   }
-  if (!shouldDelete) return;
+  if (!deletionReason) return;
 
   if (await isExemptFromAntilink(ctx, chat.id, ctx.from.id)) return;
 
   await ctx.api.deleteMessage(chat.id, message.message_id).catch((err) => {
     console.error(`deleteMessage (AntiLink/blacklist) failed for message ${message.message_id} in chat ${chat.id}:`, err);
+  });
+
+  // Сообщаем ПОЧЕМУ сообщение удалено — отдельным сообщением в группу, а
+  // не ответом (reply) на удалённое: Telegram не позволяет ответить на
+  // сообщение, которого уже не существует к этому моменту. Имя
+  // собирается тем же способом, что и в handleMemberJoined/
+  // handleMemberLeft выше (первое+последнее имя Telegram, без общей
+  // функции — то же самое прямое инлайн-выражение, что и там, ради
+  // единообразия с уже существующим стилем этого файла).
+  const displayName = ctx.from.last_name ? `${ctx.from.first_name} ${ctx.from.last_name}` : ctx.from.first_name;
+  // Без parse_mode (обычный текст) — ровно как задокументировано в
+  // formatDeletionReasonMessage: displayName — это first_name/last_name
+  // из Telegram, которые пользователь задаёт сам произвольным текстом, и
+  // без parse_mode Telegram не интерпретирует в нём "<"/"&" как разметку,
+  // так что отдельное экранирование здесь не нужно.
+  await ctx.api.sendMessage(chat.id, formatDeletionReasonMessage(displayName, deletionReason)).catch((err) => {
+    console.error(`sendMessage (deletion reason) failed in chat ${chat.id}:`, err);
   });
 }
 
@@ -648,6 +784,23 @@ async function handleMemberJoined(
     await createPendingMessageDeletion(env, chat.id, sentMessageId, deleteAfterSeconds).catch((err) =>
       console.error(`createPendingMessageDeletion failed for message ${sentMessageId} in chat ${chat.id}:`, err),
     );
+  }
+
+  // Онбординг «авторизации» Activision -- только если чат зарегистрирован
+  // (channel !== null, требование channel.id как внешнего ключа) и
+  // владелец явно включил cod_summary_enabled (новая функция, выключена
+  // по умолчанию для всех -- см. комментарий у этой колонки в schema.sql).
+  // Отдельное сообщение ПОСЛЕ приветствия, а не часть одного с ним -- у
+  // приветствия уже есть собственная забота о TELEGRAM_CAPTION_LIMIT при
+  // фото, плюс у него вообще может не быть sentMessageId (ошибка отправки
+  // выше), что онбордингу не должно мешать.
+  if (channel?.cod_summary_enabled) {
+    await startCodOnboarding(env, channel.id, newMember.id).catch((err) => {
+      console.error(`startCodOnboarding failed for user ${newMember.id} in channel ${channel.id}:`, err);
+    });
+    await ctx.api.sendMessage(chat.id, QUESTION_1_NAME).catch((err) => {
+      console.error(`sendMessage (CoD onboarding question 1) failed in chat ${chat.id}:`, err);
+    });
   }
 }
 
@@ -1017,18 +1170,31 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
       if (i > 0) kb.row();
       kb.text(ch.title ?? String(ch.telegram_chat_id), `set:ch:${ch.id}`);
     });
-    await ctx.editMessageText("Какой канал/группа?", { reply_markup: kb });
+    // editScreen, а не напрямую ctx.editMessageText -- этот же путь
+    // теперь вызывается и из handleHomeKeyboardPress (нажатие reply-
+    // кнопки "🏠 Меню"), где апдейт -- обычное текстовое сообщение, а не
+    // callback_query, так что редактировать уже нечего; editScreen сама
+    // решает, редактировать текущее сообщение или отправить новое.
+    await editScreen(ctx, { text: "Какой канал/группа?", kb });
     return;
   }
 
   if (action === "ch" && rest[1]) {
     const channel = await getChannelById(env, Number(rest[1]));
-    if (channel) await renderChannelSettings(ctx, env, channel);
+    if (channel) {
+      await renderChannelSettings(ctx, env, channel);
+      await sendHomeKeyboard(ctx, channel.id);
+    }
     return;
   }
 
   if (action && MODERATION_ACTIONS.has(action) && rest[1]) {
     await handleModerationCallback(ctx, env, action, rest);
+    return;
+  }
+
+  if (action && COD_ACTIONS.has(action) && rest[1]) {
+    await handleCodCallback(ctx, env, action, rest);
     return;
   }
 
@@ -1169,11 +1335,13 @@ async function renderChannelSettings(ctx: BotContext, env: Env, channel: Channel
     .row()
     .text("👥 Модерация группы", `set:mod:${channel.id}`)
     .row()
+    .text("🎮 Call of Duty", `set:cod:${channel.id}`)
+    .row()
     .text("⬅ Назад", "set:menu")
     .row()
     .text("🏠 Меню", "set:menu");
 
-  await ctx.editMessageText(text, { reply_markup: kb });
+  await editScreen(ctx, { text, kb });
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,7 +1362,7 @@ async function renderStreamerList(ctx: BotContext, env: Env, channel: ChannelRow
     ? `👤 Стримеры канала «${channel.title ?? channel.telegram_chat_id}»\n\nВыберите, кого настроить или отвязать.`
     : `В этом канале пока нет ни одного стримера — добавьте через /add_social.`;
 
-  await ctx.editMessageText(text, { reply_markup: kb });
+  await editScreen(ctx, { text, kb });
 }
 
 async function renderStreamerDetail(ctx: BotContext, env: Env, streamer: StreamerRow): Promise<void> {
@@ -1217,6 +1385,14 @@ async function renderStreamerDetail(ctx: BotContext, env: Env, streamer: Streame
   for (const l of links) {
     kb.text(`✏️ Изменить «${l.label}»`, `set:el:${streamer.id}:${l.id}`).row();
     kb.text(`❌ Убрать «${l.label}»`, `set:rl:${streamer.id}:${l.id}`).row();
+  }
+  // "soc:str:ID" — тот же callback, которым promptStreamerChoice уже ведёт
+  // на promptPlatformChoice при выборе существующего стримера (см.
+  // handleAddSocialCallback's "str" case) -- тот самый список платформ,
+  // где уже занятые (accounts выше) автоматически не предлагаются
+  // повторно. Переиспользуется напрямую, без дублирования этой логики.
+  if (accounts.length < ALL_PLATFORMS.length) {
+    kb.text("➕ Добавить соцсеть", `soc:str:${streamer.id}`).row();
   }
   kb.text("🗑 Удалить стримера целиком", `set:rs:${streamer.id}`).row();
   kb.text("⬅ Назад", `set:strs:${streamer.channel_id}`).row();
@@ -1330,6 +1506,13 @@ const MODERATION_ACTIONS = new Set([
   "bwd", // URL blacklist: delete one entry
 ]);
 
+const COD_ACTIONS = new Set([
+  "cod", // open the Call of Duty screen
+  "codtg", // daily summary: on/off
+  "codck", // set/update the bot's Activision cookie
+  "codtt", // edit the per-channel title-code override
+]);
+
 interface View {
   text: string;
   kb: InlineKeyboard;
@@ -1347,17 +1530,77 @@ function truncateLabel(text: string, max: number): string {
   return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : text;
 }
 
-/** Показывает экран правкой текущего сообщения. Telegram отвечает ошибкой
- * «message is not modified», если новый текст и клавиатура совпали с
- * прежними (например, «сбросить к стандартным», когда уже стандартное) —
- * это не сбой: экран и так актуален. */
+/** Показывает экран. Когда апдейт пришёл с инлайн-кнопки
+ * (ctx.callbackQuery существует) — правит текущее сообщение на месте, как
+ * раньше. Когда апдейта с кнопки НЕТ (апдейт — обычное текстовое
+ * сообщение: пользователь нажал кнопку REPLY-клавиатуры снизу, см.
+ * HOME_SECTION_BUTTONS/bot.on("message:text") ниже, либо написал команду
+ * заново) — редактировать нечего, поэтому отправляется НОВОЕ сообщение с
+ * тем же текстом и той же инлайн-клавиатурой. Это единственное место,
+ * которое решает «править или отправить» — вызывающий код всегда просто
+ * показывает View, не заботясь, как именно пришёл текущий апдейт.
+ *
+ * Telegram отвечает ошибкой «message is not modified», если при правке
+ * новый текст и клавиатура совпали с прежними (например, «сбросить к
+ * стандартным», когда уже стандартное) — это не сбой: экран и так
+ * актуален. */
 async function editScreen(ctx: BotContext, view: View): Promise<void> {
+  if (!ctx.callbackQuery) {
+    await ctx.reply(view.text, { reply_markup: view.kb });
+    return;
+  }
   try {
     await ctx.editMessageText(view.text, { reply_markup: view.kb });
   } catch (err) {
     if (err instanceof GrammyError && err.description.includes("message is not modified")) return;
     throw err;
   }
+}
+
+/** ReplyKeyboard «снизу», постоянно видимая под полем ввода (persistent +
+ * resized — компактная и не сворачивается после одного нажатия), для
+ * одного конкретного канала/группы. Три кнопки — вход в соответствующий
+ * раздел (см. HomeSection в src/lib/home-keyboard.ts), плюс «🏠 Меню»,
+ * ведущая на выбор другого канала/группы. Отправляется ВМЕСТЕ с обычным
+ * сообщением-экраном (как reply_markup у ctx.reply/ctx.api.sendMessage) —
+ * это не замена инлайн-меню внутри разделов, а дополнительный быстрый
+ * доступ к самим разделам. */
+function buildHomeKeyboard(channelId: number): Keyboard {
+  return new Keyboard()
+    .text(formatHomeButtonLabel("channel", channelId))
+    .row()
+    .text(formatHomeButtonLabel("streamers", channelId))
+    .row()
+    .text(formatHomeButtonLabel("moderation", channelId))
+    .row()
+    .text(HOME_MENU_BUTTON_LABEL)
+    .resized()
+    .persistent();
+}
+
+/** Отправляет клавиатуру снизу отдельным (коротким, почти незаметным)
+ * сообщением — Telegram не позволяет совместить InlineKeyboardMarkup и
+ * ReplyKeyboardMarkup на одном reply_markup, так что её нельзя
+ * прикрепить прямо к основному экрану (renderChannelSettings и т.д.),
+ * который и так уже несёт инлайн-клавиатуру. Вызывается РОВНО один раз
+ * на вход в канал (через callback set:ch или через саму reply-кнопку
+ * «🏠 Меню» → выбор канала), а не при каждом editScreen/toggle внутри уже
+ * открытого канала — иначе каждое нажатие toggle-кнопки плодило бы ещё
+ * одно такое сообщение. */
+async function sendHomeKeyboard(ctx: BotContext, channelId: number): Promise<void> {
+  // ctx.chat типизирован как Chat | undefined (внутри "callback_query:data"
+  // это бывает, если исходное сообщение слишком старое и Telegram уже не
+  // прислал его в апдейте) -- и ctx.reply в этом случае НЕ промолчит, а
+  // выбросит исключение (grammY сам вызывает chatId ?? throw изнутри),
+  // так что явная проверка здесь обязательна, а не просто подстраховка:
+  // без неё необработанное исключение прервало бы answerCallbackQuery()
+  // чуть ниже в "callback_query:data" и показало бы человеку красную
+  // ошибку в Telegram, хотя сам экран настроек к этому моменту уже успешно
+  // показан -- это вспомогательная функция, а не критичная для него.
+  if (!ctx.chat) return;
+  await ctx.api.sendMessage(ctx.chat.id, "⌨️ Быстрый доступ к разделам — кнопки снизу.", {
+    reply_markup: buildHomeKeyboard(channelId),
+  });
 }
 
 function buildModerationView(channel: ChannelRow): View {
@@ -1370,12 +1613,15 @@ function buildModerationView(channel: ChannelRow): View {
     `Приветствие новых участников: ${channel.welcome_enabled ? "вкл" : "выкл"}\n` +
     `Уведомление о выходе участника: ${channel.leave_enabled ? "вкл" : "выкл"}\n` +
     `Удаление приветствия/уведомления о выходе через: ${formatDeleteAfter(channel.welcome_delete_after_seconds)}\n` +
+    `Скрывать системные «вступил/покинул» от Telegram: ${channel.hide_service_messages ? "вкл" : "выкл"} ` +
+    "(не текст бота — это строка самого Telegram)\n" +
     `Проверка описания профиля на спам: ${channel.spam_filter_enabled ? "вкл" : "выкл"} ` +
     `(фраз в списке: ${phrases.length}; при совпадении — блокировка на 30 дней)\n` +
     `АнтиСсылка: ${channel.antilink_enabled ? "вкл" : "выкл"} ` +
     `(в белом списке: ${whitelist.length} доменов; админы группы не фильтруются)\n` +
     `Чёрный список ссылок: ${channel.url_blacklist_enabled ? "вкл" : "выкл"} ` +
-    `(в списке: ${blacklist.length} ссылок; работает независимо от АнтиСсылки; админы не фильтруются)\n\n` +
+    `(в списке: ${blacklist.length} ссылок; работает независимо от АнтиСсылки; админы не фильтруются)\n` +
+    "При удалении сообщения АнтиСсылкой или чёрным списком бот присылает в группу отдельное сообщение с указанием причины.\n\n" +
     `Текст приветствия (${channel.welcome_template ? "свой" : "стандартный"}):\n` +
     `${resolveWelcomeTemplate(channel.welcome_template)}\n\n` +
     `Текст уведомления о выходе (${channel.leave_template ? "свой" : "стандартный"}):\n` +
@@ -1391,6 +1637,11 @@ function buildModerationView(channel: ChannelRow): View {
     .row()
     .text("✏️ Изменить текст уведомления о выходе", `set:ltx:${channel.id}`)
     .row()
+    .text(
+      channel.hide_service_messages ? "Показывать системные «вступил/покинул»" : "Скрывать системные «вступил/покинул»",
+      `set:htg:${channel.id}`,
+    )
+    .row()
     .text(channel.spam_filter_enabled ? "Выключить проверку спама" : "Включить проверку спама", `set:stg:${channel.id}`)
     .row()
     .text(`📝 Спам-фразы (${phrases.length})`, `set:spl:${channel.id}:0`)
@@ -1402,6 +1653,39 @@ function buildModerationView(channel: ChannelRow): View {
     .text(channel.url_blacklist_enabled ? "Выключить чёрный список" : "Включить чёрный список", `set:btg:${channel.id}`)
     .row()
     .text(`⛔ Чёрный список ссылок (${blacklist.length})`, `set:bwl:${channel.id}:0`)
+    .row()
+    .text("⬅ Назад", `set:ch:${channel.id}`)
+    .row()
+    .text("🏠 Меню", "set:menu");
+  return { text, kb };
+}
+
+/** Экран настроек Call of Duty/Activision для одного канала --
+ * ВАЖНО: activisionConfigured относится к боту ЦЕЛИКОМ (служебная сессия
+ * одна на весь бот, см. activision_session в schema.sql), а не к этому
+ * конкретному каналу -- текст ниже это явно отражает, чтобы не создавать
+ * впечатление, будто у каждого канала своя отдельная Activision-сессия. */
+function buildCodSettingsView(channel: ChannelRow, activisionConfigured: boolean, authorizedCount: number): View {
+  const titleCode = resolveCodTitleCode(channel.cod_title_code);
+  const text =
+    `🎮 Call of Duty: ${channel.title ?? channel.telegram_chat_id}\n\n` +
+    `Ежедневная сводка по играм: ${channel.cod_summary_enabled ? "вкл" : "выкл"}\n\n` +
+    `Служебная Activision-сессия бота: ${activisionConfigured ? "настроена" : "НЕ настроена"} ` +
+    "(одна на весь бот, общая для всех ваших групп — не отдельно для этого канала)\n\n" +
+    `Код игры (title) для этого канала: «${titleCode}»` +
+    (channel.cod_title_code ? "" : " (по умолчанию — не подтверждён достоверно для Black Ops 7/Modern Warfare 4, см. /settings help)") +
+    "\n\n" +
+    `Авторизовано участников в этой группе: ${authorizedCount}`;
+
+  const kb = new InlineKeyboard()
+    .text(
+      channel.cod_summary_enabled ? "Выключить ежедневную сводку" : "Включить ежедневную сводку",
+      `set:codtg:${channel.id}`,
+    )
+    .row()
+    .text(activisionConfigured ? "🔑 Обновить Activision-cookie" : "🔑 Задать Activision-cookie", `set:codck:${channel.id}`)
+    .row()
+    .text("✏️ Изменить код игры (title)", `set:codtt:${channel.id}`)
     .row()
     .text("⬅ Назад", `set:ch:${channel.id}`)
     .row()
@@ -1629,6 +1913,54 @@ function buildUrlBlacklistAddPromptView(channelId: number): View {
   return { text, kb };
 }
 
+/** Обрабатывает нажатие одной из кнопок ReplyKeyboard снизу (см.
+ * HOME_SECTION_BUTTONS/HomeSection в src/lib/home-keyboard.ts) —
+ * пришедшее как обычное текстовое сообщение, совпавшее с
+ * parseHomeKeyboardPress в bot.on("message", ...) выше. "channel" /
+ * "streamers" / "moderation" открывают тот же самый экран, что и
+ * соответствующая инлайн-кнопка (set:ch / set:strs / set:mod), для того
+ * же самого канала. "menu" открывает выбор канала — то же самое, что
+ * set:menu.
+ *
+ * ВАЖНО, в отличие от action === "ch"/"strs" в handleSettingsCallback
+ * (которые используют "голый" getChannelById БЕЗ проверки владения —
+ * это безопасно для них ТОЛЬКО потому, что channel.id там приходит
+ * исключительно из callback_data инлайн-кнопки, а её текст никогда не
+ * показывается пользователю открытым текстом): здесь channel.id приходит
+ * из ВИДИМОГО текста кнопки ReplyKeyboard, который теоретически можно
+ * напечатать вручную с любым числом. Поэтому здесь ОБЯЗАТЕЛЬНО
+ * getOwnedChannel (с проверкой owner_user_id), а не getChannelById —
+ * иначе подставив чужой числовой id в скобках, можно было бы открыть
+ * чужой канал. */
+async function handleHomeKeyboardPress(ctx: BotContext, env: Env, press: HomeKeyboardPress): Promise<void> {
+  if (press.kind === "menu") {
+    await handleSettingsCallback(ctx, env, ["menu"]);
+    return;
+  }
+
+  const channel = await getOwnedChannel(ctx, env, press.channelId);
+  if (!channel) {
+    await editScreen(ctx, {
+      text: "Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы, или кнопка устарела). Откройте /settings заново.",
+      kb: new InlineKeyboard().text("🏠 Меню", "set:menu"),
+    });
+    return;
+  }
+
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION); // как и «Отмена»/вход в раздел с инлайн-кнопки — сбрасывает незавершённый ввод
+  switch (press.section) {
+    case "channel":
+      await renderChannelSettings(ctx, env, channel);
+      return;
+    case "streamers":
+      await renderStreamerList(ctx, env, channel);
+      return;
+    case "moderation":
+      await editScreen(ctx, buildModerationView(channel));
+      return;
+  }
+}
+
 async function handleModerationCallback(ctx: BotContext, env: Env, action: string, rest: string[]): Promise<void> {
   const channel = await getOwnedChannel(ctx, env, Number(rest[1]));
   if (!channel) {
@@ -1649,16 +1981,18 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
     case "stg":
     case "ltg":
     case "atg":
-    case "btg": {
+    case "btg":
+    case "htg": {
       // A Record (rather than a growing chain of ternaries) so adding a
-      // sixth toggle later is one more line here, not one more branch to
+      // seventh toggle later is one more line here, not one more branch to
       // thread through an already-long conditional.
-      const TOGGLE_ACTION_TO_FLAG: Record<"wtg" | "stg" | "ltg" | "atg" | "btg", ChannelFlag> = {
+      const TOGGLE_ACTION_TO_FLAG: Record<"wtg" | "stg" | "ltg" | "atg" | "btg" | "htg", ChannelFlag> = {
         wtg: "welcome_enabled",
         stg: "spam_filter_enabled",
         ltg: "leave_enabled",
         atg: "antilink_enabled",
         btg: "url_blacklist_enabled",
+        htg: "hide_service_messages",
       };
       const updated = await toggleChannelFlag(env, channel.id, TOGGLE_ACTION_TO_FLAG[action as keyof typeof TOGGLE_ACTION_TO_FLAG]);
       await editScreen(ctx, buildModerationView(updated ?? channel));
@@ -1757,6 +2091,59 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
       const next = removeBlacklistEntryAt(resolveUrlBlacklist(channel.url_blacklist), Number(rest[2]));
       const updated = next ? await updateChannelUrlBlacklist(env, channel.id, serializeUrlBlacklist(next)) : channel;
       await editScreen(ctx, buildUrlBlacklistView(updated ?? channel, Number(rest[3] ?? 0)));
+      return;
+    }
+  }
+}
+
+async function handleCodCallback(ctx: BotContext, env: Env, action: string, rest: string[]): Promise<void> {
+  const channel = await getOwnedChannel(ctx, env, Number(rest[1]));
+  if (!channel) {
+    await editScreen(ctx, {
+      text: "Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Откройте /settings заново.",
+      kb: new InlineKeyboard().text("🏠 Меню", "set:menu"),
+    });
+    return;
+  }
+
+  switch (action) {
+    case "cod": {
+      await setSession(env, ctx.dbUser.id, IDLE_SESSION); // «Отмена» с экрана ввода тоже приходит сюда
+      const [session, authorized] = await Promise.all([
+        getActivisionSession(env),
+        listCodAuthorizationsByChannel(env, channel.id),
+      ]);
+      await editScreen(ctx, buildCodSettingsView(channel, Boolean(session?.cookie_value?.trim()), authorized.length));
+      return;
+    }
+    case "codtg": {
+      const updated = await toggleChannelFlag(env, channel.id, "cod_summary_enabled");
+      const [session, authorized] = await Promise.all([
+        getActivisionSession(env),
+        listCodAuthorizationsByChannel(env, (updated ?? channel).id),
+      ]);
+      await editScreen(ctx, buildCodSettingsView(updated ?? channel, Boolean(session?.cookie_value?.trim()), authorized.length));
+      return;
+    }
+    case "codck": {
+      await setSession(env, ctx.dbUser.id, { step: "awaiting_cod_cookie", data: { return_to_channel_id: channel.id } });
+      await editScreen(ctx, {
+        text:
+          "Пришлите значение ACT_SSO_COOKIE одним сообщением.\n\n" +
+          "Как получить: зайдите на callofduty.com под служебным Activision-аккаунтом бота → откройте инструменты разработчика (Ctrl+Shift+I) → Application/Хранилище → Cookies → callofduty.com → найдите ACT_SSO_COOKIE → скопируйте значение.\n\n" +
+          "Эта сессия общая для всего бота (не только для этой группы) и рано или поздно протухает — обновлять её тем же способом по мере необходимости.",
+        kb: new InlineKeyboard().text("Отмена", `set:cod:${channel.id}`),
+      });
+      return;
+    }
+    case "codtt": {
+      await setSession(env, ctx.dbUser.id, { step: "awaiting_cod_title_code", data: { channel_id: channel.id } });
+      await editScreen(ctx, {
+        text:
+          `Текущий код игры: «${resolveCodTitleCode(channel.cod_title_code)}».\n\n` +
+          "Пришлите новый код одним сообщением (например: bo7, mw4 — когда подтверждённый код для Modern Warfare 4 станет известен). Это тот самый неподтверждённый параметр — см. объяснение в /settings help.",
+        kb: new InlineKeyboard().text("Отмена", `set:cod:${channel.id}`),
+      });
       return;
     }
   }
@@ -1975,4 +2362,60 @@ async function handleUrlBlacklistInput(ctx: BotContext, env: Env, data: { channe
 
   const view = buildUrlBlacklistView(updated, 0);
   await ctx.reply(view.text, { reply_markup: view.kb });
+}
+
+async function handleCodCookieInput(ctx: BotContext, env: Env, data: { return_to_channel_id: number }): Promise<void> {
+  const raw = ctx.message?.text;
+  if (!raw) return;
+
+  // Проверка владения ровно тем каналом, откуда начался этот ввод -- сама
+  // activision_session общая для всего бота (не принадлежит конкретному
+  // каналу), но доступ к самому ВВОДУ её значения должен быть ограничен
+  // владельцем какого-то зарегистрированного канала, а не кем угодно, кто
+  // напишет боту в личку, оказавшись в этом состоянии сессии.
+  const channel = await getOwnedChannel(ctx, env, data.return_to_channel_id);
+  if (!channel) {
+    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
+    return;
+  }
+
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    await ctx.reply("Cookie не должна быть пустой. Пришлите значение ACT_SSO_COOKIE ещё раз, или нажмите «Отмена».");
+    return; // остаёмся в режиме ввода
+  }
+
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+  await upsertActivisionSession(env, { cookieValue: trimmed });
+  const authorized = await listCodAuthorizationsByChannel(env, channel.id);
+  const view = buildCodSettingsView(channel, true, authorized.length);
+  await ctx.reply(`✅ Activision-cookie сохранена.\n\n${view.text}`, { reply_markup: view.kb });
+}
+
+async function handleCodTitleCodeInput(ctx: BotContext, env: Env, data: { channel_id: number }): Promise<void> {
+  const raw = ctx.message?.text;
+  if (!raw) return;
+
+  const channel = await getOwnedChannel(ctx, env, data.channel_id);
+  if (!channel) {
+    await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+    await ctx.reply("Этот чат не найден в ваших настройках (возможно, бота уже убрали из группы). Начните с /settings.");
+    return;
+  }
+
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 40) {
+    await ctx.reply("Код игры не должен быть пустым и не длиннее 40 символов. Попробуйте ещё раз, или нажмите «Отмена».");
+    return; // остаёмся в режиме ввода
+  }
+
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+  const updated = await updateChannelCodTitleCode(env, channel.id, trimmed);
+  const [session, authorized] = await Promise.all([
+    getActivisionSession(env),
+    listCodAuthorizationsByChannel(env, (updated ?? channel).id),
+  ]);
+  const view = buildCodSettingsView(updated ?? channel, Boolean(session?.cookie_value?.trim()), authorized.length);
+  await ctx.reply(`✅ Код игры обновлён.\n\n${view.text}`, { reply_markup: view.kb });
 }
