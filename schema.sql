@@ -9,6 +9,9 @@
 
 PRAGMA foreign_keys = ON;
 
+DROP TABLE IF EXISTS cod_onboarding_progress;
+DROP TABLE IF EXISTS cod_authorizations;
+DROP TABLE IF EXISTS activision_session;
 DROP TABLE IF EXISTS pending_message_deletions;
 DROP TABLE IF EXISTS user_reports;
 DROP TABLE IF EXISTS post_claims;
@@ -88,6 +91,39 @@ CREATE TABLE channels (
   -- JSON array of {hostname, path, display} entries. NULL/"[]" both mean
   -- nothing is blacklisted -- no built-in default here either.
   url_blacklist         TEXT,
+  -- Delete Telegram's OWN service message announcing a member joined/left
+  -- (message.new_chat_members / message.left_chat_member) -- this is the
+  -- grey "X joined the group" / "X left the group" line Telegram itself
+  -- inserts into the chat, completely separate from welcome_enabled/
+  -- leave_enabled above, which are this bot's OWN announcement text. A
+  -- chat can have either, both, or neither turned on independently: hide
+  -- Telegram's own line while keeping the bot's own welcome/leave message,
+  -- or vice versa. Default 0 (OFF) -- unlike the delete-on-sight AntiLink
+  -- features, this has no safety reason to default off, but matching
+  -- welcome_enabled/leave_enabled's default of 1 risks deleting a message
+  -- type with special Telegram semantics (e.g. a NEW member's very first
+  -- message in some client flows IS the join service message) for every
+  -- existing chat the moment this ships, without the owner having asked
+  -- for it -- an explicit opt-in is the safer default for a brand-new
+  -- feature nobody has configured yet. See migrations/011_add_hide_service_messages.sql.
+  hide_service_messages INTEGER NOT NULL DEFAULT 0,
+  -- Ежедневная сводка по играм авторизованных участников (см.
+  -- cod_authorizations выше, src/lib/cod-client.ts,
+  -- src/scheduled-cod-summary.ts). Default 0 (OFF) -- новая функция,
+  -- никто её ещё не настраивал, плюс она зависит от
+  -- activision_session, которой изначально вообще нет ни одной строки.
+  cod_summary_enabled   INTEGER NOT NULL DEFAULT 0,
+  -- Код игры, передаваемый в запрос статистики Call of Duty API
+  -- (src/lib/cod-client.ts) -- НАСТРАИВАЕМЫЙ, а не захардкоженный в коде,
+  -- потому что на момент этой миграции (конец 2026) точный код для
+  -- актуальных игр (Black Ops 7, Modern Warfare 4) НЕ подтверждён ни в
+  -- одном открытом источнике -- только исторические коды для игр
+  -- 2017-2020 (mw, cw, bo3, bo4, wwii, iw) задокументированы где-либо.
+  -- NULL -- используется разумное предположение по умолчанию
+  -- (DEFAULT_COD_TITLE_CODE в cod-client.ts), которое владелец должен
+  -- проверить и при необходимости поменять здесь на подтверждённый код,
+  -- когда таковой станет известен, без единой правки в самом коде бота.
+  cod_title_code        TEXT,
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(owner_user_id, telegram_chat_id)
 );
@@ -303,3 +339,96 @@ CREATE TABLE pending_message_deletions (
 );
 
 CREATE INDEX idx_pending_message_deletions_delete_at ON pending_message_deletions (delete_at);
+
+-- Один участник группы, прошедший «авторизацию» в этой группе: назвал
+-- отображаемое имя и свой Activision-тег в ответ на 2 вопроса при
+-- вступлении (см. src/lib/cod-onboarding.ts). Хранится НАВСЕГДА, как и
+-- попросил владелец -- ничего здесь само не удаляется и не истекает;
+-- единственный способ убрать запись -- владелец или сам участник явно
+-- просит об этом. UNIQUE(channel_id, telegram_user_id): один и тот же
+-- человек авторизуется один раз на канал/группу, повторная попытка
+-- обновляет уже существующую запись (см. upsertCodAuthorization в db.ts),
+-- а не плодит дубликаты. ПОЛНОСТЬЮ независимо от games played — тег
+-- запоминается сам по себе, даже если Activision Sportsman/активность по
+-- нему потом окажется недоступна боту (см. activision_session ниже и
+-- channels.cod_summary_enabled/cod_title_code).
+CREATE TABLE cod_authorizations (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id        INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  telegram_user_id  INTEGER NOT NULL,
+  -- Ответ на вопрос 1 («Как ваше имя?») -- произвольный текст, который
+  -- участник ввёл сам, НЕ обязательно его Telegram-имя.
+  display_name      TEXT NOT NULL,
+  -- Ответ на вопрос 2 -- Activision-тег, пример формата дан самим
+  -- владельцем боту: «亗 Casper#7378333». Хранится ровно как ввёл
+  -- участник, без нормализации регистра/пробелов -- именно так он будет
+  -- показан в ежедневной сводке, и именно так он будет передан боту для
+  -- поиска статистики, когда это станет возможным технически (см.
+  -- activision_session и cod-client.ts -- на момент этой миграции сам
+  -- код игры для Black Ops 7/Modern Warfare 4 ещё не подтверждён, но тег
+  -- запоминается уже сейчас, независимо от этого).
+  activision_tag    TEXT NOT NULL,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (channel_id, telegram_user_id)
+);
+
+-- Служебная сессия СОБСТВЕННОГО Activision-аккаунта бота (не аккаунта
+-- какого-либо участника группы) -- единственная на весь бот, не
+-- привязана к конкретному channel_id/streamer_id. Ровно ОДНА строка
+-- когда-либо существует (id всегда 1 -- см. upsertActivisionSession в
+-- db.ts, которая делает UPSERT по этому фиксированному id, а не INSERT
+-- новой строки на каждое обновление). Эта таблица, а не Worker Secrets,
+-- потому что cookie_value должна обновляться ЧЕРЕЗ /settings самим
+-- владельцем, а Worker Secrets можно менять только через
+-- `wrangler secret put`/дашборд Cloudflare, не из кода бота.
+--
+-- cookie_value -- ЕДИНСТВЕННЫЙ способ входа, который реально
+-- используется кодом (см. src/lib/cod-session.ts): для пути
+-- my.callofduty.com, нужного классическому Warzone, программного входа
+-- по email+паролю не существует вообще ни в каком виде -- это
+-- подтверждено разбором единственной работающей reference-реализации, а
+-- не предположение. Это ACT_SSO_COOKIE, добытая ВРУЧНУЮ из браузера (см.
+-- src/lib/cod-client.ts), обновляется владельцем вручную по мере
+-- истечения -- истечение здесь не отслеживается заранее, бот просто
+-- пробует cookie_value при каждом обращении и обнаруживает её
+-- непригодность по ответу самого Activision (см. CodApiError в
+-- cod-client.ts). email/password хранятся ВПРОК, на случай будущей
+-- отдельной интеграции с другим API (telescope-путь для Warzone2/
+-- MW2/MW3, который ДЕЙСТВИТЕЛЬНО поддерживает пароль, но для ДРУГИХ
+-- игр) -- владелец явно решил не делать эту интеграцию сейчас, так что
+-- сегодняшний код (cod-session.ts) эти два поля не читает вообще.
+CREATE TABLE activision_session (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  email         TEXT,
+  password      TEXT,
+  cookie_value  TEXT,
+  updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Черновик «авторизации» ОДНОГО участника в ОДНОЙ группе, пока он отвечает
+-- на 2 вопроса (см. src/lib/cod-onboarding.ts) -- существует только МЕЖДУ
+-- вопросом 1 и финальным ответом на вопрос 2; как только оба ответа
+-- получены, из этой строки собирается настоящая cod_authorizations (см.
+-- upsertCodAuthorization в db.ts) и сама строка здесь удаляется. Отдельная
+-- таблица, а не поле прямо в cod_authorizations -- cod_authorizations
+-- хранит данные НАВСЕГДА и обе её текстовые колонки NOT NULL ровно
+-- потому, что это завершённая, осмысленная запись; недописанный черновик
+-- с display_name = NULL был бы грязью в той же таблице. UNIQUE
+-- (channel_id, telegram_user_id): участник отвечает на один и тот же
+-- набор вопросов за раз -- если бот прислал вопрос 1 повторно (например,
+-- после перезапуска чего-либо), более новая попытка просто заменяет
+-- прежнюю, а не плодит вторую параллельную.
+CREATE TABLE cod_onboarding_progress (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id        INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  telegram_user_id  INTEGER NOT NULL,
+  -- "awaiting_name" -- ждём ответ на вопрос 1. "awaiting_tag" -- вопрос 1
+  -- получен (см. display_name ниже), ждём ответ на вопрос 2.
+  step              TEXT NOT NULL CHECK (step IN ('awaiting_name', 'awaiting_tag')),
+  -- Заполняется, когда step переходит в 'awaiting_tag'; NULL, пока ждём
+  -- ещё самого первого ответа.
+  display_name      TEXT,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (channel_id, telegram_user_id)
+);
