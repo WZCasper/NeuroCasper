@@ -2,7 +2,14 @@ import { webhookCallback } from "grammy";
 import { createBot } from "./bot.js";
 import { handleKickOAuthCallback, handleKickWebhook } from "./handlers/kick.js";
 import { runScheduledCheck } from "./scheduled.js";
+import { runDailyCodSummary } from "./scheduled-cod-summary.js";
 import type { Env } from "./types.js";
+
+// Код cron-расписания, вызывающего ежедневную сводку CoD -- должен
+// совпадать с его записью в wrangler.toml's crons слово в слово;
+// ScheduledEvent.cron несёт именно ТУ строку, что сработала, так что
+// этим и различаются два настроенных триггера ниже.
+const DAILY_COD_SUMMARY_CRON = "0 8 * * *";
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -34,7 +41,13 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (event.cron === DAILY_COD_SUMMARY_CRON) {
+      ctx.waitUntil(runDailyCodSummary(env));
+      return;
+    }
+    // Любой другой cron (сегодня — только "*/5 * * * *") — обычная
+    // проверка новых стримов, как и раньше.
     ctx.waitUntil(runScheduledCheck(env));
   },
 };

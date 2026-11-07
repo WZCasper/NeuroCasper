@@ -4,7 +4,10 @@
 // Actions script (see src/scheduled.ts), the posts/post_platforms tables
 // too.
 import type {
+  ActivisionSessionRow,
   ChannelRow,
+  CodAuthorizationRow,
+  CodOnboardingProgressRow,
   Env,
   ExtraLinkRow,
   KickTokenRow,
@@ -235,7 +238,9 @@ export type ChannelFlag =
   | "spam_filter_enabled"
   | "leave_enabled"
   | "antilink_enabled"
-  | "url_blacklist_enabled";
+  | "url_blacklist_enabled"
+  | "hide_service_messages"
+  | "cod_summary_enabled";
 
 // Literal SQL per flag rather than interpolating the column name into the
 // query string — `flag` is always a hardcoded literal from the call sites
@@ -249,6 +254,8 @@ const TOGGLE_CHANNEL_FLAG_SQL: Record<ChannelFlag, string> = {
   leave_enabled: "UPDATE channels SET leave_enabled = 1 - leave_enabled WHERE id = ?",
   antilink_enabled: "UPDATE channels SET antilink_enabled = 1 - antilink_enabled WHERE id = ?",
   url_blacklist_enabled: "UPDATE channels SET url_blacklist_enabled = 1 - url_blacklist_enabled WHERE id = ?",
+  hide_service_messages: "UPDATE channels SET hide_service_messages = 1 - hide_service_messages WHERE id = ?",
+  cod_summary_enabled: "UPDATE channels SET cod_summary_enabled = 1 - cod_summary_enabled WHERE id = ?",
 };
 
 export async function toggleChannelFlag(env: Env, channelId: number, flag: ChannelFlag): Promise<ChannelRow | null> {
@@ -833,4 +840,179 @@ export async function listDuePendingMessageDeletions(env: Env): Promise<PendingM
 
 export async function deletePendingMessageDeletion(env: Env, id: number): Promise<void> {
   await env.DB.prepare("DELETE FROM pending_message_deletions WHERE id = ?").bind(id).run();
+}
+
+// ---------------------------------------------------------------------------
+// Call of Duty / Activision integration
+// ---------------------------------------------------------------------------
+
+/** Sets the per-chat Activision API `title` code override (see
+ * ChannelRow.cod_title_code's own comment); null goes back to
+ * DEFAULT_COD_TITLE_CODE in src/lib/cod-client.ts. Returns the updated row. */
+export async function updateChannelCodTitleCode(
+  env: Env,
+  channelId: number,
+  titleCode: string | null,
+): Promise<ChannelRow | null> {
+  await env.DB.prepare("UPDATE channels SET cod_title_code = ? WHERE id = ?").bind(titleCode, channelId).run();
+  return getChannelById(env, channelId);
+}
+
+/** One member's "authorization" (display name + Activision tag) for one
+ * chat, or null if that Telegram user hasn't gone through it in this chat. */
+export async function getCodAuthorization(
+  env: Env,
+  channelId: number,
+  telegramUserId: number,
+): Promise<CodAuthorizationRow | null> {
+  return env.DB.prepare("SELECT * FROM cod_authorizations WHERE channel_id = ? AND telegram_user_id = ?")
+    .bind(channelId, telegramUserId)
+    .first<CodAuthorizationRow>();
+}
+
+/** Creates or updates one member's authorization for one chat --
+ * UNIQUE(channel_id, telegram_user_id) means a repeat run (e.g. the member
+ * answers the 2 questions again) overwrites their previous answers rather
+ * than creating a second row. Stored forever, as the owner asked -- there
+ * is no TTL/expiry anywhere in this path. Returns the resulting row. */
+export async function upsertCodAuthorization(
+  env: Env,
+  channelId: number,
+  telegramUserId: number,
+  displayName: string,
+  activisionTag: string,
+): Promise<CodAuthorizationRow> {
+  await env.DB.prepare(
+    `INSERT INTO cod_authorizations (channel_id, telegram_user_id, display_name, activision_tag)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(channel_id, telegram_user_id) DO UPDATE SET
+       display_name = excluded.display_name,
+       activision_tag = excluded.activision_tag,
+       updated_at = datetime('now')`,
+  )
+    .bind(channelId, telegramUserId, displayName, activisionTag)
+    .run();
+  const row = await getCodAuthorization(env, channelId, telegramUserId);
+  if (!row) throw new Error(`upsertCodAuthorization: row missing immediately after its own upsert (channel ${channelId}, user ${telegramUserId})`);
+  return row;
+}
+
+/** Every member authorized in one chat, oldest-first -- the list the daily
+ * summary (src/scheduled-cod-summary.ts) iterates over for that chat. */
+export async function listCodAuthorizationsByChannel(env: Env, channelId: number): Promise<CodAuthorizationRow[]> {
+  const { results } = await env.DB.prepare("SELECT * FROM cod_authorizations WHERE channel_id = ? ORDER BY created_at ASC")
+    .bind(channelId)
+    .all<CodAuthorizationRow>();
+  return results ?? [];
+}
+
+/** Removes one member's authorization -- the one place this "forever"
+ * data can go away, and only on an explicit request (owner or the member
+ * themselves), never automatically. */
+export async function deleteCodAuthorization(env: Env, channelId: number, telegramUserId: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM cod_authorizations WHERE channel_id = ? AND telegram_user_id = ?")
+    .bind(channelId, telegramUserId)
+    .run();
+}
+
+/** The bot's own Activision session (singleton row, id always 1), or null
+ * if it has never been set up at all. */
+export async function getActivisionSession(env: Env): Promise<ActivisionSessionRow | null> {
+  return env.DB.prepare("SELECT * FROM activision_session WHERE id = 1").first<ActivisionSessionRow>();
+}
+
+/** Creates or updates the bot's singleton Activision session row.
+ * `patch` only overwrites the fields it includes -- e.g. passing just
+ * `{ cookieValue }` (the common case: the owner refreshed the manual
+ * cookie but email/password haven't changed) leaves email/password as
+ * they already were, rather than nulling them out. Returns the resulting
+ * row. */
+export async function upsertActivisionSession(
+  env: Env,
+  patch: { email?: string | null; password?: string | null; cookieValue?: string | null },
+): Promise<ActivisionSessionRow> {
+  const current = await getActivisionSession(env);
+  const email = "email" in patch ? (patch.email ?? null) : (current?.email ?? null);
+  const password = "password" in patch ? (patch.password ?? null) : (current?.password ?? null);
+  const cookieValue = "cookieValue" in patch ? (patch.cookieValue ?? null) : (current?.cookie_value ?? null);
+  await env.DB.prepare(
+    `INSERT INTO activision_session (id, email, password, cookie_value)
+     VALUES (1, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       email = excluded.email,
+       password = excluded.password,
+       cookie_value = excluded.cookie_value,
+       updated_at = datetime('now')`,
+  )
+    .bind(email, password, cookieValue)
+    .run();
+  const row = await getActivisionSession(env);
+  if (!row) throw new Error("upsertActivisionSession: row missing immediately after its own upsert");
+  return row;
+}
+
+// ---------------------------------------------------------------------------
+// Call of Duty onboarding (черновик, см. cod_onboarding_progress в schema.sql)
+// ---------------------------------------------------------------------------
+
+/** Текущий прогресс диалога для одного участника в одном чате, или null,
+ * если никакого диалога сейчас не идёт (ещё не начат, уже завершён, или
+ * никогда не начинался). */
+export async function getCodOnboardingProgress(
+  env: Env,
+  channelId: number,
+  telegramUserId: number,
+): Promise<CodOnboardingProgressRow | null> {
+  return env.DB.prepare("SELECT * FROM cod_onboarding_progress WHERE channel_id = ? AND telegram_user_id = ?")
+    .bind(channelId, telegramUserId)
+    .first<CodOnboardingProgressRow>();
+}
+
+/** Начинает диалог с вопроса 1 -- ON CONFLICT перезаписывает (а не
+ * плодит вторую строку), если по какой-то причине для этой пары уже
+ * существовал незавершённый черновик (например, бот уже один раз
+ * задавал вопрос, но участник не ответил, а потом событие вступления
+ * обработалось ещё раз). */
+export async function startCodOnboarding(env: Env, channelId: number, telegramUserId: number): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO cod_onboarding_progress (channel_id, telegram_user_id, step, display_name)
+     VALUES (?, ?, 'awaiting_name', NULL)
+     ON CONFLICT(channel_id, telegram_user_id) DO UPDATE SET
+       step = 'awaiting_name',
+       display_name = NULL`,
+  )
+    .bind(channelId, telegramUserId)
+    .run();
+}
+
+/** Переводит диалог на вопрос 2, запомнив ответ на вопрос 1. */
+export async function advanceCodOnboardingToTag(
+  env: Env,
+  channelId: number,
+  telegramUserId: number,
+  displayName: string,
+): Promise<void> {
+  await env.DB.prepare(
+    "UPDATE cod_onboarding_progress SET step = 'awaiting_tag', display_name = ? WHERE channel_id = ? AND telegram_user_id = ?",
+  )
+    .bind(displayName, channelId, telegramUserId)
+    .run();
+}
+
+/** Убирает черновик -- вызывается после того, как оба ответа получены и
+ * upsertCodAuthorization уже создал настоящую запись, либо если диалог
+ * нужно отменить по другой причине. */
+export async function deleteCodOnboardingProgress(env: Env, channelId: number, telegramUserId: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM cod_onboarding_progress WHERE channel_id = ? AND telegram_user_id = ?")
+    .bind(channelId, telegramUserId)
+    .run();
+}
+
+/** Every channel with cod_summary_enabled = 1 -- what the daily cron
+ * (src/scheduled-cod-summary.ts) iterates over, across ALL owners (not
+ * scoped to one owner's channels like listChannelsByOwner above), since
+ * the cron is a single global job covering every registered chat. */
+export async function listChannelsWithCodSummaryEnabled(env: Env): Promise<ChannelRow[]> {
+  const { results } = await env.DB.prepare("SELECT * FROM channels WHERE cod_summary_enabled = 1 ORDER BY id ASC").all<ChannelRow>();
+  return results ?? [];
 }
