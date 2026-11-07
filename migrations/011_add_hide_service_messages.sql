@@ -1,0 +1,18 @@
+-- Migration: per-chat toggle to delete Telegram's OWN service message
+-- announcing a member joined/left the group (message.new_chat_members /
+-- message.left_chat_member) -- the grey "X joined the group" / "X left the
+-- group" line Telegram itself inserts, completely separate from
+-- welcome_enabled/leave_enabled (channels table), which are this bot's OWN
+-- announcement text. See src/lib/service-messages.ts.
+--
+-- Run once, manually, against a live database:
+--   npx wrangler d1 execute neurocasper-db --remote --file=./migrations/011_add_hide_service_messages.sql
+--
+-- The ALTER TABLE statement has no IF NOT EXISTS (SQLite doesn't support
+-- it for ADD COLUMN): running this twice fails on "duplicate column name"
+-- -- harmless, it just means it was already applied.
+--
+-- Additive, safe with real data: hide_service_messages defaults to 0
+-- (off) for every existing chat, so nothing changes for any chat until
+-- its owner deliberately turns it on in /settings.
+ALTER TABLE channels ADD COLUMN hide_service_messages INTEGER NOT NULL DEFAULT 0;
