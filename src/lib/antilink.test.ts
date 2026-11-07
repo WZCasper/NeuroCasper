@@ -4,7 +4,9 @@ import type { MessageEntity } from "grammy/types";
 import {
   addBlacklistEntries,
   addWhitelistEntries,
+  deletionReasonLabel,
   extractMessageLinks,
+  formatDeletionReasonMessage,
   hostnameIsWhitelisted,
   isLinkAllowed,
   messageHasBlacklistedLink,
@@ -489,4 +491,31 @@ test("removeBlacklistEntryAt returns null for an out-of-range index", () => {
   assert.equal(removeBlacklistEntryAt(entries, 5), null);
   assert.equal(removeBlacklistEntryAt(entries, -1), null);
   assert.equal(removeBlacklistEntryAt([], 0), null);
+});
+
+// ---------------------------------------------------------------------------
+// deletionReasonLabel / formatDeletionReasonMessage
+// ---------------------------------------------------------------------------
+
+test("deletionReasonLabel gives a distinct Russian label for each reason", () => {
+  assert.equal(deletionReasonLabel("antilink"), "АнтиСсылка (ссылка не из белого списка)");
+  assert.equal(deletionReasonLabel("blacklist"), "чёрный список ссылок");
+});
+
+test("formatDeletionReasonMessage includes the display name and the matching reason label verbatim", () => {
+  const message = formatDeletionReasonMessage("Vasya Pupkin", "antilink");
+  assert.ok(message.includes("Vasya Pupkin"), "must include the display name");
+  assert.ok(message.includes(deletionReasonLabel("antilink")), "must include the antilink reason label");
+});
+
+test("formatDeletionReasonMessage switches the label when the reason is blacklist instead", () => {
+  const message = formatDeletionReasonMessage("Vasya Pupkin", "blacklist");
+  assert.ok(message.includes(deletionReasonLabel("blacklist")), "must include the blacklist reason label");
+  assert.ok(!message.includes(deletionReasonLabel("antilink")), "must NOT include the antilink label for a blacklist reason");
+});
+
+test("formatDeletionReasonMessage does not escape or alter the display name -- callers sending it must use plain text (no parse_mode), never parse_mode: \"HTML\", so a hostile first_name can't inject markup", () => {
+  const hostileName = '<a href="https://evil.example">click</a>';
+  const message = formatDeletionReasonMessage(hostileName, "blacklist");
+  assert.ok(message.includes(hostileName), "the raw name must appear unescaped -- plain-text sending is what keeps this safe, not escaping here");
 });

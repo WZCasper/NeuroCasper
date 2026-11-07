@@ -503,3 +503,44 @@ export function removeWhitelistEntryAt(current: readonly string[], index: number
   if (!Number.isInteger(index) || index < 0 || index >= current.length) return null;
   return current.filter((_, i) => i !== index);
 }
+
+// ---------------------------------------------------------------------------
+// Announcing WHY a message got deleted
+// ---------------------------------------------------------------------------
+
+/** Which link-moderation feature triggered a deletion -- "antilink" is a
+ * link whose HOSTNAME isn't on the whitelist (channels.antilink_enabled);
+ * "blacklist" is a link matching one specific blacklisted resource
+ * (channels.url_blacklist_enabled), independent of AntiLink/the whitelist.
+ * There is deliberately no "antispam" member here: today's spam filter
+ * (channels.spam_filter_enabled, src/lib/chat-membership.ts's
+ * bioLooksLikeSpam) only ever checks a NEW MEMBER'S BIO at join time, not
+ * the text of ordinary group messages, so it never deletes a message with
+ * a link in the first place and has nothing to announce a reason for
+ * here. If a future change makes the spam filter delete messages too,
+ * this union (and formatDeletionReasonMessage below) is the place to add
+ * that third case. */
+export type DeletionReason = "antilink" | "blacklist";
+
+/** Human-readable (Russian) label for one DeletionReason, used both in the
+ * group-chat announcement below and anywhere else a reason needs to be
+ * shown to a chat owner (e.g. a future moderation log). */
+export function deletionReasonLabel(reason: DeletionReason): string {
+  return reason === "antilink" ? "АнтиСсылка (ссылка не из белого списка)" : "чёрный список ссылок";
+}
+
+/** The message posted to the GROUP right after a link-triggered deletion,
+ * stating who got moderated and why (AntiLink vs the URL blacklist) --
+ * see src/handlers/telegram.ts's call site in handleGroupMessage. Plain
+ * text on purpose, same reasoning as DEFAULT_WELCOME_TEMPLATE in
+ * moderation-settings.ts: `displayName` is free-text the member chose for
+ * themselves (their Telegram first/last name), so it is NOT safe to send
+ * with parse_mode: "HTML" without escaping it first -- sending it as plain
+ * text sidesteps that risk entirely rather than requiring every call site
+ * to remember to escape it. Not a per-chat customizable template (unlike
+ * welcome/leave text): the request was for the reason to be stated, not
+ * for the wording to be configurable, so there is deliberately no
+ * database column or settings-menu entry for this text. */
+export function formatDeletionReasonMessage(displayName: string, reason: DeletionReason): string {
+  return `🗑 Сообщение пользователя ${displayName} удалено.\nПричина: ${deletionReasonLabel(reason)}.`;
+}
