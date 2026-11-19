@@ -52,8 +52,10 @@ import {
   QUESTION_2_ACTIVISION_TAG,
 } from "../lib/cod-onboarding.js";
 import {
+  formatChannelChoiceButtonLabel,
   formatHomeButtonLabel,
   HOME_MENU_BUTTON_LABEL,
+  parseChannelChoicePress,
   parseHomeKeyboardPress,
   type HomeKeyboardPress,
 } from "../lib/home-keyboard.js";
@@ -187,7 +189,7 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
     }
     const only = channels.length === 1 ? channels[0] : undefined;
     if (only) await promptStreamerChoice(ctx, env, only, false);
-    else await promptChannelChoice(ctx, channels, "soc");
+    else await promptChannelChoice(ctx, channels);
   });
 
   bot.command("settings", async (ctx) => {
@@ -201,7 +203,7 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
       await ctx.reply("Вы ещё не зарегистрировали канал или группу — см. /start.");
       return;
     }
-    await promptChannelChoice(ctx, channels, "set");
+    await sendChannelChoiceKeyboard(ctx, channels);
   });
 
   bot.command("report", async (ctx) => {
@@ -262,11 +264,31 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
     // session.step: нажатие такой кнопки — явное намерение сменить
     // раздел, даже если пользователь был посреди ввода чего-то другого
     // (ровно как «Отмена» у инлайн-экранов ввода уже сбрасывает сессию —
-    // см. комментарий у case "mod" в handleModerationCallback).
-    const pressedButton = ctx.message.text ? parseHomeKeyboardPress(ctx.message.text) : null;
-    if (pressedButton) {
-      await handleHomeKeyboardPress(ctx, env, pressedButton);
-      return;
+    // см. комментарий у case "mod" в handleModerationCallback). Список
+    // каналов владельца нужен здесь, чтобы сопоставить текст кнопки
+    // (теперь содержащий НАЗВАНИЕ канала, не id — см. home-keyboard.ts)
+    // с конкретным channelId.
+    if (ctx.message.text) {
+      const ownedChannels = await listChannelsByOwner(env, ctx.dbUser.id);
+
+      const pressedButton = parseHomeKeyboardPress(ctx.message.text, ownedChannels);
+      if (pressedButton) {
+        await handleHomeKeyboardPress(ctx, env, pressedButton);
+        return;
+      }
+
+      // Нажатие кнопки выбора канала (sendChannelChoiceKeyboard выше) —
+      // тот же принцип: текст кнопки сверяется со СПИСКОМ реальных
+      // каналов владельца, а не разбирается как число/id.
+      const chosenChannelId = parseChannelChoicePress(ctx.message.text, ownedChannels);
+      if (chosenChannelId !== null) {
+        const channel = await getChannelById(env, chosenChannelId);
+        if (channel) {
+          await renderChannelSettings(ctx, env, channel);
+          await sendHomeKeyboard(ctx, channel);
+        }
+        return;
+      }
     }
 
     const session = ctx.session;
@@ -895,7 +917,13 @@ async function registerChannelFromForward(ctx: BotContext, env: Env): Promise<vo
 // /add_social: канал -> стример (новый или существующий) -> платформа/ссылка -> значение
 // ---------------------------------------------------------------------------
 
-async function promptChannelChoice(ctx: BotContext, channels: ChannelRow[], prefix: "soc" | "set"): Promise<void> {
+/** Выбор канала только для сценария /add_social ("soc:ch:ID" дальше ведёт
+ * на выбор/создание стримера) -- остаётся инлайн-клавиатурой, в отличие
+ * от /settings (см. sendChannelChoiceKeyboard выше), потому что эта
+ * reply-кнопка должна знать, что дальше нужен именно флоу добавления
+ * соцсети, а не настроек канала, а ReplyKeyboard-кнопка не умеет нести
+ * такой скрытый контекст в своём тексте — только видимое название. */
+async function promptChannelChoice(ctx: BotContext, channels: ChannelRow[]): Promise<void> {
   // .row() is only called BETWEEN buttons (never after the last one) --
   // see buildKeyboard's own comment (src/lib/buttons.ts) on why calling
   // it after every single button, including the last, always leaves a
@@ -904,7 +932,7 @@ async function promptChannelChoice(ctx: BotContext, channels: ChannelRow[], pref
   const kb = new InlineKeyboard();
   channels.forEach((ch, i) => {
     if (i > 0) kb.row();
-    kb.text(ch.title ?? String(ch.telegram_chat_id), `${prefix}:ch:${ch.id}`);
+    kb.text(ch.title ?? String(ch.telegram_chat_id), `soc:ch:${ch.id}`);
   });
   await ctx.reply("Какой канал/группа?", { reply_markup: kb });
 }
@@ -1162,20 +1190,7 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
 
   if (action === "menu") {
     const channels = await listChannelsByOwner(env, ctx.dbUser.id);
-    // Same trailing-empty-row defect and the same fix as buildKeyboard
-    // (src/lib/buttons.ts) and promptChannelChoice above -- .row() goes
-    // BETWEEN buttons only, never after the very last one.
-    const kb = new InlineKeyboard();
-    channels.forEach((ch, i) => {
-      if (i > 0) kb.row();
-      kb.text(ch.title ?? String(ch.telegram_chat_id), `set:ch:${ch.id}`);
-    });
-    // editScreen, а не напрямую ctx.editMessageText -- этот же путь
-    // теперь вызывается и из handleHomeKeyboardPress (нажатие reply-
-    // кнопки "🏠 Меню"), где апдейт -- обычное текстовое сообщение, а не
-    // callback_query, так что редактировать уже нечего; editScreen сама
-    // решает, редактировать текущее сообщение или отправить новое.
-    await editScreen(ctx, { text: "Какой канал/группа?", kb });
+    await sendChannelChoiceKeyboard(ctx, channels);
     return;
   }
 
@@ -1183,7 +1198,7 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
     const channel = await getChannelById(env, Number(rest[1]));
     if (channel) {
       await renderChannelSettings(ctx, env, channel);
-      await sendHomeKeyboard(ctx, channel.id);
+      await sendHomeKeyboard(ctx, channel);
     }
     return;
   }
@@ -1325,9 +1340,9 @@ async function renderChannelSettings(ctx: BotContext, env: Env, channel: Channel
     `Текст уведомления:\n${channel.message_template}`;
 
   const kb = new InlineKeyboard()
-    .text(channel.auto_pin ? "Выключить автозакрепление" : "Включить автозакрепление", `set:pin:${channel.id}`)
+    .text(toggleButtonLabel("Автозакрепление", Boolean(channel.auto_pin)), `set:pin:${channel.id}`)
     .row()
-    .text(channel.auto_unpin ? "Выключить автооткрепление" : "Включить автооткрепление", `set:unpin:${channel.id}`)
+    .text(toggleButtonLabel("Автооткрепление", Boolean(channel.auto_unpin)), `set:unpin:${channel.id}`)
     .row()
     .text("Изменить текст уведомления", `set:tpl:${channel.id}`)
     .row()
@@ -1557,6 +1572,19 @@ async function editScreen(ctx: BotContext, view: View): Promise<void> {
   }
 }
 
+/** Текст кнопки-тумблера с ВИЗУАЛЬНЫМ состоянием прямо на самой кнопке —
+ * ✅ когда включено, ❌ когда выключено, а не только нейтральное
+ * "Включить/Выключить X" без собственной индикации состояния. Единая
+ * функция для КАЖДОЙ toggle-кнопки в боте (welcome/leave/антиспам/
+ * АнтиСсылка/чёрный список/служебные сообщения/ежедневная сводка CoD и
+ * любая будущая), чтобы вид был согласован везде одинаково, а не
+ * изобретался заново на каждом экране. Текст кнопки остаётся тем же при
+ * любом состоянии (не меняется на "Выключить X"/"Включить X") — только
+ * значок перед названием показывает текущее состояние. */
+function toggleButtonLabel(label: string, enabled: boolean): string {
+  return `${enabled ? "✅" : "❌"} ${label}`;
+}
+
 /** ReplyKeyboard «снизу», постоянно видимая под полем ввода (persistent +
  * resized — компактная и не сворачивается после одного нажатия), для
  * одного конкретного канала/группы. Три кнопки — вход в соответствующий
@@ -1565,13 +1593,41 @@ async function editScreen(ctx: BotContext, view: View): Promise<void> {
  * сообщением-экраном (как reply_markup у ctx.reply/ctx.api.sendMessage) —
  * это не замена инлайн-меню внутри разделов, а дополнительный быстрый
  * доступ к самим разделам. */
-function buildHomeKeyboard(channelId: number): Keyboard {
+/** Экран выбора канала/группы (пункт 3: раньше был инлайн-список, теперь
+ * — ReplyKeyboard снизу, по тому же принципу, что и buildHomeKeyboard
+ * ниже). Если апдейт пришёл с инлайн-кнопки (⬅ Назад/🏠 Меню на каком-то
+ * из экранов) — у того сообщения убирается инлайн-клавиатура (сам выбор
+ * переехал на клавиатуру снизу, оставлять старые кнопки там же было бы
+ * сбивающим с толку дублированием), а сама ReplyKeyboard отправляется
+ * ОТДЕЛЬНЫМ сообщением следом (Telegram не даёт совместить
+ * InlineKeyboardMarkup и ReplyKeyboardMarkup на одном reply_markup — та
+ * же причина, по которой buildHomeKeyboard/sendHomeKeyboard ниже делают
+ * то же самое для кнопок разделов). */
+async function sendChannelChoiceKeyboard(ctx: BotContext, channels: readonly ChannelRow[]): Promise<void> {
+  if (channels.length === 0) {
+    await editScreen(ctx, { text: "У вас пока нет зарегистрированных каналов/групп — см. /start.", kb: new InlineKeyboard() });
+    return;
+  }
+
+  await editScreen(ctx, { text: "Какой канал/группа? Выберите кнопкой снизу.", kb: new InlineKeyboard() });
+
+  if (!ctx.chat) return; // см. тот же комментарий про ctx.chat в sendHomeKeyboard ниже
+  const kb = new Keyboard();
+  channels.forEach((ch, i) => {
+    if (i > 0) kb.row();
+    kb.text(formatChannelChoiceButtonLabel(ch));
+  });
+  kb.resized().persistent();
+  await ctx.api.sendMessage(ctx.chat.id, "⌨️ Выберите канал/группу кнопкой снизу.", { reply_markup: kb });
+}
+
+function buildHomeKeyboard(channel: ChannelRow): Keyboard {
   return new Keyboard()
-    .text(formatHomeButtonLabel("channel", channelId))
+    .text(formatHomeButtonLabel("channel", channel))
     .row()
-    .text(formatHomeButtonLabel("streamers", channelId))
+    .text(formatHomeButtonLabel("streamers", channel))
     .row()
-    .text(formatHomeButtonLabel("moderation", channelId))
+    .text(formatHomeButtonLabel("moderation", channel))
     .row()
     .text(HOME_MENU_BUTTON_LABEL)
     .resized()
@@ -1587,7 +1643,7 @@ function buildHomeKeyboard(channelId: number): Keyboard {
  * «🏠 Меню» → выбор канала), а не при каждом editScreen/toggle внутри уже
  * открытого канала — иначе каждое нажатие toggle-кнопки плодило бы ещё
  * одно такое сообщение. */
-async function sendHomeKeyboard(ctx: BotContext, channelId: number): Promise<void> {
+async function sendHomeKeyboard(ctx: BotContext, channel: ChannelRow): Promise<void> {
   // ctx.chat типизирован как Chat | undefined (внутри "callback_query:data"
   // это бывает, если исходное сообщение слишком старое и Telegram уже не
   // прислал его в апдейте) -- и ctx.reply в этом случае НЕ промолчит, а
@@ -1599,7 +1655,7 @@ async function sendHomeKeyboard(ctx: BotContext, channelId: number): Promise<voi
   // показан -- это вспомогательная функция, а не критичная для него.
   if (!ctx.chat) return;
   await ctx.api.sendMessage(ctx.chat.id, "⌨️ Быстрый доступ к разделам — кнопки снизу.", {
-    reply_markup: buildHomeKeyboard(channelId),
+    reply_markup: buildHomeKeyboard(channel),
   });
 }
 
@@ -1627,30 +1683,27 @@ function buildModerationView(channel: ChannelRow): View {
     `Текст уведомления о выходе (${channel.leave_template ? "свой" : "стандартный"}):\n` +
     resolveLeaveTemplate(channel.leave_template);
   const kb = new InlineKeyboard()
-    .text(channel.welcome_enabled ? "Выключить приветствие" : "Включить приветствие", `set:wtg:${channel.id}`)
+    .text(toggleButtonLabel("Приветствие новых участников", Boolean(channel.welcome_enabled)), `set:wtg:${channel.id}`)
     .row()
     .text("✏️ Изменить текст приветствия", `set:wtx:${channel.id}`)
     .row()
     .text("⏱ Время удаления приветствия/выхода", `set:wdt:${channel.id}`)
     .row()
-    .text(channel.leave_enabled ? "Выключить уведомление о выходе" : "Включить уведомление о выходе", `set:ltg:${channel.id}`)
+    .text(toggleButtonLabel("Уведомление о выходе", Boolean(channel.leave_enabled)), `set:ltg:${channel.id}`)
     .row()
     .text("✏️ Изменить текст уведомления о выходе", `set:ltx:${channel.id}`)
     .row()
-    .text(
-      channel.hide_service_messages ? "Показывать системные «вступил/покинул»" : "Скрывать системные «вступил/покинул»",
-      `set:htg:${channel.id}`,
-    )
+    .text(toggleButtonLabel("Скрывать системные «вступил/покинул»", Boolean(channel.hide_service_messages)), `set:htg:${channel.id}`)
     .row()
-    .text(channel.spam_filter_enabled ? "Выключить проверку спама" : "Включить проверку спама", `set:stg:${channel.id}`)
+    .text(toggleButtonLabel("Проверка спама", Boolean(channel.spam_filter_enabled)), `set:stg:${channel.id}`)
     .row()
     .text(`📝 Спам-фразы (${phrases.length})`, `set:spl:${channel.id}:0`)
     .row()
-    .text(channel.antilink_enabled ? "Выключить АнтиСсылку" : "Включить АнтиСсылку", `set:atg:${channel.id}`)
+    .text(toggleButtonLabel("АнтиСсылка", Boolean(channel.antilink_enabled)), `set:atg:${channel.id}`)
     .row()
     .text(`🔗 Белый список ссылок (${whitelist.length})`, `set:awl:${channel.id}:0`)
     .row()
-    .text(channel.url_blacklist_enabled ? "Выключить чёрный список" : "Включить чёрный список", `set:btg:${channel.id}`)
+    .text(toggleButtonLabel("Чёрный список ссылок", Boolean(channel.url_blacklist_enabled)), `set:btg:${channel.id}`)
     .row()
     .text(`⛔ Чёрный список ссылок (${blacklist.length})`, `set:bwl:${channel.id}:0`)
     .row()
@@ -1667,21 +1720,42 @@ function buildModerationView(channel: ChannelRow): View {
  * впечатление, будто у каждого канала своя отдельная Activision-сессия. */
 function buildCodSettingsView(channel: ChannelRow, activisionConfigured: boolean, authorizedCount: number): View {
   const titleCode = resolveCodTitleCode(channel.cod_title_code);
+
+  // Три шага настройки показаны по порядку, каждый со своей меткой
+  // "✅ готово" / "☐ ещё нет" — владельцу сразу видно, на каком шаге он
+  // сейчас остановился, а не только сухие статусы без контекста.
+  const step1Done = activisionConfigured;
+  const step2Done = authorizedCount > 0;
+  const stepMark = (done: boolean) => (done ? "✅" : "☐");
+
   const text =
     `🎮 Call of Duty: ${channel.title ?? channel.telegram_chat_id}\n\n` +
-    `Ежедневная сводка по играм: ${channel.cod_summary_enabled ? "вкл" : "выкл"}\n\n` +
-    `Служебная Activision-сессия бота: ${activisionConfigured ? "настроена" : "НЕ настроена"} ` +
-    "(одна на весь бот, общая для всех ваших групп — не отдельно для этого канала)\n\n" +
-    `Код игры (title) для этого канала: «${titleCode}»` +
-    (channel.cod_title_code ? "" : " (по умолчанию — не подтверждён достоверно для Black Ops 7/Modern Warfare 4, см. /settings help)") +
+    "Что это: раз в день (08:00 UTC) бот присылает в эту группу сводку по играм каждого авторизованного участника. " +
+    "Чтобы это заработало, нужно пройти 3 шага по порядку — ниже видно, какой уже сделан.\n\n" +
+    `${stepMark(step1Done)} Шаг 1 — служебный Activision-аккаунт бота.\n` +
+    `Статус: ${activisionConfigured ? "настроен" : "НЕ настроен"}. ` +
+    "Это ОДИН аккаунт на весь бот, общий сразу для всех ваших групп — не отдельно для этой. " +
+    "Нужен отдельный, специально созданный Activision-аккаунт (не ваш личный). " +
+    "Кнопка «🔑 Задать/Обновить Activision-cookie» ниже — там же инструкция, как достать cookie из браузера.\n\n" +
+    `${stepMark(step2Done)} Шаг 2 — участники должны пройти авторизацию в самой группе.\n` +
+    `Авторизовано сейчас: ${authorizedCount}. ` +
+    "Это происходит само: когда новый человек вступает в группу (и сводка включена — см. шаг 3), " +
+    "бот сам задаёт ему 2 вопроса (имя и Activision-тег) прямо в группе. " +
+    "Отдельной кнопки для этого шага нет — его не нужно запускать вручную.\n\n" +
+    "Шаг 3 — включить саму сводку для этой группы.\n" +
+    `Сейчас: ${channel.cod_summary_enabled ? "включена" : "выключена"}. ` +
+    "Кнопка-тумблер первая в списке ниже.\n\n" +
+    `Код игры (title) для этой группы: «${titleCode}»` +
+    (channel.cod_title_code
+      ? "."
+      : " — это значение по умолчанию, оно НЕ подтверждено достоверно для Black Ops 7/Modern Warfare 4 (Activision нигде это не публикует). " +
+        "Если сводка не находит статистику — попробуйте сменить код кнопкой «✏️ Изменить код игры» ниже; другие варианты для пробы: bo6, mw4, bo4.") +
     "\n\n" +
-    `Авторизовано участников в этой группе: ${authorizedCount}`;
+    "Также важно: у каждого участника профиль Call of Duty должен быть публичным — иначе бот не сможет прочитать его статистику, " +
+    "даже если всё остальное настроено верно. Участнику нужно зайти на callofduty.com → Account Linking → включить видимость статистики для посторонних аккаунтов.";
 
   const kb = new InlineKeyboard()
-    .text(
-      channel.cod_summary_enabled ? "Выключить ежедневную сводку" : "Включить ежедневную сводку",
-      `set:codtg:${channel.id}`,
-    )
+    .text(toggleButtonLabel("Ежедневная сводка", Boolean(channel.cod_summary_enabled)), `set:codtg:${channel.id}`)
     .row()
     .text(activisionConfigured ? "🔑 Обновить Activision-cookie" : "🔑 Задать Activision-cookie", `set:codck:${channel.id}`)
     .row()

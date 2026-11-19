@@ -4,18 +4,21 @@
 // ReplyKeyboard физически не умеет редактировать сообщение на месте и не
 // умеет листать страницы списка (белый/чёрный список, список стримеров),
 // так что внутри каждого раздела навигация остаётся на InlineKeyboard, как
-// и была. Эти пять кнопок — только вход в раздел (эквивалент нажатия
-// самой первой инлайн-кнопки в renderChannelSettings/
-// buildModerationView), не замена всего, что внутри него.
+// и была. Эти кнопки — только вход в раздел (эквивалент нажатия самой
+// первой инлайн-кнопки в renderChannelSettings/buildModerationView), не
+// замена всего, что внутри него.
 //
 // ReplyKeyboard-кнопка не умеет нести скрытый payload (в отличие от
-// callback_data инлайн-кнопки) — Telegram присылает ровно тот текст,
-// что написан на кнопке, как обычное сообщение от пользователя. Чтобы
-// кнопка «знала», к какому именно каналу/группе она относится (у
-// владельца их может быть несколько), ID канала дописывается в сам
-// видимый текст кнопки в квадратных скобках: "👥 Модерация [42]".
-// parseHomeKeyboardPress ниже — обратная операция: по полученному тексту
-// определить, какой раздел нажат и для какого ID канала.
+// callback_data инлайн-кнопки) — Telegram присылает ровно тот текст, что
+// написан на кнопке, как обычное сообщение от пользователя. Кнопка
+// показывает НАЗВАНИЕ канала/группы (а не технический id) — то, что
+// реально видит владелец, например "👥 Модерация — CLUB WARZONE".
+// parseHomeKeyboardPress ниже сопоставляет полученный текст с РЕАЛЬНЫМ
+// списком каналов владельца (передаётся ей отдельным параметром), а не
+// разбирает число из текста — названия каналов это текст, который может
+// содержать что угодно, включая квадратные скобки/эмодзи, так что
+// надёжный способ узнать «какой это канал» — сравнить с текущим списком
+// каналов, а не пытаться закодировать id внутри самого названия.
 
 /** Один раздел верхнего уровня — КАЖДЫЙ из трёх имеет собственный
  * отдельный экран в /settings (renderChannelSettings/renderStreamerList/
@@ -27,23 +30,39 @@
  * не добавляют. */
 export type HomeSection = "channel" | "streamers" | "moderation";
 
-/** Эмодзи-иконка + подпись для каждого раздела, БЕЗ id канала — этим
- * занимается formatHomeButtonLabel. Единый источник подписи, чтобы текст
- * кнопки и её разбор (parseHomeKeyboardPress) не могли разойтись. */
+/** Эмодзи-иконка + подпись для каждого раздела, БЕЗ названия канала —
+ * этим занимается formatHomeButtonLabel. Единый источник подписи, чтобы
+ * текст кнопки и её разбор (parseHomeKeyboardPress) не могли разойтись. */
 const SECTION_LABEL: Record<HomeSection, string> = {
   channel: "⚙️ Канал",
   streamers: "👤 Стримеры",
   moderation: "👥 Модерация",
 };
 
-/** Текст кнопки, с ID канала в квадратных скобках — то, что реально
- * увидит и отправит пользователь, нажав эту кнопку. */
-export function formatHomeButtonLabel(section: HomeSection, channelId: number): string {
-  return `${SECTION_LABEL[section]} [${channelId}]`;
+/** Минимально необходимое о канале для этого модуля — не весь ChannelRow
+ * (у него десятки других полей, не имеющих отношения к тексту кнопки). */
+export interface HomeKeyboardChannel {
+  id: number;
+  title: string | null;
+  telegram_chat_id: number;
 }
 
-/** Текст кнопки «🏠 Меню» — без id, она ведёт на выбор канала (set:menu),
- * а не внутрь какого-то одного канала. */
+/** То же самое отображаемое название, что уже используется в других
+ * местах интерфейса (promptChannelChoice и т.п.) -- если у канала нет
+ * заголовка (ещё не подтянут Telegram-ом), используется сам numeric
+ * chat id как видимый текст. */
+function displayTitle(channel: HomeKeyboardChannel): string {
+  return channel.title ?? String(channel.telegram_chat_id);
+}
+
+/** Текст кнопки — "<иконка раздела> — <название канала>", то, что
+ * реально увидит и отправит пользователь, нажав эту кнопку. */
+export function formatHomeButtonLabel(section: HomeSection, channel: HomeKeyboardChannel): string {
+  return `${SECTION_LABEL[section]} — ${displayTitle(channel)}`;
+}
+
+/** Текст кнопки «🏠 Меню» — без названия канала, она ведёт на выбор
+ * канала (set:menu), а не внутрь какого-то одного канала. */
 export const HOME_MENU_BUTTON_LABEL = "🏠 Меню";
 
 /** Что получилось разобрать из текста входящего сообщения, если это
@@ -53,28 +72,47 @@ export const HOME_MENU_BUTTON_LABEL = "🏠 Меню";
 export type HomeKeyboardPress = { kind: "section"; section: HomeSection; channelId: number } | { kind: "menu" };
 
 /** Разбирает текст входящего сообщения обратно в (раздел, id канала) —
- * обратная операция к formatHomeButtonLabel/HOME_MENU_BUTTON_LABEL. Не
- * доверяет регистру/пробелам отправителя: сравнение точное, потому что
+ * обратная операция к formatHomeButtonLabel/HOME_MENU_BUTTON_LABEL.
+ * Сопоставляет текст с ownedChannels (каналы ЭТОГО владельца) по точному
+ * совпадению "<иконка раздела> — <название>" — название канала может
+ * быть любым текстом, так что надёжно опознать канал можно только
+ * сверкой со списком его реальных каналов, а не разбором самого текста.
+ * Не доверяет регистру/пробелам отправителя: сравнение точное, потому что
  * ЭТО сообщение может прийти только от самого Telegram-клиента, нажавшего
  * ровно ту кнопку, что была отправлена клавиатурой — текст кнопки
- * пользователь никогда не вводит вручную, так что точное совпадение (без
- * побочной нормализации регистра и пробелов, которая могла бы случайно
- * совпасть с посторонним сообщением) здесь безопаснее, а не чрезмерно
- * строго. */
-export function parseHomeKeyboardPress(text: string): HomeKeyboardPress | null {
+ * пользователь никогда не вводит вручную. Если у владельца оказалось
+ * несколько каналов с ОДИНАКОВЫМ названием (редкий, но возможный случай),
+ * совпадает с первым из них в переданном порядке — не идеально, но лучше,
+ * чем вовсе не находить канал. */
+export function parseHomeKeyboardPress(text: string, ownedChannels: readonly HomeKeyboardChannel[]): HomeKeyboardPress | null {
   if (text === HOME_MENU_BUTTON_LABEL) return { kind: "menu" };
   for (const section of Object.keys(SECTION_LABEL) as HomeSection[]) {
-    const prefix = `${SECTION_LABEL[section]} [`;
-    if (!text.startsWith(prefix) || !text.endsWith("]")) continue;
-    const idPart = text.slice(prefix.length, -1);
-    const channelId = Number(idPart);
-    // Число ТОЛЬКО если idPart выглядит как целое положительное число:
-    // Number("") === 0 и Number(" ") === 0 — оба прошли бы голую проверку
-    // isFinite, но это не настоящий id, поэтому отдельная regex-проверка
-    // на непустую строку из цифр защищает именно от этих двух ложных
-    // срабатываний.
-    if (!/^\d+$/.test(idPart) || !Number.isSafeInteger(channelId)) return null;
-    return { kind: "section", section, channelId };
+    const channel = ownedChannels.find((ch) => formatHomeButtonLabel(section, ch) === text);
+    if (channel) return { kind: "section", section, channelId: channel.id };
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Выбор канала -- отдельный ReplyKeyboard-экран ДО того, как появляются
+// кнопки разделов выше: владелец сначала выбирает КАКОЙ канал/группу
+// настраивает, и только потом видит "⚙️ Канал — <название>" и т.д. для
+// уже выбранного. Кнопки здесь -- просто название канала, без иконки
+// раздела (это не формат HomeSection/formatHomeButtonLabel выше).
+// ---------------------------------------------------------------------------
+
+/** Текст кнопки выбора канала -- просто его название (как уже
+ * отображалось в инлайн-варианте списка). */
+export function formatChannelChoiceButtonLabel(channel: HomeKeyboardChannel): string {
+  return displayTitle(channel);
+}
+
+/** Разбирает текст сообщения как нажатие кнопки выбора канала --
+ * возвращает id совпавшего канала, или null если текст не совпал ни с
+ * одним названием из списка (обычное сообщение, не связанное с этим
+ * выбором). Как и parseHomeKeyboardPress выше, сверяется со СПИСКОМ
+ * текущих каналов, а не разбирает число из текста. */
+export function parseChannelChoicePress(text: string, ownedChannels: readonly HomeKeyboardChannel[]): number | null {
+  const channel = ownedChannels.find((ch) => formatChannelChoiceButtonLabel(ch) === text);
+  return channel ? channel.id : null;
 }
