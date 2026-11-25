@@ -20,6 +20,12 @@ export interface Env {
 
 export type Platform = "youtube" | "tiktok" | "kick";
 export type PostKind = "live" | "video";
+/** Кому уходит рекламный пост (see ad_broadcasts, migrations/013):
+ * "groups" -- во все зарегистрированные группы/каналы бота напрямую;
+ * "admins" -- личным сообщением каждому отдельному владельцу канала (с
+ * дедупликацией -- один человек получает пост один раз, даже если у него
+ * зарегистрировано несколько групп). */
+export type AdTarget = "groups" | "admins";
 
 export interface UserRow {
   id: number;
@@ -236,7 +242,30 @@ export type SessionState =
   // какой экран показать после сохранения (откуда именно владелец зашёл
   // в этот ввод), а не часть самих данных сессии Activision.
   | { step: "awaiting_cod_cookie"; data: { return_to_channel_id: number } }
-  | { step: "awaiting_cod_title_code"; data: { channel_id: number } };
+  | { step: "awaiting_cod_title_code"; data: { channel_id: number } }
+  // "📢 РЕКЛАМА" -- доступно только isSuperAdminUsername (см.
+  // src/lib/super-admins.ts), никак не привязано к channel_id/owner. Пять
+  // шагов подряд: content (текст/фото) -> target (кому) -> timing (когда)
+  // -> schedule_time (ТОЛЬКО если timing = "отложенно" -- конкретные
+  // дата/время текстом) -> confirm (финальное подтверждение с превью).
+  // target/timing сами по себе выбираются инлайн-кнопками, а не текстом,
+  // но данные, накопленные до них (текст/фото/цель), нужно пронести через
+  // сессию дальше -- callback_data Telegram ограничен 64 байтами, вложить
+  // туда произвольный текст поста невозможно.
+  | { step: "awaiting_ad_content" }
+  | { step: "awaiting_ad_target"; data: { text: string | null; photo_file_id: string | null } }
+  | {
+      step: "awaiting_ad_timing";
+      data: { text: string | null; photo_file_id: string | null; target: AdTarget };
+    }
+  | {
+      step: "awaiting_ad_schedule_time";
+      data: { text: string | null; photo_file_id: string | null; target: AdTarget };
+    }
+  | {
+      step: "awaiting_ad_confirm";
+      data: { text: string | null; photo_file_id: string | null; target: AdTarget; send_at: string | null };
+    };
 
 export const IDLE_SESSION: SessionState = { step: "idle" };
 
@@ -247,4 +276,21 @@ export interface PendingMessageDeletionRow {
   telegram_chat_id: number;
   message_id: number;
   delete_at: string;
+}
+
+/** A "📢 РЕКЛАМА" post queued for sending once send_at has passed. See
+ * migrations/013. Always has at least one of text/photo_file_id (enforced
+ * by a CHECK constraint in schema.sql and by validation before the row is
+ * ever created -- see src/lib/ad-broadcast.ts). photo_file_id is a
+ * Telegram file_id, not a URL or binary data -- images are never uploaded
+ * anywhere outside Telegram's own infrastructure, which is what the person
+ * asked for ("Изображения загружать нинакакие сервера мы не будем"). */
+export interface AdBroadcastRow {
+  id: number;
+  created_by_user_id: number;
+  text: string | null;
+  photo_file_id: string | null;
+  target: AdTarget;
+  send_at: string;
+  created_at: string;
 }

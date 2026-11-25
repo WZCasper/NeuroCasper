@@ -13,14 +13,18 @@
 import { Api, GrammyError } from "grammy";
 import {
   contentAlreadyPosted,
+  deleteAdBroadcast,
   deletePendingMessageDeletion,
   findOpenPostPlatformForAccount,
   getChannelById,
+  getUserById,
+  listDueAdBroadcasts,
   listDuePendingMessageDeletions,
   listSocialAccountsByPlatform,
   touchLastCheckedAt,
   updateLastVideoId,
 } from "./db.js";
+import { broadcastAd, formatAdBroadcastSummary } from "./lib/ad-broadcast.js";
 import { DEFAULT_CONCURRENCY, runWithConcurrency } from "./lib/concurrency.js";
 import { closeLivePlatform, publishOrMerge } from "./lib/publish.js";
 import { StreamerSerializer } from "./lib/streamer-serializer.js";
@@ -231,7 +235,46 @@ export async function runScheduledCheck(env: Env): Promise<void> {
     console.error("flushDuePendingMessageDeletions failed:", err),
   );
 
+  // Sends every "📢 РЕКЛАМА" post whose scheduled send_at has arrived
+  // (migrations/013).
+  await flushDueAdBroadcasts(env, api).catch((err) => console.error("flushDueAdBroadcasts failed:", err));
+
   console.log("Scheduled check done.");
+}
+
+/** Sends every scheduled "📢 РЕКЛАМА" post whose send_at has passed, then
+ * DMs the super-admin who scheduled it an honest results summary -- they
+ * are not watching live when a delayed post actually goes out, so this is
+ * the only way they ever learn whether it worked. Unlike
+ * flushDuePendingMessageDeletions below, a row here is deleted
+ * unconditionally once broadcastAd has been attempted (success or
+ * failure, in whole or in part): broadcastAd already isolates failures
+ * per RECIPIENT inside one broadcast and reports them in the summary, and
+ * nothing about a failed recipient would improve by retrying the entire
+ * broadcast again on the next cron tick -- see deleteAdBroadcast's own
+ * comment in src/db.ts. A broadcast that throws entirely (e.g. the D1
+ * query itself fails) still gets its row removed rather than retried
+ * forever, logged instead so it isn't silently lost. */
+async function flushDueAdBroadcasts(env: Env, api: Api): Promise<void> {
+  const due = await listDueAdBroadcasts(env);
+  for (const broadcast of due) {
+    try {
+      const outcome = await broadcastAd(env, api, broadcast.target, {
+        text: broadcast.text,
+        photoFileId: broadcast.photo_file_id,
+      });
+      const createdByUser = await getUserById(env, broadcast.created_by_user_id);
+      if (createdByUser) {
+        await api
+          .sendMessage(createdByUser.telegram_user_id, formatAdBroadcastSummary(outcome))
+          .catch((err) => console.error(`Could not DM ad-broadcast results to user ${createdByUser.telegram_user_id}:`, err));
+      }
+    } catch (err) {
+      console.error(`Scheduled ad_broadcasts row ${broadcast.id} failed entirely:`, err);
+    } finally {
+      await deleteAdBroadcast(env, broadcast.id);
+    }
+  }
 }
 
 /** Deletes every queued message whose delete_at has passed. A 400/403 from

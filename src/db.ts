@@ -5,6 +5,8 @@
 // too.
 import type {
   ActivisionSessionRow,
+  AdBroadcastRow,
+  AdTarget,
   ChannelRow,
   CodAuthorizationRow,
   CodOnboardingProgressRow,
@@ -96,6 +98,31 @@ export async function listChannelsByOwner(env: Env, ownerUserId: number): Promis
   return results ?? [];
 }
 
+/** EVERY registered channel/group across the WHOLE bot, regardless of
+ * owner -- deliberately NOT scoped by owner_user_id, unlike every other
+ * listChannelsBy* function here. Only used by the "📢 РЕКЛАМА" feature's
+ * "во все группы" target (src/lib/ad-broadcast.ts) -- that feature is
+ * itself gated to two hardcoded super-admin usernames
+ * (src/lib/super-admins.ts), not by channel ownership, so this
+ * cross-tenant listing is intentional and safe to expose only there. */
+export async function listAllChannels(env: Env): Promise<ChannelRow[]> {
+  const { results } = await env.DB.prepare("SELECT * FROM channels ORDER BY created_at ASC").all<ChannelRow>();
+  return results ?? [];
+}
+
+/** One row per DISTINCT owner across every registered channel -- a person
+ * who owns three groups appears here once, not three times. Backs the
+ * "📢 РЕКЛАМА" feature's "только админам групп" target: each distinct
+ * owner gets the ad post as a single private message, never one copy per
+ * group they happen to own. Same cross-tenant scope and the same
+ * super-admin gating as listAllChannels above. */
+export async function listDistinctChannelOwners(env: Env): Promise<UserRow[]> {
+  const { results } = await env.DB.prepare(
+    "SELECT DISTINCT u.* FROM users u JOIN channels c ON c.owner_user_id = u.id",
+  ).all<UserRow>();
+  return results ?? [];
+}
+
 export async function getChannelById(env: Env, id: number): Promise<ChannelRow | null> {
   const row = await env.DB.prepare("SELECT * FROM channels WHERE id = ?").bind(id).first<ChannelRow>();
   return row ?? null;
@@ -127,6 +154,25 @@ export async function getChannelByOwnerAndChatId(
  * when the bot's own status in a chat becomes "left" or "kicked". */
 export async function deleteChannelsByTelegramChatId(env: Env, telegramChatId: number): Promise<void> {
   await env.DB.prepare("DELETE FROM channels WHERE telegram_chat_id = ?").bind(telegramChatId).run();
+}
+
+/** Wipes ONE channel row (and, via the same ON DELETE CASCADE as
+ * deleteChannelsByTelegramChatId above, everything registered under it) by
+ * its own id. Unlike deleteChannelsByTelegramChatId, this does NOT touch
+ * any other owner's registration of the same physical chat -- it is the
+ * manual "🗑 Удалить группу из бота" button in /settings, which only ever
+ * acts on the one row the caller already owns (the call site in
+ * telegram.ts verifies ownership via getOwnedChannel before calling this),
+ * so scoping by id rather than telegram_chat_id is deliberate: a person
+ * tapping this button means "stop using the bot for MY OWN setup of this
+ * chat", not "wipe everyone else's setup of it too". The automatic
+ * kick/demoted-from-admin cleanup in the my_chat_member handler is a
+ * genuinely different situation -- there the bot can no longer serve
+ * ANYONE in that chat, so every owner's row is cleared -- which is why
+ * that path deliberately keeps using deleteChannelsByTelegramChatId
+ * instead of this function. */
+export async function deleteChannelById(env: Env, channelId: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM channels WHERE id = ?").bind(channelId).run();
 }
 
 export async function createChannel(
@@ -649,12 +695,47 @@ export async function listOpenPostPlatforms(env: Env, postId: number): Promise<P
   return results ?? [];
 }
 
+/**
+ * Finds the currently-open post_platforms row for this social account that
+ * belongs to a LIVE post specifically -- never to a 'video' post.
+ *
+ * BUG FIXED HERE (reported live: "video post's button disappears after a
+ * few minutes"): the original query had no `posts.kind` filter at all, so
+ * it matched the open post_platforms row of a 'video' post just as readily
+ * as a 'live' one -- the two callers in src/scheduled.ts use this
+ * function's result to ask "is the stream we're tracking for this account
+ * still live?" and, if not, call closeLivePlatform to close it out. Video
+ * posts have NO such "stream" concept and their post_platforms row never
+ * gets `ended` set to 1 (see closeLivePlatform's own doc comment in
+ * src/lib/publish.ts -- it is explicitly a no-op for 'video' posts), so on
+ * the very next cron tick (every 5 minutes) after a brand-new video
+ * announcement, this query used to hand that video's own still-open row
+ * back as if it were a live stream to re-check. checkIsCurrentlyLive then
+ * (correctly) reports a plain video as not live, and closeLivePlatform
+ * trims the "button" (the platform link) right off the video post,
+ * mistaking it for a stream that just ended. findOpenPost (used when
+ * actually publishing/merging a post) already scopes every query by
+ * `kind` for exactly this reason -- this was the one query in the file
+ * that didn't, and it is the one this bug lived in.
+ *
+ * `post_platforms.*` (not a bare `*`) is deliberate: `posts` and
+ * `post_platforms` both have their own `id` column, and a bare `*` on this
+ * JOIN would return both under the same JSON key, with the later one
+ * silently overwriting the row's own id when D1 turns the result into an
+ * object.
+ */
 export async function findOpenPostPlatformForAccount(
   env: Env,
   socialAccountId: number,
 ): Promise<PostPlatformRow | null> {
   const row = await env.DB.prepare(
-    "SELECT * FROM post_platforms WHERE social_account_id = ? AND ended = 0 ORDER BY created_at DESC LIMIT 1",
+    `SELECT post_platforms.* FROM post_platforms
+     JOIN posts ON posts.id = post_platforms.post_id
+     WHERE post_platforms.social_account_id = ?
+       AND post_platforms.ended = 0
+       AND posts.kind = 'live'
+     ORDER BY post_platforms.created_at DESC
+     LIMIT 1`,
   )
     .bind(socialAccountId)
     .first<PostPlatformRow>();
@@ -840,6 +921,68 @@ export async function listDuePendingMessageDeletions(env: Env): Promise<PendingM
 
 export async function deletePendingMessageDeletion(env: Env, id: number): Promise<void> {
   await env.DB.prepare("DELETE FROM pending_message_deletions WHERE id = ?").bind(id).run();
+}
+
+// ---------------------------------------------------------------------------
+// "📢 РЕКЛАМА" -- ad broadcasts (migrations/013). Only a DELAYED post is ever
+// stored here; an immediate ("🚀 Отправить сейчас") one is sent directly from
+// the callback handler in src/handlers/telegram.ts and never becomes a row
+// at all -- see schema.sql's own comment on this table for why.
+// ---------------------------------------------------------------------------
+
+/** Queues a delayed ad post. `sendAt` must already be an absolute ISO-ish
+ * `datetime('now', ...)`-compatible string (UTC) -- computed once by the
+ * caller (see parseAdScheduleTime in src/lib/ad-broadcast.ts), never
+ * recomputed here, for the same reason createPendingMessageDeletion's own
+ * delete_at is absolute rather than a relative delay. */
+export async function createAdBroadcast(
+  env: Env,
+  createdByUserId: number,
+  text: string | null,
+  photoFileId: string | null,
+  target: AdTarget,
+  sendAt: string,
+): Promise<AdBroadcastRow> {
+  const row = await env.DB.prepare(
+    `INSERT INTO ad_broadcasts (created_by_user_id, text, photo_file_id, target, send_at)
+     VALUES (?, ?, ?, ?, ?)
+     RETURNING *`,
+  )
+    .bind(createdByUserId, text, photoFileId, target, sendAt)
+    .first<AdBroadcastRow>();
+  if (!row) throw new Error("Failed to create ad broadcast");
+  return row;
+}
+
+/** Every still-pending broadcast, due or not, soonest first -- for the
+ * "📋 Запланированные рассылки" list screen, where a super-admin can cancel
+ * one before its time comes. */
+export async function listPendingAdBroadcasts(env: Env): Promise<AdBroadcastRow[]> {
+  const { results } = await env.DB.prepare("SELECT * FROM ad_broadcasts ORDER BY send_at ASC LIMIT 200").all<AdBroadcastRow>();
+  return results ?? [];
+}
+
+/** Broadcasts whose send_at has passed -- what the cron sweep
+ * (flushDueAdBroadcasts in src/scheduled.ts) actually sends. Same shape as
+ * listDuePendingMessageDeletions above. */
+export async function listDueAdBroadcasts(env: Env): Promise<AdBroadcastRow[]> {
+  const { results } = await env.DB.prepare(
+    "SELECT * FROM ad_broadcasts WHERE send_at <= datetime('now') ORDER BY send_at ASC LIMIT 50",
+  ).all<AdBroadcastRow>();
+  return results ?? [];
+}
+
+export async function getAdBroadcastById(env: Env, id: number): Promise<AdBroadcastRow | null> {
+  const row = await env.DB.prepare("SELECT * FROM ad_broadcasts WHERE id = ?").bind(id).first<AdBroadcastRow>();
+  return row ?? null;
+}
+
+/** Removes a broadcast -- either because a super-admin cancelled it before
+ * its time, or because the cron sweep just finished attempting it (sent or
+ * not; broadcastAd in src/lib/ad-broadcast.ts never retries a failed
+ * target on a later tick, same one-shot philosophy as an immediate send). */
+export async function deleteAdBroadcast(env: Env, id: number): Promise<void> {
+  await env.DB.prepare("DELETE FROM ad_broadcasts WHERE id = ?").bind(id).run();
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ import type { Message } from "grammy/types";
 import {
   advanceCodOnboardingToTag,
   countDistinctReportingChats,
+  createAdBroadcast,
   createChannel,
   createExtraLink,
   createKickOAuthState,
@@ -10,10 +11,13 @@ import {
   createSocialAccount,
   createStreamer,
   createUserReport,
+  deleteAdBroadcast,
+  deleteChannelById,
   deleteChannelsByTelegramChatId,
   deleteCodOnboardingProgress,
   deleteExtraLink,
   getActivisionSession,
+  getAdBroadcastById,
   getChannelById,
   getChannelByOwnerAndChatId,
   getChannelByTelegramChatId,
@@ -22,6 +26,7 @@ import {
   listChannelsByOwner,
   listCodAuthorizationsByChannel,
   listExtraLinksByStreamer,
+  listPendingAdBroadcasts,
   listSocialAccountsByStreamer,
   listStreamersByChannel,
   setSession,
@@ -40,8 +45,17 @@ import {
   upsertActivisionSession,
   upsertCodAuthorization,
 } from "../db.js";
+import {
+  broadcastAd,
+  formatAdBroadcastSummary,
+  formatUtcSendAtAsMinsk,
+  isAdBroadcastContentValid,
+  parseAdScheduleTime,
+} from "../lib/ad-broadcast.js";
 import { bioLooksLikeSpam, escapeHtml, isMemberStatus } from "../lib/chat-membership.js";
+import { buildBotDeletePermissionWarning, toggleConfirmationText } from "../lib/moderation-permissions.js";
 import { isJoinOrLeaveServiceMessage } from "../lib/service-messages.js";
+import { isSuperAdminUsername } from "../lib/super-admins.js";
 import { resolveCodTitleCode } from "../lib/cod-client.js";
 import {
   formatOnboardingComplete,
@@ -105,7 +119,7 @@ import { buildAuthorizationUrl, generatePkcePair } from "../lib/kick.js";
 import { DEFAULT_TEMPLATE } from "../lib/message-templates.js";
 import { removeSocialAccount, removeStreamer } from "../lib/removal.js";
 import { IDLE_SESSION } from "../types.js";
-import type { ChannelRow, Env, Platform, SessionState, StreamerRow, UserRow } from "../types.js";
+import type { AdTarget, ChannelRow, Env, Platform, SessionState, StreamerRow, UserRow } from "../types.js";
 
 export interface BotContext extends Context {
   dbUser: UserRow;
@@ -237,6 +251,7 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
     // added yet) that this was traced to.
     if (scope === "soc") await handleAddSocialCallback(ctx, env, rest);
     else if (scope === "set") await handleSettingsCallback(ctx, env, rest);
+    else if (scope === "ad") await handleAdCallback(ctx, env, rest);
     await ctx.answerCallbackQuery().catch(() => undefined);
   });
 
@@ -289,6 +304,16 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
         }
         return;
       }
+
+      // "📢 РЕКЛАМА" -- показывается в sendChannelChoiceKeyboard ТОЛЬКО
+      // суперадминам, но нажатие ReplyKeyboard-кнопки приходит как ОБЫЧНЫЙ
+      // текст, который в принципе может напечатать кто угодно, даже не
+      // видевший саму кнопку -- isSuperAdminUsername поэтому проверяется
+      // здесь заново, а не только один раз при показе кнопки.
+      if (ctx.message.text === AD_BROADCAST_BUTTON_LABEL && isSuperAdminUsername(ctx.from?.username)) {
+        await renderAdHome(ctx, env);
+        return;
+      }
     }
 
     const session = ctx.session;
@@ -320,6 +345,10 @@ export function registerHandlers(bot: Bot<BotContext>, env: Env): void {
       await handleCodCookieInput(ctx, env, session.data);
     } else if (session.step === "awaiting_cod_title_code") {
       await handleCodTitleCodeInput(ctx, env, session.data);
+    } else if (session.step === "awaiting_ad_content") {
+      await handleAdContentInput(ctx, env);
+    } else if (session.step === "awaiting_ad_schedule_time") {
+      await handleAdScheduleTimeInput(ctx, env, session.data);
     }
   });
 }
@@ -664,11 +693,24 @@ async function handleMyChatMemberUpdate(ctx: BotContext, env: Env): Promise<void
     return;
   }
 
+  // Бот остался в чате, но у него только что забрали права администратора
+  // (administrator -> member) -- без прав администратора бот физически не
+  // может ни удалять сообщения (служебные уведомления/АнтиСсылка/чёрный
+  // список), ни закреплять посты, ни банить по /report, так что
+  // регистрация этого чата в боте приравнивается к исключению бота: те же
+  // настройки стираются, как и в ветке "wasMember && !isNowMember" выше.
+  // Не трогаем переход в обратную сторону (member -> administrator,
+  // например, права только что ВЫДАЛИ) -- это не повод что-либо удалять.
+  if (update.old_chat_member.status === "administrator" && update.new_chat_member.status === "member") {
+    await deleteChannelsByTelegramChatId(env, chat.id);
+    return;
+  }
+
   // Осталось изменение статуса, при котором бот и до, и после числится
-  // участником (например, только что назначили админом отдельным
-  // действием после обычного добавления) — этому чату можно продолжать
-  // отправлять команду /add_channel как обычно, дополнительной реакции
-  // здесь не требуется.
+  // участником С правами администратора (например, права администратора
+  // только что скорректировали, не отобрав совсем) — этому чату можно
+  // продолжать отправлять команду /add_channel как обычно, дополнительной
+  // реакции здесь не требуется.
 }
 
 async function handleChatMemberUpdate(ctx: BotContext, env: Env): Promise<void> {
@@ -1203,6 +1245,31 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
     return;
   }
 
+  // "🗑 Удалить группу из бота" на экране renderChannelSettings. Та же
+  // модель доверия, что и у action === "ch" чуть выше и у action ===
+  // "rsc" (удаление стримера) ниже по файлу: channel.id здесь приходит
+  // ИСКЛЮЧИТЕЛЬНО из callback_data серверной инлайн-кнопки, которую видел
+  // только сам владелец (см. комментарий у handleHomeKeyboardPress на тему
+  // того, почему там, в отличие от этих мест, обязательна
+  // getOwnedChannel) — отдельная проверка владения здесь не нужна.
+  if (action === "delc" && rest[1]) {
+    const channel = await getChannelById(env, Number(rest[1]));
+    if (channel) await renderConfirmDeleteChannel(ctx, channel);
+    return;
+  }
+
+  if (action === "delcy" && rest[1]) {
+    const channel = await getChannelById(env, Number(rest[1]));
+    if (!channel) return;
+    await deleteChannelById(env, channel.id);
+    await ctx
+      .answerCallbackQuery({ text: `🗑 «${channel.title ?? channel.telegram_chat_id}» удалена из бота.` })
+      .catch(() => undefined);
+    const channels = await listChannelsByOwner(env, ctx.dbUser.id);
+    await sendChannelChoiceKeyboard(ctx, channels);
+    return;
+  }
+
   if (action && MODERATION_ACTIONS.has(action) && rest[1]) {
     await handleModerationCallback(ctx, env, action, rest);
     return;
@@ -1215,13 +1282,19 @@ async function handleSettingsCallback(ctx: BotContext, env: Env, rest: string[])
 
   if (action === "pin" && rest[1]) {
     const channel = await toggleChannelFlag(env, Number(rest[1]), "auto_pin");
-    if (channel) await renderChannelSettings(ctx, env, channel);
+    if (channel) {
+      await ctx.answerCallbackQuery({ text: toggleConfirmationText("auto_pin", Boolean(channel.auto_pin)) }).catch(() => undefined);
+      await renderChannelSettings(ctx, env, channel);
+    }
     return;
   }
 
   if (action === "unpin" && rest[1]) {
     const channel = await toggleChannelFlag(env, Number(rest[1]), "auto_unpin");
-    if (channel) await renderChannelSettings(ctx, env, channel);
+    if (channel) {
+      await ctx.answerCallbackQuery({ text: toggleConfirmationText("auto_unpin", Boolean(channel.auto_unpin)) }).catch(() => undefined);
+      await renderChannelSettings(ctx, env, channel);
+    }
     return;
   }
 
@@ -1352,11 +1425,262 @@ async function renderChannelSettings(ctx: BotContext, env: Env, channel: Channel
     .row()
     .text("🎮 Call of Duty", `set:cod:${channel.id}`)
     .row()
+    .text("🗑 Удалить группу из бота", `set:delc:${channel.id}`)
+    .row()
     .text("⬅ Назад", "set:menu")
     .row()
     .text("🏠 Меню", "set:menu");
 
   await editScreen(ctx, { text, kb });
+}
+
+/** Подтверждение перед удалением регистрации группы/канала из бота (см.
+ * комментарий у deleteChannelById в src/db.ts на тему того, почему это
+ * удаление затрагивает ТОЛЬКО регистрацию текущего владельца, а не весь
+ * физический чат целиком). Сам бот из группы/канала не выходит — только
+ * стирается его настройка там: стримеры, модерация, Call of Duty и т.д. */
+async function renderConfirmDeleteChannel(ctx: BotContext, channel: ChannelRow): Promise<void> {
+  const kb = new InlineKeyboard()
+    .text("✅ Да, удалить", `set:delcy:${channel.id}`)
+    .row()
+    .text("❌ Отмена", `set:ch:${channel.id}`)
+    .row()
+    .text("🏠 Меню", "set:menu");
+  const text =
+    `🗑 Удалить «${channel.title ?? channel.telegram_chat_id}» из бота?\n\n` +
+    "Это сотрёт ВСЮ настройку этой группы/канала в боте: стримеров, модерацию, Call of Duty, тексты " +
+    "приветствия/прощания — без возможности отменить.\n\n" +
+    "Сам бот при этом из группы/канала НЕ выходит — его можно будет настроить заново командой " +
+    "/add_channel в любой момент.";
+  await editScreen(ctx, { text, kb });
+}
+
+// ---------------------------------------------------------------------------
+// "📢 РЕКЛАМА" -- доступно ТОЛЬКО isSuperAdminUsername (src/lib/super-admins.ts),
+// никак не привязано к channel_id/владению каналом. Вся бизнес-логика
+// (парсинг времени, сама отправка, отчёт) -- в src/lib/ad-broadcast.ts;
+// здесь только экраны и сессия. Пять шагов подряд: content (текст/фото) ->
+// target (кому) -> timing (когда) -> [schedule_time, только если
+// "отложенно"] -> confirm. См. комментарий у соответствующих шагов в
+// SessionState (src/types.ts) для полной схемы.
+// ---------------------------------------------------------------------------
+
+const AD_BROADCAST_BUTTON_LABEL = "📢 РЕКЛАМА";
+
+async function renderAdHome(ctx: BotContext, env: Env): Promise<void> {
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+  const pending = await listPendingAdBroadcasts(env);
+  const kb = new InlineKeyboard()
+    .text("✍️ Создать новый пост", "ad:new")
+    .row()
+    .text(`📋 Запланированные рассылки (${pending.length})`, "ad:list")
+    .row()
+    .text("🏠 Меню", "set:menu");
+  const text =
+    "📢 Реклама\n\n" +
+    "Рекламный пост можно отправить сразу во все группы/каналы бота, либо личным сообщением каждому " +
+    "отдельному владельцу группы (один раз на человека, даже если у него несколько групп).\n\n" +
+    `Сейчас запланировано отложенных рассылок: ${pending.length}.`;
+  await editScreen(ctx, { text, kb });
+}
+
+async function startAdCompose(ctx: BotContext, env: Env): Promise<void> {
+  await setSession(env, ctx.dbUser.id, { step: "awaiting_ad_content" });
+  const kb = new InlineKeyboard().text("⬅ Отмена", "ad:home");
+  const text =
+    "Отправьте текст рекламного поста.\n\n" +
+    "Можно приложить одну фотографию — в этом случае текст пишите подписью к ней (или отправьте " +
+    "фото вообще без подписи, если текст не нужен). Изображение никуда не загружается, кроме " +
+    "собственной инфраструктуры Telegram.";
+  await editScreen(ctx, { text, kb });
+}
+
+async function handleAdContentInput(ctx: BotContext, env: Env): Promise<void> {
+  const text = ctx.message?.text?.trim() || ctx.message?.caption?.trim() || null;
+  const photos = ctx.message?.photo;
+  const largestPhoto = photos && photos.length > 0 ? photos[photos.length - 1] : undefined; // Telegram отдаёт размеры по возрастанию — последний самый крупный
+  const photoFileId = largestPhoto?.file_id ?? null;
+
+  if (!isAdBroadcastContentValid({ text, photoFileId })) {
+    await ctx.reply(
+      "Нужен текст или фотография (можно с подписью). Отправьте ещё раз, либо «⬅ Отмена» в предыдущем сообщении.",
+    );
+    return;
+  }
+
+  await setSession(env, ctx.dbUser.id, { step: "awaiting_ad_target", data: { text, photo_file_id: photoFileId } });
+  const kb = new InlineKeyboard()
+    .text("📨 Во все группы", "ad:target:groups")
+    .row()
+    .text("👤 Только админам групп (в личку)", "ad:target:admins")
+    .row()
+    .text("⬅ Отмена", "ad:home");
+  await ctx.reply("Кому отправить?", { reply_markup: kb });
+}
+
+async function handleAdTargetChoice(ctx: BotContext, env: Env, target: AdTarget): Promise<void> {
+  const session = ctx.session;
+  if (session.step !== "awaiting_ad_target") return; // кнопка нажата не на том экране/сессия сброшена — просто игнорируем
+  await setSession(env, ctx.dbUser.id, {
+    step: "awaiting_ad_timing",
+    data: { text: session.data.text, photo_file_id: session.data.photo_file_id, target },
+  });
+  const kb = new InlineKeyboard()
+    .text("🚀 Отправить сейчас", "ad:timing:now")
+    .row()
+    .text("⏰ Запланировать", "ad:timing:schedule")
+    .row()
+    .text("⬅ Отмена", "ad:home");
+  await editScreen(ctx, { text: "Когда отправить?", kb });
+}
+
+async function handleAdTimingNow(ctx: BotContext, env: Env): Promise<void> {
+  const session = ctx.session;
+  if (session.step !== "awaiting_ad_timing") return;
+  const data = { ...session.data, send_at: null };
+  await setSession(env, ctx.dbUser.id, { step: "awaiting_ad_confirm", data });
+  // sendAdConfirmScreen всегда шлёт ОТДЕЛЬНОЕ новое сообщение (с фото это
+  // обязано быть так — см. её собственный комментарий), а не редактирует
+  // текущее, поэтому кнопки "🚀 Отправить сейчас"/"⏰ Запланировать" на ЭТОМ
+  // сообщении иначе остались бы видимыми и нажимаемыми после перехода
+  // дальше. Снимаем клавиатуру здесь же, чтобы повторный клик по уже
+  // неактуальному экрану ничего не делал молча, а просто не существовал.
+  await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => undefined);
+  await sendAdConfirmScreen(ctx, data);
+}
+
+async function handleAdTimingSchedule(ctx: BotContext, env: Env): Promise<void> {
+  const session = ctx.session;
+  if (session.step !== "awaiting_ad_timing") return;
+  await setSession(env, ctx.dbUser.id, { step: "awaiting_ad_schedule_time", data: session.data });
+  const kb = new InlineKeyboard().text("⬅ Отмена", "ad:home");
+  const text =
+    "Когда отправить? Напишите дату и время по Минску (UTC+3) в формате ДД.ММ.ГГГГ ЧЧ:ММ, например: " +
+    "25.11.2026 18:00";
+  await editScreen(ctx, { text, kb });
+}
+
+async function handleAdScheduleTimeInput(
+  ctx: BotContext,
+  env: Env,
+  data: { text: string | null; photo_file_id: string | null; target: AdTarget },
+): Promise<void> {
+  const raw = ctx.message?.text;
+  if (!raw) return;
+  const parsed = parseAdScheduleTime(raw, new Date());
+  if (!parsed.ok) {
+    await ctx.reply(parsed.error);
+    return; // остаёмся на том же шаге — ждём ещё одну попытку
+  }
+  const confirmData = { ...data, send_at: parsed.value.utcSendAt };
+  await setSession(env, ctx.dbUser.id, { step: "awaiting_ad_confirm", data: confirmData });
+  await sendAdConfirmScreen(ctx, confirmData);
+}
+
+/** Финальный экран предпросмотра перед реальной отправкой/планированием.
+ * НЕ использует универсальный View/editScreen: пост с фотографией физически
+ * не может быть показан через editMessageText, поэтому с фото это всегда
+ * ОТДЕЛЬНОЕ новое сообщение (replyWithPhoto) с теми же кнопками прямо под
+ * фото, а без фото — обычный ctx.reply. */
+async function sendAdConfirmScreen(
+  ctx: BotContext,
+  data: { text: string | null; photo_file_id: string | null; target: AdTarget; send_at: string | null },
+): Promise<void> {
+  const targetLabel = data.target === "groups" ? "во все группы" : "админам групп (в личку)";
+  const timingLabel = data.send_at ? `отложенно — ${formatUtcSendAtAsMinsk(data.send_at)}` : "сейчас";
+  const preview = [data.text ?? "", "—", `Кому: ${targetLabel}`, `Когда: ${timingLabel}`].filter(Boolean).join("\n");
+  const confirmLabel = data.send_at ? "✅ Запланировать" : "✅ Отправить";
+  const kb = new InlineKeyboard().text(confirmLabel, "ad:confirm:yes").row().text("❌ Отмена", "ad:confirm:no");
+  if (data.photo_file_id) {
+    await ctx.replyWithPhoto(data.photo_file_id, { caption: preview, reply_markup: kb });
+  } else {
+    await ctx.reply(preview, { reply_markup: kb });
+  }
+}
+
+async function handleAdConfirm(ctx: BotContext, env: Env, confirmed: boolean): Promise<void> {
+  const session = ctx.session;
+  if (session.step !== "awaiting_ad_confirm") return;
+  await setSession(env, ctx.dbUser.id, IDLE_SESSION);
+
+  if (!confirmed) {
+    await ctx.reply("Отменено.");
+    return;
+  }
+
+  const { text, photo_file_id, target, send_at } = session.data;
+  if (!send_at) {
+    await ctx.reply("Рассылка началась, это может занять некоторое время…");
+    const outcome = await broadcastAd(env, ctx.api, target, { text, photoFileId: photo_file_id });
+    await ctx.reply(formatAdBroadcastSummary(outcome));
+    return;
+  }
+  await createAdBroadcast(env, ctx.dbUser.id, text, photo_file_id, target, send_at);
+  await ctx.reply(`✅ Запланировано на ${formatUtcSendAtAsMinsk(send_at)}.`);
+}
+
+async function renderAdList(ctx: BotContext, env: Env): Promise<void> {
+  const pending = await listPendingAdBroadcasts(env);
+  const kb = new InlineKeyboard();
+  if (pending.length === 0) {
+    kb.text("⬅ Назад", "ad:home");
+    await editScreen(ctx, { text: "Запланированных рассылок нет.", kb });
+    return;
+  }
+  for (const broadcast of pending) {
+    const preview = (broadcast.text ?? "(фото без текста)").slice(0, 30);
+    kb.text(`❌ ${formatUtcSendAtAsMinsk(broadcast.send_at)} — ${preview}`, `ad:cancel:${broadcast.id}`).row();
+  }
+  kb.text("⬅ Назад", "ad:home");
+  await editScreen(ctx, { text: `📋 Запланированные рассылки (${pending.length}):`, kb });
+}
+
+async function renderAdCancelConfirm(ctx: BotContext, env: Env, id: number): Promise<void> {
+  const broadcast = await getAdBroadcastById(env, id);
+  if (!broadcast) {
+    await renderAdList(ctx, env);
+    return;
+  }
+  const kb = new InlineKeyboard().text("✅ Да, отменить", `ad:cancelyes:${id}`).row().text("❌ Нет", "ad:list");
+  const preview = (broadcast.text ?? "(фото без текста)").slice(0, 60);
+  const text = `Отменить рассылку «${preview}», запланированную на ${formatUtcSendAtAsMinsk(broadcast.send_at)}?`;
+  await editScreen(ctx, { text, kb });
+}
+
+async function handleAdCancelConfirmed(ctx: BotContext, env: Env, id: number): Promise<void> {
+  await deleteAdBroadcast(env, id);
+  await renderAdList(ctx, env);
+}
+
+/** Единая точка входа для всех callback_query с scope "ad" — проверка
+ * isSuperAdminUsername здесь ОДИН РАЗ покрывает вообще каждый шаг визарда
+ * (включая финальное подтверждение отправки), а не только первое нажатие
+ * кнопки "📢 РЕКЛАМА" (которое приходит обычным текстом, а не callback_query,
+ * и поэтому проверяется отдельно в bot.on("message", ...) выше). */
+async function handleAdCallback(ctx: BotContext, env: Env, rest: string[]): Promise<void> {
+  if (!isSuperAdminUsername(ctx.from?.username)) return;
+  const [action, idStr] = rest;
+  if (action === "home") {
+    await renderAdHome(ctx, env);
+  } else if (action === "new") {
+    await startAdCompose(ctx, env);
+  } else if (action === "list") {
+    await renderAdList(ctx, env);
+  } else if (action === "cancel" && idStr) {
+    await renderAdCancelConfirm(ctx, env, Number(idStr));
+  } else if (action === "cancelyes" && idStr) {
+    await handleAdCancelConfirmed(ctx, env, Number(idStr));
+  } else if (action === "target" && (idStr === "groups" || idStr === "admins")) {
+    await handleAdTargetChoice(ctx, env, idStr);
+  } else if (action === "timing" && idStr === "now") {
+    await handleAdTimingNow(ctx, env);
+  } else if (action === "timing" && idStr === "schedule") {
+    await handleAdTimingSchedule(ctx, env);
+  } else if (action === "confirm" && idStr === "yes") {
+    await handleAdConfirm(ctx, env, true);
+  } else if (action === "confirm" && idStr === "no") {
+    await handleAdConfirm(ctx, env, false);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,6 +1896,23 @@ async function editScreen(ctx: BotContext, view: View): Promise<void> {
   }
 }
 
+/** Единственное место, которое должно собирать View экрана Модерации —
+ * проверяет актуальные права бота (checkBotCanDeleteMessages) ПЕРЕД тем,
+ * как строить текст, чтобы предупреждение о правах никогда не отставало
+ * от реального состояния чата. Вызывается из каждого места, которое
+ * показывает этот экран (и через editScreen, и через ctx.reply после
+ * текстового ввода) — один лишний вызов Bot API на показ экрана, который
+ * и так уже делает несколько обращений к базе, так что заметной
+ * дополнительной задержки это не добавляет. */
+async function buildLiveModerationView(ctx: BotContext, channel: ChannelRow): Promise<View> {
+  const canDeleteMessages = await checkBotCanDeleteMessages(ctx, channel.telegram_chat_id);
+  return buildModerationView(channel, canDeleteMessages);
+}
+
+async function renderModerationView(ctx: BotContext, channel: ChannelRow): Promise<void> {
+  await editScreen(ctx, await buildLiveModerationView(ctx, channel));
+}
+
 /** Текст кнопки-тумблера с ВИЗУАЛЬНЫМ состоянием прямо на самой кнопке —
  * ✅ когда включено, ❌ когда выключено, а не только нейтральное
  * "Включить/Выключить X" без собственной индикации состояния. Единая
@@ -1583,6 +1924,27 @@ async function editScreen(ctx: BotContext, view: View): Promise<void> {
  * значок перед названием показывает текущее состояние. */
 function toggleButtonLabel(label: string, enabled: boolean): string {
   return `${enabled ? "✅" : "❌"} ${label}`;
+}
+
+/** Правда, если у бота ПРЯМО СЕЙЧАС есть право Telegram «Удалять
+ * сообщения» в этом чате — именно то право, без которого
+ * hide_service_messages/АнтиСсылка/чёрный список ссылок могут быть честно
+ * включены в базе данных, но не будут удалять вообще ничего (Telegram
+ * тихо отклоняет deleteMessage без этого права — см. handleGroupMessage
+ * выше, где такой отказ лишь пишется в лог). null — само обращение к
+ * Telegram не удалось (бот уже не в чате, временная ошибка сети и т.п.):
+ * это ДЕЙСТВИТЕЛЬННО неизвестно, а не "права нет", поэтому вызывающий код
+ * не должен показывать предупреждение для null так же, как для
+ * подтверждённого false. */
+async function checkBotCanDeleteMessages(ctx: BotContext, telegramChatId: number): Promise<boolean | null> {
+  const botMember = await ctx.api.getChatMember(telegramChatId, ctx.me.id).catch((err) => {
+    console.error(`getChatMember (права бота) не удался для чата ${telegramChatId}:`, err);
+    return null;
+  });
+  if (!botMember) return null;
+  if (botMember.status === "creator") return true; // у бота в принципе не бывает этого статуса в чужом чате, но на всякий случай — у creator всегда полные права
+  if (botMember.status === "administrator") return botMember.can_delete_messages;
+  return false; // "member"/"restricted"/"left"/"kicked" — права на удаление чужих сообщений нет ни у кого из них
 }
 
 /** ReplyKeyboard «снизу», постоянно видимая под полем ввода (persistent +
@@ -1604,12 +1966,24 @@ function toggleButtonLabel(label: string, enabled: boolean): string {
  * же причина, по которой buildHomeKeyboard/sendHomeKeyboard ниже делают
  * то же самое для кнопок разделов). */
 async function sendChannelChoiceKeyboard(ctx: BotContext, channels: readonly ChannelRow[]): Promise<void> {
-  if (channels.length === 0) {
+  // "📢 РЕКЛАМА" не привязана ни к какому каналу (см. handleAdCallback и
+  // super-admins.ts), поэтому ДАЖЕ суперадмин без единого своего
+  // зарегистрированного канала/группы должен увидеть эту кнопку -- ранний
+  // return ниже (раньше срабатывавший для ЛЮБОГО человека без каналов)
+  // теперь учитывает это отдельно, а не просто пропускает клавиатуру
+  // целиком.
+  const showAdButton = isSuperAdminUsername(ctx.from?.username);
+
+  if (channels.length === 0 && !showAdButton) {
     await editScreen(ctx, { text: "У вас пока нет зарегистрированных каналов/групп — см. /start.", kb: new InlineKeyboard() });
     return;
   }
 
-  await editScreen(ctx, { text: "Какой канал/группа? Выберите кнопкой снизу.", kb: new InlineKeyboard() });
+  const promptText =
+    channels.length === 0
+      ? "У вас пока нет зарегистрированных каналов/групп — см. /start."
+      : "Какой канал/группа? Выберите кнопкой снизу.";
+  await editScreen(ctx, { text: promptText, kb: new InlineKeyboard() });
 
   if (!ctx.chat) return; // см. тот же комментарий про ctx.chat в sendHomeKeyboard ниже
   const kb = new Keyboard();
@@ -1617,6 +1991,10 @@ async function sendChannelChoiceKeyboard(ctx: BotContext, channels: readonly Cha
     if (i > 0) kb.row();
     kb.text(formatChannelChoiceButtonLabel(ch));
   });
+  if (showAdButton) {
+    if (channels.length > 0) kb.row();
+    kb.text(AD_BROADCAST_BUTTON_LABEL);
+  }
   kb.resized().persistent();
   await ctx.api.sendMessage(ctx.chat.id, "⌨️ Выберите канал/группу кнопкой снизу.", { reply_markup: kb });
 }
@@ -1659,11 +2037,23 @@ async function sendHomeKeyboard(ctx: BotContext, channel: ChannelRow): Promise<v
   });
 }
 
-function buildModerationView(channel: ChannelRow): View {
+/** canDeleteMessages: результат checkBotCanDeleteMessages. true/null (право
+ * есть или не удалось проверить) — экран как раньше, без предупреждения:
+ * null НЕ считается подтверждённым отсутствием права (см. комментарий у
+ * checkBotCanDeleteMessages), поэтому по умолчанию (прямой вызов без
+ * этого параметра, как в тестах) тоже true — чтобы случайно не показать
+ * ложную тревогу там, где право на самом деле никто не проверял.
+ * confirmed false — единственный случай, когда стоит предупреждение: три
+ * функции на этом экране (hide_service_messages/АнтиСсылка/чёрный список)
+ * физически не могут ничего удалить без этого права, какими бы ни были их
+ * собственные тумблеры. */
+function buildModerationView(channel: ChannelRow, canDeleteMessages: boolean | null = true): View {
   const phrases = resolveSpamPhrases(channel.spam_phrases);
   const whitelist = resolveAntilinkWhitelist(channel.antilink_whitelist);
   const blacklist = resolveUrlBlacklist(channel.url_blacklist);
+  const permissionWarning = buildBotDeletePermissionWarning(canDeleteMessages);
   const text =
+    permissionWarning +
     `👥 Модерация: ${channel.title ?? channel.telegram_chat_id}\n` +
     "Работает в группах, где бот — администратор (в каналах не применяется).\n\n" +
     `Приветствие новых участников: ${channel.welcome_enabled ? "вкл" : "выкл"}\n` +
@@ -2030,7 +2420,7 @@ async function handleHomeKeyboardPress(ctx: BotContext, env: Env, press: HomeKey
       await renderStreamerList(ctx, env, channel);
       return;
     case "moderation":
-      await editScreen(ctx, buildModerationView(channel));
+      await renderModerationView(ctx, channel);
       return;
   }
 }
@@ -2048,7 +2438,7 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
   switch (action) {
     case "mod": {
       await setSession(env, ctx.dbUser.id, IDLE_SESSION); // «Отмена» с экрана ввода тоже приходит сюда
-      await editScreen(ctx, buildModerationView(channel));
+      await renderModerationView(ctx, channel);
       return;
     }
     case "wtg":
@@ -2068,8 +2458,12 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
         btg: "url_blacklist_enabled",
         htg: "hide_service_messages",
       };
-      const updated = await toggleChannelFlag(env, channel.id, TOGGLE_ACTION_TO_FLAG[action as keyof typeof TOGGLE_ACTION_TO_FLAG]);
-      await editScreen(ctx, buildModerationView(updated ?? channel));
+      const flag = TOGGLE_ACTION_TO_FLAG[action as keyof typeof TOGGLE_ACTION_TO_FLAG];
+      const updated = await toggleChannelFlag(env, channel.id, flag);
+      if (updated) {
+        await ctx.answerCallbackQuery({ text: toggleConfirmationText(flag, Boolean(updated[flag])) }).catch(() => undefined);
+      }
+      await renderModerationView(ctx, updated ?? channel);
       return;
     }
     case "wtx": {
@@ -2080,7 +2474,7 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
     case "wrs": {
       const updated = await updateChannelWelcomeTemplate(env, channel.id, null);
       await setSession(env, ctx.dbUser.id, IDLE_SESSION);
-      await editScreen(ctx, buildModerationView(updated ?? channel));
+      await renderModerationView(ctx, updated ?? channel);
       return;
     }
     case "ltx": {
@@ -2091,7 +2485,7 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
     case "lrs": {
       const updated = await updateChannelLeaveTemplate(env, channel.id, null);
       await setSession(env, ctx.dbUser.id, IDLE_SESSION);
-      await editScreen(ctx, buildModerationView(updated ?? channel));
+      await renderModerationView(ctx, updated ?? channel);
       return;
     }
     case "wdt": {
@@ -2102,7 +2496,7 @@ async function handleModerationCallback(ctx: BotContext, env: Env, action: strin
     case "wdr": {
       const updated = await updateChannelWelcomeDeleteAfter(env, channel.id, DEFAULT_WELCOME_DELETE_AFTER_SECONDS);
       await setSession(env, ctx.dbUser.id, IDLE_SESSION);
-      await editScreen(ctx, buildModerationView(updated ?? channel));
+      await renderModerationView(ctx, updated ?? channel);
       return;
     }
     case "spl": {
@@ -2192,6 +2586,11 @@ async function handleCodCallback(ctx: BotContext, env: Env, action: string, rest
     }
     case "codtg": {
       const updated = await toggleChannelFlag(env, channel.id, "cod_summary_enabled");
+      if (updated) {
+        await ctx
+          .answerCallbackQuery({ text: toggleConfirmationText("cod_summary_enabled", Boolean(updated.cod_summary_enabled)) })
+          .catch(() => undefined);
+      }
       const [session, authorized] = await Promise.all([
         getActivisionSession(env),
         listCodAuthorizationsByChannel(env, (updated ?? channel).id),
@@ -2242,7 +2641,7 @@ async function handleWelcomeTemplateInput(ctx: BotContext, env: Env, data: { cha
 
   await setSession(env, ctx.dbUser.id, IDLE_SESSION);
   const updated = await updateChannelWelcomeTemplate(env, channel.id, checked.template);
-  const view = buildModerationView(updated ?? channel);
+  const view = await buildLiveModerationView(ctx, updated ?? channel);
   await ctx.reply(`✅ Текст приветствия обновлён.\n\n${view.text}`, { reply_markup: view.kb });
 }
 
@@ -2265,7 +2664,7 @@ async function handleWelcomeDeleteAfterInput(ctx: BotContext, env: Env, data: { 
 
   await setSession(env, ctx.dbUser.id, IDLE_SESSION);
   const updated = await updateChannelWelcomeDeleteAfter(env, channel.id, checked.seconds);
-  const view = buildModerationView(updated ?? channel);
+  const view = await buildLiveModerationView(ctx, updated ?? channel);
   await ctx.reply(`✅ Время удаления приветствия обновлено.\n\n${view.text}`, { reply_markup: view.kb });
 }
 
@@ -2359,7 +2758,7 @@ async function handleLeaveTemplateInput(ctx: BotContext, env: Env, data: { chann
 
   await setSession(env, ctx.dbUser.id, IDLE_SESSION);
   const updated = await updateChannelLeaveTemplate(env, channel.id, checked.template);
-  const view = buildModerationView(updated ?? channel);
+  const view = await buildLiveModerationView(ctx, updated ?? channel);
   await ctx.reply(`✅ Текст уведомления о выходе обновлён.\n\n${view.text}`, { reply_markup: view.kb });
 }
 

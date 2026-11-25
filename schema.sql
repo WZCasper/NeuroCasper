@@ -9,6 +9,7 @@
 
 PRAGMA foreign_keys = ON;
 
+DROP TABLE IF EXISTS ad_broadcasts;
 DROP TABLE IF EXISTS cod_onboarding_progress;
 DROP TABLE IF EXISTS cod_authorizations;
 DROP TABLE IF EXISTS activision_session;
@@ -339,6 +340,32 @@ CREATE TABLE pending_message_deletions (
 );
 
 CREATE INDEX idx_pending_message_deletions_delete_at ON pending_message_deletions (delete_at);
+
+-- "📢 РЕКЛАМА" -- рекламный пост, поставленный в очередь на отложенную
+-- отправку (send_at). Пост, отправляемый СРАЗУ ("🚀 Отправить сейчас"),
+-- отправляется прямо из обработчика кнопки и строкой здесь не хранится
+-- вообще -- строка создаётся только для действительно отложенных постов,
+-- по той же логике, что и у pending_message_deletions выше: send_at --
+-- АБСОЛЮТНАЯ метка времени, вычисленная один раз при планировании.
+-- created_by_user_id -- кому в личку отчитаться о результатах рассылки,
+-- когда её по расписанию выполнит cron (см. src/scheduled.ts). Строка
+-- удаляется сразу после попытки отправки (успешной или нет) -- см.
+-- src/lib/ad-broadcast.ts, broadcastAd никогда не повторяет попытку сама.
+-- Фотография -- ТОЛЬКО telegram file_id, не файл и не URL: изображения
+-- никуда не загружаются, кроме собственной инфраструктуры Telegram (см.
+-- migrations/013_add_ad_broadcasts.sql).
+CREATE TABLE ad_broadcasts (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_by_user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  text                 TEXT,
+  photo_file_id        TEXT,
+  target               TEXT NOT NULL CHECK (target IN ('groups', 'admins')),
+  send_at              TEXT NOT NULL,
+  created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (text IS NOT NULL OR photo_file_id IS NOT NULL)
+);
+
+CREATE INDEX idx_ad_broadcasts_send_at ON ad_broadcasts (send_at);
 
 -- Один участник группы, прошедший «авторизацию» в этой группе: назвал
 -- отображаемое имя и свой Activision-тег в ответ на 2 вопроса при

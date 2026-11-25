@@ -4,17 +4,27 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import {
+  closePostPlatform,
   countDistinctReportingChats,
+  createAdBroadcast,
   createChannel,
   createPostWithPlatform,
   createSocialAccount,
   createStreamer,
   createPendingMessageDeletion,
   createUserReport,
+  deleteAdBroadcast,
+  deleteChannelById,
   deletePendingMessageDeletion,
+  findOpenPostPlatformForAccount,
+  getAdBroadcastById,
   getChannelByTelegramChatId,
   getKickTokenBySocialAccount,
+  listAllChannels,
+  listDistinctChannelOwners,
+  listDueAdBroadcasts,
   listDuePendingMessageDeletions,
+  listPendingAdBroadcasts,
   getOrCreateUser,
   toggleChannelFlag,
   upsertKickToken,
@@ -467,6 +477,175 @@ test("two createPostWithPlatform calls link their own rows (LAST_INSERT_ROWID do
   assert.notEqual(a.post.id, b.post.id);
   assert.equal(a.postPlatform.post_id, a.post.id);
   assert.equal(b.postPlatform.post_id, b.post.id);
+});
+
+// ---------------------------------------------------------------------------
+// findOpenPostPlatformForAccount -- regression coverage for the reported bug
+// "the new-video post's button disappears after a few minutes". Root cause:
+// this query used to have no `posts.kind` filter, so it happily handed back
+// a 'video' post's still-open post_platforms row as if it were a live
+// stream to re-check. src/scheduled.ts then asked "is this still live?",
+// got (correctly) "no" for a plain video, and closeLivePlatform trimmed the
+// video post's button off, mistaking it for an ended stream. See the
+// function's own doc comment in src/db.ts for the full trace.
+// ---------------------------------------------------------------------------
+
+test("a 'video' post's open post_platforms row is never returned (the exact bug: it used to be, and got mistaken for a live stream)", async () => {
+  const env = createTestEnv();
+  const { streamerId, socialAccountId } = await createTestStreamerWithAccount(env, -5001);
+  await createPostWithPlatform(env, streamerId, 1, "video", -5001, 701, socialAccountId, "youtube", "new-video", "https://y/new-video");
+  const found = await findOpenPostPlatformForAccount(env, socialAccountId);
+  assert.equal(found, null, "a video post must never be treated as an open live stream to re-check");
+});
+
+test("an open 'live' post's row IS returned (the function must still do its actual job)", async () => {
+  const env = createTestEnv();
+  const { streamerId, socialAccountId } = await createTestStreamerWithAccount(env, -5002);
+  const { postPlatform } = await createPostWithPlatform(
+    env, streamerId, 1, "live", -5002, 702, socialAccountId, "youtube", "live-content", "https://y/live",
+  );
+  const found = await findOpenPostPlatformForAccount(env, socialAccountId);
+  assert.ok(found);
+  assert.equal(found?.id, postPlatform.id);
+});
+
+test("a video posted AFTER a live stream is already open: only the live post's row is found, never the newer video's", async () => {
+  const env = createTestEnv();
+  const { streamerId, socialAccountId } = await createTestStreamerWithAccount(env, -5003);
+  const { post: livePost } = await createPostWithPlatform(
+    env, streamerId, 1, "live", -5003, 703, socialAccountId, "youtube", "live-content", "https://y/live",
+  );
+  const { postPlatform: videoPlatform } = await createPostWithPlatform(
+    env, streamerId, 1, "video", -5003, 704, socialAccountId, "youtube", "another-video", "https://y/video",
+  );
+  // Both rows get `datetime('now')` (second resolution) by default, so within
+  // one fast test they can tie on created_at. Back-date the video row's
+  // timestamp explicitly so it is unambiguously the MORE RECENT row --
+  // exactly the real-world case (a video posted some time after a stream
+  // went live) that the old, unscoped "ORDER BY created_at DESC LIMIT 1"
+  // query would have picked, being newer, over the live row it should have
+  // returned instead.
+  await env.DB.prepare("UPDATE post_platforms SET created_at = datetime('now', '+1 hour') WHERE id = ?")
+    .bind(videoPlatform.id)
+    .run();
+  const found = await findOpenPostPlatformForAccount(env, socialAccountId);
+  assert.ok(found);
+  assert.equal(found?.post_id, livePost.id, "the newer video row must never shadow the live post's own row");
+});
+
+test("once the live post's row is closed, it stops being returned -- the ended=0 filter still works after adding the kind JOIN", async () => {
+  const env = createTestEnv();
+  const { streamerId, socialAccountId } = await createTestStreamerWithAccount(env, -5004);
+  const { postPlatform } = await createPostWithPlatform(
+    env, streamerId, 1, "live", -5004, 705, socialAccountId, "youtube", "live-content", "https://y/live",
+  );
+  await closePostPlatform(env, postPlatform.id);
+  const found = await findOpenPostPlatformForAccount(env, socialAccountId);
+  assert.equal(found, null);
+});
+
+// ---------------------------------------------------------------------------
+// deleteChannelById -- the manual "🗑 Удалить группу из бота" button in
+// /settings. Unlike deleteChannelsByTelegramChatId (used when the bot itself
+// is kicked or loses admin rights, which must wipe every owner's
+// registration of that physical chat at once), this manual action must only
+// ever touch the ONE row the person pressing the button actually owns.
+// ---------------------------------------------------------------------------
+
+test("deleteChannelById removes exactly the given channel and cascades to its own streamers", async () => {
+  const env = createTestEnv();
+  const channel = await createTestChannel(env, -6001);
+  await createStreamer(env, channel.id, "Streamer To Cascade");
+
+  await deleteChannelById(env, channel.id);
+
+  const remaining = await getChannelByTelegramChatId(env, -6001);
+  assert.equal(remaining, null);
+  const orphanedStreamers = await env.DB.prepare("SELECT id FROM streamers WHERE channel_id = ?")
+    .bind(channel.id)
+    .all<{ id: number }>();
+  assert.deepEqual(orphanedStreamers.results, [], "ON DELETE CASCADE must remove streamers under the deleted channel");
+});
+
+test("deleteChannelById does NOT touch a different owner's registration of the same physical chat", async () => {
+  const env = createTestEnv();
+  const ownerA = await getOrCreateUser(env, 710001, undefined, "Owner A");
+  const ownerB = await getOrCreateUser(env, 710002, undefined, "Owner B");
+  const channelA = await createChannel(env, ownerA.id, -6002, "Owner A's setup");
+  const channelB = await createChannel(env, ownerB.id, -6002, "Owner B's setup");
+
+  await deleteChannelById(env, channelA.id);
+
+  const stillThere = await getChannelByTelegramChatId(env, -6002);
+  assert.ok(stillThere);
+  assert.equal(stillThere?.id, channelB.id, "owner B's own row for the same chat must survive owner A's deletion");
+});
+
+// ---------------------------------------------------------------------------
+// "📢 РЕКЛАМА" -- ad_broadcasts (migrations/013) and the two cross-tenant
+// listing functions it needs (listAllChannels, listDistinctChannelOwners).
+// ---------------------------------------------------------------------------
+
+test("createAdBroadcast stores every field as given, including a photo-only post (null text)", async () => {
+  const env = createTestEnv();
+  const user = await getOrCreateUser(env, 810001, "advertiser", "Advertiser");
+  const row = await createAdBroadcast(env, user.id, null, "AgACAgIAAxkBfile123", "groups", "2026-12-01 10:00:00");
+  assert.equal(row.created_by_user_id, user.id);
+  assert.equal(row.text, null);
+  assert.equal(row.photo_file_id, "AgACAgIAAxkBfile123");
+  assert.equal(row.target, "groups");
+  assert.equal(row.send_at, "2026-12-01 10:00:00");
+});
+
+test("listPendingAdBroadcasts returns every row, soonest send_at first", async () => {
+  const env = createTestEnv();
+  const user = await getOrCreateUser(env, 810002, "advertiser", "Advertiser");
+  await createAdBroadcast(env, user.id, "later", null, "groups", "2027-01-01 00:00:00");
+  await createAdBroadcast(env, user.id, "sooner", null, "groups", "2026-06-01 00:00:00");
+  const pending = await listPendingAdBroadcasts(env);
+  assert.equal(pending.length, 2);
+  assert.equal(pending[0]?.text, "sooner");
+  assert.equal(pending[1]?.text, "later");
+});
+
+test("listDueAdBroadcasts returns only rows whose send_at has already passed", async () => {
+  const env = createTestEnv();
+  const user = await getOrCreateUser(env, 810003, "advertiser", "Advertiser");
+  await createAdBroadcast(env, user.id, "already due", null, "groups", "2000-01-01 00:00:00"); // far in the past
+  await createAdBroadcast(env, user.id, "far future", null, "groups", "2099-01-01 00:00:00");
+  const due = await listDueAdBroadcasts(env);
+  assert.equal(due.length, 1);
+  assert.equal(due[0]?.text, "already due");
+});
+
+test("deleteAdBroadcast removes exactly the given row", async () => {
+  const env = createTestEnv();
+  const user = await getOrCreateUser(env, 810004, "advertiser", "Advertiser");
+  const row = await createAdBroadcast(env, user.id, "to be cancelled", null, "admins", "2099-01-01 00:00:00");
+  await deleteAdBroadcast(env, row.id);
+  assert.equal(await getAdBroadcastById(env, row.id), null);
+});
+
+test("listAllChannels returns every channel regardless of owner (unlike listChannelsByOwner)", async () => {
+  const env = createTestEnv();
+  await createTestChannel(env, -8101);
+  await createTestChannel(env, -8102); // a different owner, auto-created by createTestChannel
+  const all = await listAllChannels(env);
+  assert.equal(all.length, 2);
+});
+
+test("listDistinctChannelOwners returns one row per distinct owner, not one per channel", async () => {
+  const env = createTestEnv();
+  const owner = await getOrCreateUser(env, 810005, "multi_owner", "Multi Owner");
+  await createChannel(env, owner.id, -8201, "First group");
+  await createChannel(env, owner.id, -8202, "Second group"); // same owner, second channel
+  await createTestChannel(env, -8203); // a different owner entirely
+
+  const owners = await listDistinctChannelOwners(env);
+  assert.equal(owners.length, 2, "the owner of two channels must appear once, not twice");
+  const multiOwnerRow = owners.find((u) => u.id === owner.id);
+  assert.ok(multiOwnerRow);
+  assert.equal(multiOwnerRow?.username, "multi_owner");
 });
 
 // ---------------------------------------------------------------------------
