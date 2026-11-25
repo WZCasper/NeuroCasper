@@ -1,0 +1,70 @@
+# Run once, manually (Actions tab -> this workflow -> "Run workflow"), to
+# apply migrations/013_add_ad_broadcasts.sql to the live D1 database --
+# adds the ad_broadcasts table that backs the new "📢 РЕКЛАМА" feature
+# (scheduled ad posts; immediate ones never touch this table at all).
+#
+# Safe to re-run: same check-first pattern as 9-/10-/11-/12-migrate-*.yml --
+# checks sqlite_master for the ad_broadcasts table and skips the whole file
+# if it's already there (unlike those four, this migration creates a new
+# TABLE rather than adding a COLUMN, so the check queries sqlite_master
+# instead of PRAGMA table_info).
+#
+# Needs CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repo secrets
+# (same ones the other migration workflows already use).
+name: "13) Add ad_broadcasts table to D1"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether the migration is already applied
+        id: check
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --json --command "SELECT name FROM sqlite_master WHERE type='table' AND name='ad_broadcasts'"
+
+      - name: Decide whether to apply it
+        id: decide
+        env:
+          # command-output is wrangler-action's own documented output
+          # variable (since v3.4.0) holding the previous step's stdout as a
+          # string -- not a file path. Routed through env here (rather than
+          # interpolated directly into the script) so the JSON content is
+          # never substituted into shell syntax.
+          CHECK_OUTPUT: ${{ steps.check.outputs.command-output }}
+        run: |
+          HAS_TABLE=$(echo "$CHECK_OUTPUT" | jq -r '.[0].results[] | select(.name == "ad_broadcasts") | .name')
+          if [ -n "$HAS_TABLE" ]; then
+            echo "already_applied=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Already applied -- nothing to do
+        if: steps.decide.outputs.already_applied == 'true'
+        run: echo "ad_broadcasts already exists -- migration 013 was already applied, skipping."
+
+      - name: Apply migrations/013_add_ad_broadcasts.sql
+        if: steps.decide.outputs.already_applied == 'false'
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --file=./migrations/013_add_ad_broadcasts.sql
+
+      - name: Confirm the new table is there
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute neurocasper-db --remote --command "PRAGMA table_info(ad_broadcasts)"
